@@ -11,10 +11,6 @@ let dataChannel;
 let audioContext;
 // Audio element for playback
 let audioElement;
-// Audio buffer queue for smooth playback
-let audioBufferQueue = [];
-// Flag to track if we're currently playing audio
-let isPlayingAudio = false;
 
 // Initialize the audio player and connections
 document.addEventListener('DOMContentLoaded', function () {
@@ -42,8 +38,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
 function initAudioContext() {
     if (!audioContext) {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        console.log("Audio context initialized");
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            latencyHint: 'interactive',  // Optimize for low latency
+            sampleRate: 44100           // Use standard sample rate
+        });
+        console.log("Audio context initialized with latency mode: interactive");
     }
 }
 
@@ -268,46 +267,67 @@ function playWebRtcAudio(audioBuffer) {
     }
     
     try {
-        // Add the buffer to our queue
-        audioBufferQueue.push(audioBuffer);
+        const dataView = new DataView(audioBuffer);
         
-        // If we're not currently playing, start the playback process
-        if (!isPlayingAudio) {
-            processAudioQueue();
+        // Read header information (first 8 bytes)
+        const sampleRate = dataView.getInt32(0, true);  // First 4 bytes: sample rate
+        const channels = dataView.getInt16(4, true);    // Next 2 bytes: channels
+        const bitsPerSample = dataView.getInt16(6, true); // Last 2 bytes: bits per sample
+        
+        // Skip the 8-byte header to get to the actual audio data
+        const headerSize = 8;
+        
+        // Calculate bytes per sample based on bits per sample
+        const bytesPerSample = bitsPerSample / 8;
+        
+        // Create float array for audio samples
+        const sampleCount = (audioBuffer.byteLength - headerSize) / bytesPerSample;
+        const floatData = new Float32Array(sampleCount);
+        
+        // Convert PCM data to float audio data based on bit depth (optimized for speed)
+        if (bitsPerSample === 16) {
+            // 16-bit PCM (most common case)
+            for (let i = 0; i < sampleCount; i++) {
+                const offset = headerSize + i * 2;
+                // Read 16-bit value (little endian) and normalize to [-1, 1]
+                floatData[i] = dataView.getInt16(offset, true) / 32768;
+            }
+        } else if (bitsPerSample === 8) {
+            // 8-bit PCM
+            for (let i = 0; i < sampleCount; i++) {
+                floatData[i] = dataView.getInt8(headerSize + i) / 128;
+            }
+        } else {
+            console.error(`Unsupported bit depth: ${bitsPerSample}`);
+            return;
         }
-    } catch (error) {
-        console.error("Error playing WebRTC audio:", error);
-    }
-}
-
-// Process audio buffers in the queue
-function processAudioQueue() {
-    if (audioBufferQueue.length === 0) {
-        isPlayingAudio = false;
-        return;
-    }
-    
-    isPlayingAudio = true;
-    
-    // Get the next buffer
-    const audioBuffer = audioBufferQueue.shift();
-    
-    // Create an audio source from the buffer
-    audioContext.decodeAudioData(audioBuffer, (buffer) => {
+        
+        // Create an audio buffer with the correct sample rate and channels
+        const buffer = audioContext.createBuffer(channels, floatData.length / channels, sampleRate);
+        
+        // Copy data to the buffer (handling mono or stereo)
+        if (channels === 1) {
+            // Mono - just copy the data directly
+            buffer.getChannelData(0).set(floatData);
+        } else if (channels === 2) {
+            // Stereo - deinterleave the samples
+            const leftChannel = buffer.getChannelData(0);
+            const rightChannel = buffer.getChannelData(1);
+            
+            for (let i = 0, j = 0; i < floatData.length; i += 2, j++) {
+                leftChannel[j] = floatData[i];
+                rightChannel[j] = floatData[i + 1];
+            }
+        }
+        
+        // Play the audio with minimal latency
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(audioContext.destination);
-        
-        // When this buffer finishes, play the next one
-        source.onended = processAudioQueue;
-        
-        // Start playing
         source.start(0);
-    }, (error) => {
-        console.error("Error decoding audio data:", error);
-        // Continue with the next buffer
-        processAudioQueue();
-    });
+    } catch (error) {
+        console.error("Error playing WebRTC audio:", error);
+    }
 }
 
 // SignalR audio playback

@@ -29,6 +29,7 @@ namespace BabyMonitarr.Backend.Services
     public class WebRtcService : IWebRtcService, IDisposable
     {
         private readonly ILogger<WebRtcService> _logger;
+        private readonly IAudioProcessingService _audioService;
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = 
             new ConcurrentDictionary<string, RTCPeerConnection>();
         private readonly ConcurrentDictionary<string, RTCDataChannel> _dataChannels =
@@ -37,9 +38,10 @@ namespace BabyMonitarr.Backend.Services
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionCreated;
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionClosed;
 
-        public WebRtcService(ILogger<WebRtcService> logger)
+        public WebRtcService(ILogger<WebRtcService> logger, IAudioProcessingService audioService)
         {
             _logger = logger;
+            _audioService = audioService;
         }
 
         public async Task<RTCPeerConnection> CreatePeerConnection(string peerId)
@@ -219,7 +221,28 @@ namespace BabyMonitarr.Backend.Services
 
             try
             {
-                _logger.LogDebug($"Sending {audioData.Length} bytes of audio data to {_dataChannels.Count} WebRTC peers");
+                // Get the audio format information
+                var audioFormat = _audioService.GetAudioFormat();
+                
+                // Create a header with format information (simple 8-byte header)
+                // Format: [sample rate (4 bytes)][channels (2 bytes)][bits per sample (2 bytes)]
+                byte[] header = new byte[8];
+                
+                // Sample rate (e.g., 44100Hz)
+                BitConverter.GetBytes(audioFormat.SampleRate).CopyTo(header, 0);
+                
+                // Channels (e.g., 1 for mono, 2 for stereo)
+                BitConverter.GetBytes((short)audioFormat.Channels).CopyTo(header, 4);
+                
+                // Bits per sample (e.g., 16 for 16-bit PCM)
+                BitConverter.GetBytes((short)audioFormat.BitsPerSample).CopyTo(header, 6);
+                
+                // Combine header and audio data
+                byte[] dataWithHeader = new byte[header.Length + audioData.Length];
+                header.CopyTo(dataWithHeader, 0);
+                audioData.CopyTo(dataWithHeader, header.Length);
+                
+                _logger.LogDebug($"Sending {dataWithHeader.Length} bytes of audio data to {_dataChannels.Count} WebRTC peers");
                 
                 // Send audio data through data channels
                 foreach (var pair in _dataChannels)
@@ -230,7 +253,7 @@ namespace BabyMonitarr.Backend.Services
                     try
                     {
                         // Send the audio data through the data channel
-                        dataChannel.send(audioData);
+                        dataChannel.send(dataWithHeader);
                     }
                     catch (Exception ex)
                     {

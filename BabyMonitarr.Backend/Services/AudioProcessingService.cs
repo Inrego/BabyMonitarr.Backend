@@ -25,6 +25,7 @@ public interface IAudioProcessingService
     event EventHandler<SoundThresholdEventArgs> SoundThresholdExceeded;
     AudioSettings GetSettings();
     void UpdateSettings(AudioSettings settings);
+    AudioFormatInfo GetAudioFormat();
 }
 
 public class AudioSampleEventArgs : EventArgs
@@ -69,6 +70,16 @@ public class AudioProcessingService : IAudioProcessingService, IDisposable
     public AudioSettings GetSettings()
     {
         return _settings;
+    }
+
+    public AudioFormatInfo GetAudioFormat()
+    {
+        return new AudioFormatInfo
+        {
+            SampleRate = 44100, // Standard sample rate
+            Channels = 1,       // Mono
+            BitsPerSample = 16  // 16-bit PCM
+        };
     }
 
     public void UpdateSettings(AudioSettings settings)
