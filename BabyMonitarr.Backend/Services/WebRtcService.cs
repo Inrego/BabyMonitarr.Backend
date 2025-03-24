@@ -74,12 +74,7 @@ namespace BabyMonitarr.Backend.Services
             {
                 _logger.LogInformation($"Connection state changed to {state} for peer {peerId}");
                 
-                if (state == RTCPeerConnectionState.connected)
-                {
-                    // Create a data channel for this peer connection when connected
-                    CreateDataChannel(peerId, pc);
-                }
-                else if (state == RTCPeerConnectionState.failed || 
+                if (state == RTCPeerConnectionState.failed || 
                     state == RTCPeerConnectionState.closed ||
                     state == RTCPeerConnectionState.disconnected)
                 {
@@ -88,6 +83,10 @@ namespace BabyMonitarr.Backend.Services
             };
 
             _peerConnections.TryAdd(peerId, pc);
+            
+            // Create a data channel immediately when setting up the peer connection
+            // This ensures the client will receive the ondatachannel event
+            CreateDataChannel(peerId, pc);
             
             // Raise event
             OnPeerConnectionCreated?.Invoke(this, new WebRtcPeerConnectionEventArgs
@@ -103,6 +102,13 @@ namespace BabyMonitarr.Backend.Services
         {
             try
             {
+                // Check if we already have a data channel for this peer
+                if (_dataChannels.ContainsKey(peerId))
+                {
+                    _logger.LogDebug($"Data channel already exists for peer {peerId}");
+                    return;
+                }
+
                 // Create a data channel for audio streaming
                 var dataChannel = await pc.createDataChannel("audio", null);
                 
@@ -213,19 +219,23 @@ namespace BabyMonitarr.Backend.Services
 
             try
             {
+                _logger.LogDebug($"Sending {audioData.Length} bytes of audio data to {_dataChannels.Count} WebRTC peers");
+                
                 // Send audio data through data channels
-                foreach (var dataChannel in _dataChannels.Values)
+                foreach (var pair in _dataChannels)
                 {
+                    string peerId = pair.Key;
+                    RTCDataChannel dataChannel = pair.Value;
+                    
                     try
                     {
-                        // Check if the DataChannel's readyState property and method are available
-                        // If not, we just attempt to send regardless of state
+                        // Send the audio data through the data channel
                         dataChannel.send(audioData);
                     }
                     catch (Exception ex)
                     {
                         // Just log and continue, don't propagate exceptions to avoid disrupting the audio flow
-                        _logger.LogDebug($"Error sending audio data via data channel: {ex.Message}");
+                        _logger.LogDebug($"Error sending audio data via data channel to peer {peerId}: {ex.Message}");
                     }
                 }
             }
