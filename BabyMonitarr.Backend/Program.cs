@@ -9,6 +9,7 @@ builder.Services.Configure<BabyMonitarr.Backend.Models.AudioSettings>(
 
 // Register services
 builder.Services.AddSingleton<BabyMonitarr.Backend.Services.IAudioProcessingService, BabyMonitarr.Backend.Services.AudioProcessingService>();
+builder.Services.AddSingleton<BabyMonitarr.Backend.Services.IWebRtcService, BabyMonitarr.Backend.Services.WebRtcService>();
 builder.Services.AddHostedService<BabyMonitarr.Backend.Services.AudioStreamingBackgroundService>();
 
 // Add SignalR

@@ -14,15 +14,18 @@ public class AudioStreamingBackgroundService : BackgroundService
     private readonly ILogger<AudioStreamingBackgroundService> _logger;
     private readonly IAudioProcessingService _audioService;
     private readonly IHubContext<AudioStreamHub> _hubContext;
+    private readonly IWebRtcService _webRtcService;
 
     public AudioStreamingBackgroundService(
         ILogger<AudioStreamingBackgroundService> logger,
         IAudioProcessingService audioService,
-        IHubContext<AudioStreamHub> hubContext)
+        IHubContext<AudioStreamHub> hubContext,
+        IWebRtcService webRtcService)
     {
         _logger = logger;
         _audioService = audioService;
         _hubContext = hubContext;
+        _webRtcService = webRtcService;
 
         // Subscribe to events
         _audioService.AudioSampleProcessed += OnAudioSampleProcessed;
@@ -52,13 +55,16 @@ public class AudioStreamingBackgroundService : BackgroundService
     {
         try
         {
-            // Send audio data to clients that are in the AudioStreamListeners group
+            // Send audio data to SignalR clients that are in the AudioStreamListeners group
             await _hubContext.Clients.Group("AudioStreamListeners").SendAsync(
                 "ReceiveAudioData", 
                 Convert.ToBase64String(e.AudioData), 
                 e.AudioLevel, 
                 e.Timestamp
             );
+            
+            // Send audio data to WebRTC peers
+            _webRtcService.SendAudioData(e.AudioData);
         }
         catch (Exception ex)
         {
