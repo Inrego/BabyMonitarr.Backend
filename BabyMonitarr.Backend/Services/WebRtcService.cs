@@ -3,8 +3,12 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
+using SIPSorcery.Media;
 using SIPSorcery.Net;
+using SIPSorceryMedia.Abstractions;
+using BabyMonitarr.Backend.Hubs;
 
 namespace BabyMonitarr.Backend.Services
 {
@@ -12,6 +16,12 @@ namespace BabyMonitarr.Backend.Services
     {
         public required string PeerId { get; set; }
         public RTCPeerConnection? PeerConnection { get; set; }
+    }
+
+    public class IceCandidateEventArgs : EventArgs
+    {
+        public required string PeerId { get; set; }
+        public required RTCIceCandidate Candidate { get; set; }
     }
 
     public interface IWebRtcService
@@ -23,6 +33,7 @@ namespace BabyMonitarr.Backend.Services
         Task ClosePeerConnection(string peerId);
         event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionCreated;
         event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionClosed;
+        event EventHandler<IceCandidateEventArgs>? OnIceCandidateGenerated;
         void SendAudioData(byte[] audioData);
     }
 
@@ -30,18 +41,28 @@ namespace BabyMonitarr.Backend.Services
     {
         private readonly ILogger<WebRtcService> _logger;
         private readonly IAudioProcessingService _audioService;
-        private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = 
+        private readonly IHubContext<AudioStreamHub> _hubContext;
+        private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections =
             new ConcurrentDictionary<string, RTCPeerConnection>();
-        private readonly ConcurrentDictionary<string, RTCDataChannel> _dataChannels =
-            new ConcurrentDictionary<string, RTCDataChannel>();
-        
+        private readonly ConcurrentDictionary<string, AudioExtrasSource> _audioSources =
+            new ConcurrentDictionary<string, AudioExtrasSource>();
+        private readonly ConcurrentDictionary<string, AudioEncoder> _audioEncoders =
+            new ConcurrentDictionary<string, AudioEncoder>();
+        private readonly ConcurrentDictionary<string, AudioFormat> _negotiatedFormats =
+            new ConcurrentDictionary<string, AudioFormat>();
+
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionCreated;
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionClosed;
+        public event EventHandler<IceCandidateEventArgs>? OnIceCandidateGenerated;
 
-        public WebRtcService(ILogger<WebRtcService> logger, IAudioProcessingService audioService)
+        public WebRtcService(
+            ILogger<WebRtcService> logger,
+            IAudioProcessingService audioService,
+            IHubContext<AudioStreamHub> hubContext)
         {
             _logger = logger;
             _audioService = audioService;
+            _hubContext = hubContext;
         }
 
         public async Task<RTCPeerConnection> CreatePeerConnection(string peerId)
@@ -54,7 +75,6 @@ namespace BabyMonitarr.Backend.Services
 
             _logger.LogInformation($"Creating WebRTC peer connection for {peerId}");
 
-            // Configure ice servers (STUN/TURN) for NAT traversal
             var config = new RTCConfiguration
             {
                 iceServers = new List<RTCIceServer>
@@ -63,34 +83,82 @@ namespace BabyMonitarr.Backend.Services
                 }
             };
 
-            // Create the peer connection
             var pc = new RTCPeerConnection(config);
 
-            // Setup event handlers for ICE negotiation and connection state
+            // Setup event handlers
             pc.onicecandidate += (candidate) =>
             {
-                _logger.LogDebug($"Generated ICE candidate: {candidate?.candidate}");
+                if (candidate != null)
+                {
+                    _logger.LogDebug($"Generated ICE candidate for {peerId}: {candidate.candidate}");
+
+                    // Fire the event for any external subscribers
+                    OnIceCandidateGenerated?.Invoke(this, new IceCandidateEventArgs
+                    {
+                        PeerId = peerId,
+                        Candidate = candidate
+                    });
+
+                    // Send the ICE candidate to the client via SignalR
+                    _ = _hubContext.Clients.Client(peerId).SendAsync(
+                        "ReceiveIceCandidate",
+                        candidate.candidate,
+                        candidate.sdpMid,
+                        candidate.sdpMLineIndex);
+                }
             };
 
             pc.onconnectionstatechange += (state) =>
             {
                 _logger.LogInformation($"Connection state changed to {state} for peer {peerId}");
-                
-                if (state == RTCPeerConnectionState.failed || 
-                    state == RTCPeerConnectionState.closed ||
-                    state == RTCPeerConnectionState.disconnected)
+
+                // Only close on 'failed' state - 'closed' is expected when we close it ourselves
+                // Don't close on 'new' or other transitional states
+                if (state == RTCPeerConnectionState.failed)
                 {
+                    _logger.LogWarning($"Peer connection failed for {peerId}, closing...");
                     Task.Run(() => ClosePeerConnection(peerId));
                 }
             };
 
+            // Add to peer connections dictionary FIRST before any operations that might trigger state changes
             _peerConnections.TryAdd(peerId, pc);
+            _logger.LogInformation($"Added peer connection to dictionary for {peerId}");
+
+            // Create and add audio track
+            try
+            {
+                // Use AudioEncoder with Opus support for WebRTC compatibility
+                var audioEncoder = new AudioEncoder(includeOpus: true);
+                var audioSource = new AudioExtrasSource(audioEncoder, new AudioSourceOptions { AudioSource = AudioSourcesEnum.None });
+
+                // Create audio track with send-only capability
+                var audioTrack = new MediaStreamTrack(audioSource.GetAudioSourceFormats(), MediaStreamStatusEnum.SendOnly);
+                pc.addTrack(audioTrack);
+
+                // Handle format negotiation
+                pc.OnAudioFormatsNegotiated += (audioFormats) =>
+                {
+                    var selectedFormat = audioFormats.First();
+                    _logger.LogInformation($"Audio formats negotiated for peer {peerId}: {string.Join(", ", audioFormats.Select(f => f.FormatName))}. Selected: {selectedFormat.FormatName}");
+                    audioSource.SetAudioSourceFormat(selectedFormat);
+                    _negotiatedFormats[peerId] = selectedFormat;
+                };
+
+                _audioSources.TryAdd(peerId, audioSource);
+                _audioEncoders.TryAdd(peerId, audioEncoder);
+                _logger.LogInformation($"Added audio track for peer {peerId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error adding audio track for peer {peerId}");
+                _peerConnections.TryRemove(peerId, out _);
+                pc.Close("Error adding audio track");
+                throw;
+            }
             
-            // Create a data channel immediately when setting up the peer connection
-            // This ensures the client will receive the ondatachannel event
-            CreateDataChannel(peerId, pc);
+            // Removed: CreateDataChannel(peerId, pc); // Data channel logic removed
             
-            // Raise event
             OnPeerConnectionCreated?.Invoke(this, new WebRtcPeerConnectionEventArgs
             {
                 PeerId = peerId, 
@@ -100,30 +168,7 @@ namespace BabyMonitarr.Backend.Services
             return pc;
         }
 
-        private async void CreateDataChannel(string peerId, RTCPeerConnection pc)
-        {
-            try
-            {
-                // Check if we already have a data channel for this peer
-                if (_dataChannels.ContainsKey(peerId))
-                {
-                    _logger.LogDebug($"Data channel already exists for peer {peerId}");
-                    return;
-                }
-
-                // Create a data channel for audio streaming
-                var dataChannel = await pc.createDataChannel("audio", null);
-                
-                // Store the data channel for later use
-                _dataChannels[peerId] = dataChannel;
-                
-                _logger.LogInformation($"Created data channel for peer {peerId}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error creating data channel for peer {peerId}");
-            }
-        }
+        // Removed: private async void CreateDataChannel(string peerId, RTCPeerConnection pc) { ... }
 
         public async Task<string> CreateOffer(string peerId)
         {
@@ -184,16 +229,31 @@ namespace BabyMonitarr.Backend.Services
 
         public Task ClosePeerConnection(string peerId)
         {
-            // Clean up data channel if exists
-            _dataChannels.TryRemove(peerId, out _);
-            
+            _logger.LogInformation($"ClosePeerConnection called for {peerId}");
+
+            // Clean up negotiated format
+            _negotiatedFormats.TryRemove(peerId, out _);
+
+            // Clean up audio encoder if exists
+            if (_audioEncoders.TryRemove(peerId, out _))
+            {
+                _logger.LogInformation($"Removed audio encoder for {peerId}");
+            }
+
+            // Clean up audio source if exists
+            if (_audioSources.TryRemove(peerId, out var audioSource))
+            {
+                _logger.LogInformation($"Closing audio source for {peerId}");
+                audioSource.CloseAudio().Wait();
+            }
+
             if (_peerConnections.TryRemove(peerId, out var pc))
             {
                 _logger.LogInformation($"Closing WebRTC peer connection for {peerId}");
                 
                 try
                 {
-                    pc.close();
+                    pc.Close("Peer connection closed by server"); // Corrected: Was pc.close() and added reason
                     
                     // Raise event
                     OnPeerConnectionClosed?.Invoke(this, new WebRtcPeerConnectionEventArgs
@@ -214,51 +274,60 @@ namespace BabyMonitarr.Backend.Services
         // This method is called by AudioStreamingBackgroundService with audio data
         public void SendAudioData(byte[] audioData)
         {
-            if (_dataChannels.Count == 0 || audioData == null || audioData.Length == 0)
+            if (_peerConnections.IsEmpty || audioData == null || audioData.Length == 0)
             {
                 return;
             }
 
             try
             {
-                // Get the audio format information
-                var audioFormat = _audioService.GetAudioFormat();
-                
-                // Create a header with format information (simple 8-byte header)
-                // Format: [sample rate (4 bytes)][channels (2 bytes)][bits per sample (2 bytes)]
-                byte[] header = new byte[8];
-                
-                // Sample rate (e.g., 44100Hz)
-                BitConverter.GetBytes(audioFormat.SampleRate).CopyTo(header, 0);
-                
-                // Channels (e.g., 1 for mono, 2 for stereo)
-                BitConverter.GetBytes((short)audioFormat.Channels).CopyTo(header, 4);
-                
-                // Bits per sample (e.g., 16 for 16-bit PCM)
-                BitConverter.GetBytes((short)audioFormat.BitsPerSample).CopyTo(header, 6);
-                
-                // Combine header and audio data
-                byte[] dataWithHeader = new byte[header.Length + audioData.Length];
-                header.CopyTo(dataWithHeader, 0);
-                audioData.CopyTo(dataWithHeader, header.Length);
-                
-                _logger.LogDebug($"Sending {dataWithHeader.Length} bytes of audio data to {_dataChannels.Count} WebRTC peers");
-                
-                // Send audio data through data channels
-                foreach (var pair in _dataChannels)
+                // Convert byte[] to short[] (16-bit PCM)
+                short[] samples = new short[audioData.Length / 2];
+                Buffer.BlockCopy(audioData, 0, samples, 0, audioData.Length);
+
+                foreach (var peerConnectionPair in _peerConnections)
                 {
-                    string peerId = pair.Key;
-                    RTCDataChannel dataChannel = pair.Value;
-                    
+                    string peerId = peerConnectionPair.Key;
+                    RTCPeerConnection pc = peerConnectionPair.Value;
+
+                    // Only send to connected peers
+                    if (pc.connectionState != RTCPeerConnectionState.connected)
+                        continue;
+
+                    if (!_audioEncoders.TryGetValue(peerId, out var encoder))
+                        continue;
+
+                    if (!_negotiatedFormats.TryGetValue(peerId, out var audioFormat))
+                    {
+                        _logger.LogDebug($"No audio format negotiated yet for peer {peerId}");
+                        continue;
+                    }
+
                     try
                     {
-                        // Send the audio data through the data channel
-                        dataChannel.send(dataWithHeader);
+                        // Resample from 44100Hz to the format's clock rate if needed
+                        short[] resampledSamples = samples;
+                        if (44100 != audioFormat.ClockRate)
+                        {
+                            resampledSamples = ResampleAudio(samples, 44100, audioFormat.ClockRate);
+                        }
+
+                        // Encode the audio using the encoder
+                        byte[] encodedSample = encoder.EncodeAudio(resampledSamples, audioFormat);
+
+                        if (encodedSample != null && encodedSample.Length > 0)
+                        {
+                            // Calculate RTP timestamp units
+                            // For Opus at 48kHz, each sample = 1 timestamp unit
+                            uint durationRtpUnits = (uint)resampledSamples.Length;
+
+                            // Send the encoded audio via the peer connection
+                            pc.SendAudio(durationRtpUnits, encodedSample);
+                        }
                     }
                     catch (Exception ex)
                     {
-                        // Just log and continue, don't propagate exceptions to avoid disrupting the audio flow
-                        _logger.LogDebug($"Error sending audio data via data channel to peer {peerId}: {ex.Message}");
+                        _logger.LogDebug($"Error encoding/sending audio to peer {peerId}: {ex.Message}");
                     }
                 }
             }
@@ -268,16 +337,55 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
+        /// <summary>
+        /// Simple linear interpolation resampler
+        /// </summary>
+        private short[] ResampleAudio(short[] input, int inputRate, int outputRate)
+        {
+            if (inputRate == outputRate)
+                return input;
+
+            double ratio = (double)outputRate / inputRate;
+            int outputLength = (int)(input.Length * ratio);
+            short[] output = new short[outputLength];
+
+            for (int i = 0; i < outputLength; i++)
+            {
+                double srcIndex = i / ratio;
+                int srcIndexInt = (int)srcIndex;
+                double frac = srcIndex - srcIndexInt;
+
+                if (srcIndexInt + 1 < input.Length)
+                {
+                    // Linear interpolation
+                    output[i] = (short)(input[srcIndexInt] * (1 - frac) + input[srcIndexInt + 1] * frac);
+                }
+                else if (srcIndexInt < input.Length)
+                {
+                    output[i] = input[srcIndexInt];
+                }
+            }
+
+            return output;
+        }
+
         public void Dispose()
         {
             // Close all peer connections
             foreach (var peerId in _peerConnections.Keys.ToList())
             {
-                ClosePeerConnection(peerId).Wait();
+                ClosePeerConnection(peerId).Wait(); // This will also dispose associated AudioExtrasSource, encoder, and format
             }
-            
-            // Clear data channels
-            _dataChannels.Clear();
+
+            // Ensure any remaining audio sources are disposed (should be covered by ClosePeerConnection)
+            // but as a safeguard:
+            foreach (var audioSource in _audioSources.Values)
+            {
+                audioSource.CloseAudio().Wait();
+            }
+            _audioSources.Clear();
+            _audioEncoders.Clear();
+            _negotiatedFormats.Clear();
         }
     }
 }

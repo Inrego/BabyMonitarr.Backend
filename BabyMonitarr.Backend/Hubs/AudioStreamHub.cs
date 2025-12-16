@@ -58,10 +58,13 @@ public class AudioStreamHub : Hub
     public async Task<string> StartWebRtcStream()
     {
         _logger.LogInformation($"Client {Context.ConnectionId} requested to start WebRTC stream");
-        
+
+        // Add client to AudioLevelListeners group for audio level updates
+        await Groups.AddToGroupAsync(Context.ConnectionId, "AudioLevelListeners");
+
         // Create a peer connection for this client
         await _webRtcService.CreatePeerConnection(Context.ConnectionId);
-        
+
         // Create an offer and return the SDP
         var offerSdp = await _webRtcService.CreateOffer(Context.ConnectionId);
         return offerSdp;
@@ -97,6 +100,10 @@ public class AudioStreamHub : Hub
     public async Task StopWebRtcStream()
     {
         _logger.LogInformation($"Client {Context.ConnectionId} requested to stop WebRTC stream");
+
+        // Remove client from AudioLevelListeners group
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, "AudioLevelListeners");
+
         await _webRtcService.ClosePeerConnection(Context.ConnectionId);
     }
     #endregion

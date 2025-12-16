@@ -5,8 +5,6 @@
 let connection;
 // WebRTC peer connection
 let peerConnection;
-// WebRTC data channel for audio
-let dataChannel;
 // Audio context for processing
 let audioContext;
 // Audio element for playback
@@ -58,13 +56,38 @@ function initializeSignalRConnection() {
         if (document.getElementById('signalrAudioEnabled')?.checked) {
             playSignalRAudio(audioBase64);
         }
-        
+
+        updateAudioMeter(audioLevel);
+    });
+
+    // Handle audio level updates (for WebRTC mode)
+    connection.on("ReceiveAudioLevel", (audioLevel, timestamp) => {
+        console.log("ReceiveAudioLevel:", audioLevel);
         updateAudioMeter(audioLevel);
     });
 
     // Handle sound alerts
     connection.on("SoundAlert", (audioLevel, threshold, timestamp) => {
         showSoundAlert(audioLevel, threshold);
+    });
+
+    // Handle server ICE candidates
+    connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
+        console.log("Received server ICE candidate:", candidate);
+        if (peerConnection && peerConnection.remoteDescription) {
+            try {
+                await peerConnection.addIceCandidate({
+                    candidate: candidate,
+                    sdpMid: sdpMid,
+                    sdpMLineIndex: sdpMLineIndex
+                });
+                console.log("Added server ICE candidate successfully");
+            } catch (err) {
+                console.error("Error adding server ICE candidate:", err);
+            }
+        } else {
+            console.warn("Cannot add ICE candidate - peer connection not ready");
+        }
     });
 
     // Start the connection
@@ -113,18 +136,21 @@ function setupButtonListeners() {
     document.getElementById('signalrAudioEnabled')?.addEventListener('change', function() {
         if (this.checked && audioElement) {
             audioElement.srcObject = null;  // Disconnect any WebRTC stream
+            // If SignalR is re-enabled, and WebRTC was playing, ensure audioElement.src is cleared if it was used by SignalR
+            audioElement.src = ''; 
         }
     });
     
     document.getElementById('webrtcAudioEnabled')?.addEventListener('change', function() {
-        if (this.checked && peerConnection && !dataChannel) {
+        // if (this.checked && peerConnection && !dataChannel) { // Old condition
+        if (this.checked && (!peerConnection || peerConnection.connectionState !== 'connected')) {
             // If WebRTC is selected but not connected, start it
             startWebRtcStream();
         }
     });
 }
 
-// WebRTC Implementation with Data Channel for audio streaming
+// WebRTC Implementation with Media Stream for audio streaming
 async function startWebRtcStream() {
     try {
         // Close any existing peer connection
@@ -133,13 +159,14 @@ async function startWebRtcStream() {
         }
 
         console.log("Starting WebRTC stream...");
-        initAudioContext();  // Make sure audio context is initialized
+        // initAudioContext(); // AudioContext not strictly needed for direct MediaStream playback
 
         // Get the offer SDP from the server
+        // The Hub method should be updated if its responsibilities change, but for now, assume it's just an offer
+        console.log("Calling StartWebRtcStream on hub...");
         const offerSdp = await connection.invoke("StartWebRtcStream");
-        console.log("Got offer from server");
+        console.log("Got offer from server, client should now be in AudioLevelListeners group");
 
-        // Create a new RTCPeerConnection
         const configuration = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' }
@@ -148,37 +175,23 @@ async function startWebRtcStream() {
         
         peerConnection = new RTCPeerConnection(configuration);
         
-        // Setup event handlers for the peer connection
         setupPeerConnectionHandlers();
 
-        // Set up data channel for incoming audio
-        peerConnection.ondatachannel = (event) => {
-            console.log("Data channel received from server");
-            dataChannel = event.channel;
-            setupDataChannelHandlers(dataChannel);
-        };
+        // Removed: peerConnection.ondatachannel setup
 
-        // Set the remote description (server's offer)
-        await peerConnection.setRemoteDescription({
-            type: 'offer',
-            sdp: offerSdp
-        });
-
-        // Create an answer
+        await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
 
-        // Send the answer to the server
         await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
         
-        console.log("WebRTC stream started");
+        console.log("WebRTC stream negotiation started");
     } catch (error) {
         console.error("Error starting WebRTC stream:", error);
     }
 }
 
 function setupPeerConnectionHandlers() {
-    // Handle ICE candidates
     peerConnection.onicecandidate = async (event) => {
         if (event.candidate) {
             try {
@@ -197,43 +210,34 @@ function setupPeerConnectionHandlers() {
     peerConnection.onconnectionstatechange = () => {
         console.log("WebRTC connection state:", peerConnection.connectionState);
         
+        if (peerConnection.connectionState === 'connected') {
+            console.log("WebRTC connected. Audio should be streaming via track.");
+        }
+
         if (peerConnection.connectionState === 'disconnected' || 
             peerConnection.connectionState === 'failed' || 
             peerConnection.connectionState === 'closed') {
             
-            // Close resources if the connection is lost
-            dataChannel = null;
+            // Removed: dataChannel = null;
+            if (audioElement) {
+                audioElement.srcObject = null; // Clear the stream from audio element
+            }
         }
     };
-}
 
-function setupDataChannelHandlers(channel) {
-    channel.onopen = () => {
-        console.log("Data channel opened");
-    };
-    
-    channel.onclose = () => {
-        console.log("Data channel closed");
-        dataChannel = null;
-    };
-    
-    channel.onerror = (error) => {
-        console.error("Data channel error:", error);
-    };
-    
-    channel.onmessage = (event) => {
-        // Handle incoming audio data from the data channel
-        if (document.getElementById('webrtcAudioEnabled')?.checked) {
-            if (event.data instanceof ArrayBuffer) {
-                playWebRtcAudio(event.data);
+    // Handle incoming remote tracks
+    peerConnection.ontrack = (event) => {
+        console.log("Remote track received:", event.track, "Streams:", event.streams);
+        if (event.streams && event.streams[0] && audioElement) {
+            if (document.getElementById('webrtcAudioEnabled')?.checked) {
+                audioElement.srcObject = event.streams[0];
+                audioElement.play().catch(e => console.error("Error playing WebRTC audio track:", e));
+                console.log("Assigned remote stream to audio element.");
             } else {
-                // If the data is not an ArrayBuffer, try to convert it
-                const reader = new FileReader();
-                reader.onload = () => {
-                    playWebRtcAudio(reader.result);
-                };
-                reader.readAsArrayBuffer(event.data);
+                console.log("WebRTC audio not enabled, not assigning stream.");
             }
+        } else {
+            console.warn("Received track, but no stream or audio element available or WebRTC not enabled.");
         }
     };
 }
@@ -241,92 +245,21 @@ function setupDataChannelHandlers(channel) {
 async function stopWebRtcStream() {
     if (peerConnection) {
         try {
-            // Tell the server to close the peer connection
             await connection.invoke("StopWebRtcStream");
             
-            // Close the connection on the client side
-            if (dataChannel) {
-                dataChannel.close();
-                dataChannel = null;
-            }
+            // Removed: dataChannel.close();
+            // Removed: dataChannel = null;
             
             peerConnection.close();
             peerConnection = null;
             
+            if (audioElement) {
+                audioElement.srcObject = null; // Ensure audio stream is cleared
+            }
             console.log("WebRTC stream stopped");
         } catch (error) {
             console.error("Error stopping WebRTC stream:", error);
         }
-    }
-}
-
-// Play audio received through WebRTC data channel
-function playWebRtcAudio(audioBuffer) {
-    if (!audioContext) {
-        initAudioContext();
-    }
-    
-    try {
-        const dataView = new DataView(audioBuffer);
-        
-        // Read header information (first 8 bytes)
-        const sampleRate = dataView.getInt32(0, true);  // First 4 bytes: sample rate
-        const channels = dataView.getInt16(4, true);    // Next 2 bytes: channels
-        const bitsPerSample = dataView.getInt16(6, true); // Last 2 bytes: bits per sample
-        
-        // Skip the 8-byte header to get to the actual audio data
-        const headerSize = 8;
-        
-        // Calculate bytes per sample based on bits per sample
-        const bytesPerSample = bitsPerSample / 8;
-        
-        // Create float array for audio samples
-        const sampleCount = (audioBuffer.byteLength - headerSize) / bytesPerSample;
-        const floatData = new Float32Array(sampleCount);
-        
-        // Convert PCM data to float audio data based on bit depth (optimized for speed)
-        if (bitsPerSample === 16) {
-            // 16-bit PCM (most common case)
-            for (let i = 0; i < sampleCount; i++) {
-                const offset = headerSize + i * 2;
-                // Read 16-bit value (little endian) and normalize to [-1, 1]
-                floatData[i] = dataView.getInt16(offset, true) / 32768;
-            }
-        } else if (bitsPerSample === 8) {
-            // 8-bit PCM
-            for (let i = 0; i < sampleCount; i++) {
-                floatData[i] = dataView.getInt8(headerSize + i) / 128;
-            }
-        } else {
-            console.error(`Unsupported bit depth: ${bitsPerSample}`);
-            return;
-        }
-        
-        // Create an audio buffer with the correct sample rate and channels
-        const buffer = audioContext.createBuffer(channels, floatData.length / channels, sampleRate);
-        
-        // Copy data to the buffer (handling mono or stereo)
-        if (channels === 1) {
-            // Mono - just copy the data directly
-            buffer.getChannelData(0).set(floatData);
-        } else if (channels === 2) {
-            // Stereo - deinterleave the samples
-            const leftChannel = buffer.getChannelData(0);
-            const rightChannel = buffer.getChannelData(1);
-            
-            for (let i = 0, j = 0; i < floatData.length; i += 2, j++) {
-                leftChannel[j] = floatData[i];
-                rightChannel[j] = floatData[i + 1];
-            }
-        }
-        
-        // Play the audio with minimal latency
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.start(0);
-    } catch (error) {
-        console.error("Error playing WebRTC audio:", error);
     }
 }
 

@@ -57,12 +57,19 @@ public class AudioStreamingBackgroundService : BackgroundService
         {
             // Send audio data to SignalR clients that are in the AudioStreamListeners group
             await _hubContext.Clients.Group("AudioStreamListeners").SendAsync(
-                "ReceiveAudioData", 
-                Convert.ToBase64String(e.AudioData), 
-                e.AudioLevel, 
+                "ReceiveAudioData",
+                Convert.ToBase64String(e.AudioData),
+                e.AudioLevel,
                 e.Timestamp
             );
-            
+
+            // Send audio level updates to WebRTC clients (AudioLevelListeners group)
+            await _hubContext.Clients.Group("AudioLevelListeners").SendAsync(
+                "ReceiveAudioLevel",
+                e.AudioLevel,
+                e.Timestamp
+            );
+
             // Send audio data to WebRTC peers
             _webRtcService.SendAudioData(e.AudioData);
         }
