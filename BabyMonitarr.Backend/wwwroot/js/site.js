@@ -9,6 +9,8 @@ let peerConnection;
 let audioContext;
 // Audio element for playback
 let audioElement;
+// Queue for ICE candidates that arrive before peer connection is ready
+let pendingIceCandidates = [];
 
 // Initialize the audio player and connections
 document.addEventListener('DOMContentLoaded', function () {
@@ -51,42 +53,29 @@ function initializeSignalRConnection() {
         .withAutomaticReconnect()
         .build();
 
-    // Handle received audio data (SignalR streaming)
-    connection.on("ReceiveAudioData", (audioBase64, audioLevel, timestamp) => {
-        if (document.getElementById('signalrAudioEnabled')?.checked) {
-            playSignalRAudio(audioBase64);
-        }
-
-        updateAudioMeter(audioLevel);
-    });
-
-    // Handle audio level updates (for WebRTC mode)
-    connection.on("ReceiveAudioLevel", (audioLevel, timestamp) => {
-        console.log("ReceiveAudioLevel:", audioLevel);
-        updateAudioMeter(audioLevel);
-    });
-
-    // Handle sound alerts
-    connection.on("SoundAlert", (audioLevel, threshold, timestamp) => {
-        showSoundAlert(audioLevel, threshold);
-    });
-
     // Handle server ICE candidates
     connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
         console.log("Received server ICE candidate:", candidate);
+        // Ensure the candidate string has the proper format (must start with "candidate:")
+        const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
+        const iceCandidate = new RTCIceCandidate({
+            candidate: candidateStr,
+            sdpMid: sdpMid,
+            sdpMLineIndex: sdpMLineIndex
+        });
+
         if (peerConnection && peerConnection.remoteDescription) {
             try {
-                await peerConnection.addIceCandidate({
-                    candidate: candidate,
-                    sdpMid: sdpMid,
-                    sdpMLineIndex: sdpMLineIndex
-                });
+                await peerConnection.addIceCandidate(iceCandidate);
                 console.log("Added server ICE candidate successfully");
             } catch (err) {
-                console.error("Error adding server ICE candidate:", err);
+                // Log but don't fail - connection may still succeed via other candidates
+                console.warn("Could not add server ICE candidate:", err.message);
             }
         } else {
-            console.warn("Cannot add ICE candidate - peer connection not ready");
+            // Queue the candidate for later
+            console.log("Queuing ICE candidate - peer connection not ready yet");
+            pendingIceCandidates.push(iceCandidate);
         }
     });
 
@@ -107,16 +96,6 @@ function initializeSignalRConnection() {
 }
 
 function setupButtonListeners() {
-    // Start SignalR streaming button
-    document.getElementById('startSignalRStreamBtn')?.addEventListener('click', function() {
-        connection.invoke("StartStream").catch(err => console.error(err));
-    });
-
-    // Stop SignalR streaming button
-    document.getElementById('stopSignalRStreamBtn')?.addEventListener('click', function() {
-        connection.invoke("StopStream").catch(err => console.error(err));
-    });
-
     // Start WebRTC streaming button
     document.getElementById('startWebRtcStreamBtn')?.addEventListener('click', function() {
         startWebRtcStream();
@@ -130,23 +109,6 @@ function setupButtonListeners() {
     // Save settings button
     document.getElementById('saveSettingsBtn')?.addEventListener('click', function() {
         saveAudioSettings();
-    });
-    
-    // Radio button change for stream type
-    document.getElementById('signalrAudioEnabled')?.addEventListener('change', function() {
-        if (this.checked && audioElement) {
-            audioElement.srcObject = null;  // Disconnect any WebRTC stream
-            // If SignalR is re-enabled, and WebRTC was playing, ensure audioElement.src is cleared if it was used by SignalR
-            audioElement.src = ''; 
-        }
-    });
-    
-    document.getElementById('webrtcAudioEnabled')?.addEventListener('change', function() {
-        // if (this.checked && peerConnection && !dataChannel) { // Old condition
-        if (this.checked && (!peerConnection || peerConnection.connectionState !== 'connected')) {
-            // If WebRTC is selected but not connected, start it
-            startWebRtcStream();
-        }
     });
 }
 
@@ -165,26 +127,40 @@ async function startWebRtcStream() {
         // The Hub method should be updated if its responsibilities change, but for now, assume it's just an offer
         console.log("Calling StartWebRtcStream on hub...");
         const offerSdp = await connection.invoke("StartWebRtcStream");
-        console.log("Got offer from server, client should now be in AudioLevelListeners group");
+        console.log("Got offer from server");
 
         const configuration = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' }
             ]
         };
-        
+
         peerConnection = new RTCPeerConnection(configuration);
-        
+
         setupPeerConnectionHandlers();
 
-        // Removed: peerConnection.ondatachannel setup
-
         await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
 
         await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
-        
+
+        // Process any ICE candidates that arrived before negotiation completed
+        if (pendingIceCandidates.length > 0) {
+            console.log(`Processing ${pendingIceCandidates.length} queued ICE candidates`);
+            for (const candidate of pendingIceCandidates) {
+                try {
+                    await peerConnection.addIceCandidate(candidate);
+                    console.log("Added queued ICE candidate successfully");
+                } catch (err) {
+                    // Log but don't fail - connection may still succeed via other candidates
+                    console.warn("Could not add queued ICE candidate:", err.message);
+                }
+            }
+            pendingIceCandidates = [];
+        }
+
         console.log("WebRTC stream negotiation started");
     } catch (error) {
         console.error("Error starting WebRTC stream:", error);
@@ -195,9 +171,9 @@ function setupPeerConnectionHandlers() {
     peerConnection.onicecandidate = async (event) => {
         if (event.candidate) {
             try {
-                await connection.invoke("AddIceCandidate", 
-                    event.candidate.candidate, 
-                    event.candidate.sdpMid, 
+                await connection.invoke("AddIceCandidate",
+                    event.candidate.candidate,
+                    event.candidate.sdpMid,
                     event.candidate.sdpMLineIndex
                 );
             } catch (err) {
@@ -206,19 +182,48 @@ function setupPeerConnectionHandlers() {
         }
     };
 
+    // Handle incoming data channel for audio level updates
+    peerConnection.ondatachannel = (event) => {
+        console.log("Data channel received:", event.channel.label);
+        const dataChannel = event.channel;
+
+        dataChannel.onopen = () => {
+            console.log("Data channel opened:", dataChannel.label);
+        };
+
+        dataChannel.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                if (message.type === 'audioLevel') {
+                    updateAudioMeter(message.level);
+                } else if (message.type === 'soundAlert') {
+                    showSoundAlert(message.level, message.threshold);
+                }
+            } catch (err) {
+                console.error("Error parsing data channel message:", err);
+            }
+        };
+
+        dataChannel.onclose = () => {
+            console.log("Data channel closed:", dataChannel.label);
+        };
+
+        dataChannel.onerror = (error) => {
+            console.error("Data channel error:", error);
+        };
+    };
+
     // Handle connection state changes
     peerConnection.onconnectionstatechange = () => {
         console.log("WebRTC connection state:", peerConnection.connectionState);
-        
+
         if (peerConnection.connectionState === 'connected') {
             console.log("WebRTC connected. Audio should be streaming via track.");
         }
 
-        if (peerConnection.connectionState === 'disconnected' || 
-            peerConnection.connectionState === 'failed' || 
+        if (peerConnection.connectionState === 'disconnected' ||
+            peerConnection.connectionState === 'failed' ||
             peerConnection.connectionState === 'closed') {
-            
-            // Removed: dataChannel = null;
             if (audioElement) {
                 audioElement.srcObject = null; // Clear the stream from audio element
             }
@@ -229,64 +234,33 @@ function setupPeerConnectionHandlers() {
     peerConnection.ontrack = (event) => {
         console.log("Remote track received:", event.track, "Streams:", event.streams);
         if (event.streams && event.streams[0] && audioElement) {
-            if (document.getElementById('webrtcAudioEnabled')?.checked) {
-                audioElement.srcObject = event.streams[0];
-                audioElement.play().catch(e => console.error("Error playing WebRTC audio track:", e));
-                console.log("Assigned remote stream to audio element.");
-            } else {
-                console.log("WebRTC audio not enabled, not assigning stream.");
-            }
+            audioElement.srcObject = event.streams[0];
+            audioElement.play().catch(e => console.error("Error playing WebRTC audio track:", e));
+            console.log("Assigned remote stream to audio element.");
         } else {
-            console.warn("Received track, but no stream or audio element available or WebRTC not enabled.");
+            console.warn("Received track, but no stream or audio element available.");
         }
     };
 }
 
 async function stopWebRtcStream() {
+    // Clear any pending ICE candidates
+    pendingIceCandidates = [];
+
     if (peerConnection) {
         try {
             await connection.invoke("StopWebRtcStream");
-            
-            // Removed: dataChannel.close();
-            // Removed: dataChannel = null;
-            
+
             peerConnection.close();
             peerConnection = null;
-            
+
             if (audioElement) {
-                audioElement.srcObject = null; // Ensure audio stream is cleared
+                audioElement.srcObject = null;
             }
             console.log("WebRTC stream stopped");
         } catch (error) {
             console.error("Error stopping WebRTC stream:", error);
         }
-    }
-}
-
-// SignalR audio playback
-function playSignalRAudio(audioBase64) {
-    if (!document.getElementById('signalrAudioEnabled')?.checked) return;
-    
-    try {
-        // Convert base64 audio to blob
-        const binary = atob(audioBase64);
-        const arrayBuffer = new ArrayBuffer(binary.length);
-        const bytes = new Uint8Array(arrayBuffer);
-        
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        
-        const blob = new Blob([arrayBuffer], { type: 'audio/wav' });
-        const url = URL.createObjectURL(blob);
-        
-        // Play the audio through the audio element
-        if (audioElement && !audioElement.srcObject) {
-            audioElement.src = url;
-            audioElement.onended = () => URL.revokeObjectURL(url);
-        }
-    } catch (error) {
-        console.error("Error playing SignalR audio:", error);
     }
 }
 

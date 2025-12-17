@@ -3,6 +3,25 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 builder.Services.AddControllersWithViews();
 
+// Add CORS policy for SignalR clients
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("SignalRPolicy", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+
+    options.AddPolicy("SignalRWithCredentials", policy =>
+    {
+        policy.SetIsOriginAllowed(_ => true)
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
 // Configure Audio Settings from appsettings.json
 builder.Services.Configure<BabyMonitarr.Backend.Models.AudioSettings>(
     builder.Configuration.GetSection("AudioSettings"));
@@ -29,10 +48,13 @@ app.UseHttpsRedirection();
 app.UseStaticFiles();
 app.UseRouting();
 
+app.UseCors("SignalRWithCredentials");
+
 app.UseAuthorization();
 
 // Map SignalR hub
-app.MapHub<BabyMonitarr.Backend.Hubs.AudioStreamHub>("/audioHub");
+app.MapHub<BabyMonitarr.Backend.Hubs.AudioStreamHub>("/audioHub")
+   .RequireCors("SignalRWithCredentials");
 
 app.MapControllerRoute(
         name: "default",

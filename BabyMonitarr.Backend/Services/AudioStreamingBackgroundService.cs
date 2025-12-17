@@ -3,8 +3,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.AspNetCore.SignalR;
-using BabyMonitarr.Backend.Hubs;
 using BabyMonitarr.Backend.Services;
 
 namespace BabyMonitarr.Backend.Services;
@@ -13,18 +11,15 @@ public class AudioStreamingBackgroundService : BackgroundService
 {
     private readonly ILogger<AudioStreamingBackgroundService> _logger;
     private readonly IAudioProcessingService _audioService;
-    private readonly IHubContext<AudioStreamHub> _hubContext;
     private readonly IWebRtcService _webRtcService;
 
     public AudioStreamingBackgroundService(
         ILogger<AudioStreamingBackgroundService> logger,
         IAudioProcessingService audioService,
-        IHubContext<AudioStreamHub> hubContext,
         IWebRtcService webRtcService)
     {
         _logger = logger;
         _audioService = audioService;
-        _hubContext = hubContext;
         _webRtcService = webRtcService;
 
         // Subscribe to events
@@ -51,27 +46,15 @@ public class AudioStreamingBackgroundService : BackgroundService
         }
     }
 
-    private async void OnAudioSampleProcessed(object? sender, AudioSampleEventArgs e)
+    private void OnAudioSampleProcessed(object? sender, AudioSampleEventArgs e)
     {
         try
         {
-            // Send audio data to SignalR clients that are in the AudioStreamListeners group
-            await _hubContext.Clients.Group("AudioStreamListeners").SendAsync(
-                "ReceiveAudioData",
-                Convert.ToBase64String(e.AudioData),
-                e.AudioLevel,
-                e.Timestamp
-            );
-
-            // Send audio level updates to WebRTC clients (AudioLevelListeners group)
-            await _hubContext.Clients.Group("AudioLevelListeners").SendAsync(
-                "ReceiveAudioLevel",
-                e.AudioLevel,
-                e.Timestamp
-            );
-
             // Send audio data to WebRTC peers
             _webRtcService.SendAudioData(e.AudioData);
+
+            // Send audio level updates via WebRTC data channel
+            _webRtcService.SendAudioLevel(e.AudioLevel, e.Timestamp);
         }
         catch (Exception ex)
         {
@@ -79,19 +62,14 @@ public class AudioStreamingBackgroundService : BackgroundService
         }
     }
 
-    private async void OnSoundThresholdExceeded(object? sender, SoundThresholdEventArgs e)
+    private void OnSoundThresholdExceeded(object? sender, SoundThresholdEventArgs e)
     {
         try
         {
             _logger.LogInformation($"Sound threshold exceeded: {e.AudioLevel:F2} dB (threshold: {e.Threshold:F2} dB)");
-            
-            // Send notification to all connected clients
-            await _hubContext.Clients.All.SendAsync(
-                "SoundAlert", 
-                e.AudioLevel,
-                e.Threshold,
-                e.Timestamp
-            );
+
+            // Send notification via WebRTC data channel
+            _webRtcService.SendSoundAlert(e.AudioLevel, e.Threshold, e.Timestamp);
         }
         catch (Exception ex)
         {

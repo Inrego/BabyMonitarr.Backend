@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
@@ -35,6 +37,8 @@ namespace BabyMonitarr.Backend.Services
         event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionClosed;
         event EventHandler<IceCandidateEventArgs>? OnIceCandidateGenerated;
         void SendAudioData(byte[] audioData);
+        void SendAudioLevel(double audioLevel, DateTime timestamp);
+        void SendSoundAlert(double audioLevel, double threshold, DateTime timestamp);
     }
 
     public class WebRtcService : IWebRtcService, IDisposable
@@ -50,6 +54,8 @@ namespace BabyMonitarr.Backend.Services
             new ConcurrentDictionary<string, AudioEncoder>();
         private readonly ConcurrentDictionary<string, AudioFormat> _negotiatedFormats =
             new ConcurrentDictionary<string, AudioFormat>();
+        private readonly ConcurrentDictionary<string, RTCDataChannel> _dataChannels =
+            new ConcurrentDictionary<string, RTCDataChannel>();
 
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionCreated;
         public event EventHandler<WebRtcPeerConnectionEventArgs>? OnPeerConnectionClosed;
@@ -156,8 +162,9 @@ namespace BabyMonitarr.Backend.Services
                 pc.Close("Error adding audio track");
                 throw;
             }
-            
-            // Removed: CreateDataChannel(peerId, pc); // Data channel logic removed
+
+            // Create data channel for audio level updates
+            CreateDataChannel(peerId, pc);
             
             OnPeerConnectionCreated?.Invoke(this, new WebRtcPeerConnectionEventArgs
             {
@@ -168,7 +175,36 @@ namespace BabyMonitarr.Backend.Services
             return pc;
         }
 
-        // Removed: private async void CreateDataChannel(string peerId, RTCPeerConnection pc) { ... }
+        private async void CreateDataChannel(string peerId, RTCPeerConnection pc)
+        {
+            try
+            {
+                var dataChannel = await pc.createDataChannel("audioLevels", new RTCDataChannelInit());
+
+                dataChannel.onopen += () =>
+                {
+                    _logger.LogInformation($"Data channel opened for peer {peerId}");
+                };
+
+                dataChannel.onclose += () =>
+                {
+                    _logger.LogInformation($"Data channel closed for peer {peerId}");
+                    _dataChannels.TryRemove(peerId, out _);
+                };
+
+                dataChannel.onerror += (error) =>
+                {
+                    _logger.LogError($"Data channel error for peer {peerId}: {error}");
+                };
+
+                _dataChannels.TryAdd(peerId, dataChannel);
+                _logger.LogInformation($"Created data channel for peer {peerId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error creating data channel for peer {peerId}");
+            }
+        }
 
         public async Task<string> CreateOffer(string peerId)
         {
@@ -223,7 +259,9 @@ namespace BabyMonitarr.Backend.Services
                 throw new KeyNotFoundException($"No peer connection found for {peerId}");
             }
 
+            _logger.LogInformation($"Adding ICE candidate for peer {peerId}: {iceCandidate.candidate}");
             pc.addIceCandidate(iceCandidate);
+            _logger.LogInformation($"ICE candidate added. Connection state: {pc.connectionState}, ICE state: {pc.iceConnectionState}");
             return Task.CompletedTask;
         }
 
@@ -245,6 +283,13 @@ namespace BabyMonitarr.Backend.Services
             {
                 _logger.LogInformation($"Closing audio source for {peerId}");
                 audioSource.CloseAudio().Wait();
+            }
+
+            // Clean up data channel if exists
+            if (_dataChannels.TryRemove(peerId, out var dataChannel))
+            {
+                _logger.LogInformation($"Closing data channel for {peerId}");
+                dataChannel.close();
             }
 
             if (_peerConnections.TryRemove(peerId, out var pc))
@@ -337,6 +382,69 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
+        public void SendAudioLevel(double audioLevel, DateTime timestamp)
+        {
+            if (_dataChannels.IsEmpty)
+                return;
+
+            try
+            {
+                var unixTimestamp = new DateTimeOffset(timestamp).ToUnixTimeMilliseconds();
+                var message = JsonSerializer.Serialize(new
+                {
+                    type = "audioLevel",
+                    level = audioLevel,
+                    timestamp = unixTimestamp
+                });
+
+                var messageBytes = Encoding.UTF8.GetBytes(message);
+
+                foreach (var dataChannelPair in _dataChannels)
+                {
+                    var dataChannel = dataChannelPair.Value;
+                    if (dataChannel.readyState == RTCDataChannelState.open)
+                    {
+                        dataChannel.send(message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"Error sending audio level via data channel: {ex.Message}");
+            }
+        }
+
+        public void SendSoundAlert(double audioLevel, double threshold, DateTime timestamp)
+        {
+            if (_dataChannels.IsEmpty)
+                return;
+
+            try
+            {
+                var unixTimestamp = new DateTimeOffset(timestamp).ToUnixTimeMilliseconds();
+                var message = JsonSerializer.Serialize(new
+                {
+                    type = "soundAlert",
+                    level = audioLevel,
+                    threshold = threshold,
+                    timestamp = unixTimestamp
+                });
+
+                foreach (var dataChannelPair in _dataChannels)
+                {
+                    var dataChannel = dataChannelPair.Value;
+                    if (dataChannel.readyState == RTCDataChannelState.open)
+                    {
+                        dataChannel.send(message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug($"Error sending sound alert via data channel: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// Simple linear interpolation resampler
         /// </summary>
@@ -386,6 +494,7 @@ namespace BabyMonitarr.Backend.Services
             _audioSources.Clear();
             _audioEncoders.Clear();
             _negotiatedFormats.Clear();
+            _dataChannels.Clear();
         }
     }
 }

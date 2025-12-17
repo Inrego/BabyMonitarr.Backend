@@ -40,27 +40,10 @@ public class AudioStreamHub : Hub
         await base.OnDisconnectedAsync(exception);
     }
 
-    #region SignalR Streaming Methods
-    public async Task StartStream()
-    {
-        _logger.LogInformation($"Client {Context.ConnectionId} requested to start audio stream");
-        await Groups.AddToGroupAsync(Context.ConnectionId, "AudioStreamListeners");
-    }
-
-    public async Task StopStream()
-    {
-        _logger.LogInformation($"Client {Context.ConnectionId} requested to stop audio stream");
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, "AudioStreamListeners");
-    }
-    #endregion
-
     #region WebRTC Signaling Methods
     public async Task<string> StartWebRtcStream()
     {
         _logger.LogInformation($"Client {Context.ConnectionId} requested to start WebRTC stream");
-
-        // Add client to AudioLevelListeners group for audio level updates
-        await Groups.AddToGroupAsync(Context.ConnectionId, "AudioLevelListeners");
 
         // Create a peer connection for this client
         await _webRtcService.CreatePeerConnection(Context.ConnectionId);
@@ -100,10 +83,6 @@ public class AudioStreamHub : Hub
     public async Task StopWebRtcStream()
     {
         _logger.LogInformation($"Client {Context.ConnectionId} requested to stop WebRTC stream");
-
-        // Remove client from AudioLevelListeners group
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, "AudioLevelListeners");
-
         await _webRtcService.ClosePeerConnection(Context.ConnectionId);
     }
     #endregion

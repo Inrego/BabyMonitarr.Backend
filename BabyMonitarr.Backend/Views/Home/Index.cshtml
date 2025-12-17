@@ -26,33 +26,10 @@
 
                 <div id="soundAlert" class="alert alert-warning" style="display: none;"></div>
 
-                <div class="mb-4">
-                    <h5>Streaming Options</h5>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input" type="radio" name="streamType" id="signalrAudioEnabled" checked>
-                        <label class="form-check-label" for="signalrAudioEnabled">
-                            SignalR Audio (Standard)
-                        </label>
-                    </div>
-                    <div class="form-check mb-3">
-                        <input class="form-check-input" type="radio" name="streamType" id="webrtcAudioEnabled">
-                        <label class="form-check-label" for="webrtcAudioEnabled">
-                            WebRTC Audio (Low Latency)
-                        </label>
-                    </div>
-                </div>
-
-                <div class="row">
-                    <div class="col">
-                        <h5>SignalR Streaming</h5>
-                        <button id="startSignalRStreamBtn" class="btn btn-success">Start SignalR Stream</button>
-                        <button id="stopSignalRStreamBtn" class="btn btn-danger">Stop SignalR Stream</button>
-                    </div>
-                    <div class="col">
-                        <h5>WebRTC Streaming</h5>
-                        <button id="startWebRtcStreamBtn" class="btn btn-success">Start WebRTC Stream</button>
-                        <button id="stopWebRtcStreamBtn" class="btn btn-danger">Stop WebRTC Stream</button>
-                    </div>
+                <div class="mb-3">
+                    <h5>Audio Streaming</h5>
+                    <button id="startWebRtcStreamBtn" class="btn btn-success me-2">Start Stream</button>
+                    <button id="stopWebRtcStreamBtn" class="btn btn-danger">Stop Stream</button>
                 </div>
             </div>
         </div>
