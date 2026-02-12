@@ -3,3 +3,10 @@ obj/
 /packages/
 riderModule.iml
 /_ReSharper.Caches/
+.idea/
+FFmpeg/
+.vscode/
+.claude/
+
+# LibMan restored client-side libraries
+wwwroot/lib/*

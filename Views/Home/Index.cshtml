@@ -1,0 +1,104 @@
+﻿@model BabyMonitarr.Backend.Models.AudioSettings
+
+@{
+    ViewData["Title"] = "BabyMonitarr - Audio Monitor";
+}
+
+<div class="text-center">
+    <h1 class="display-4">BabyMonitarr</h1>
+    <p>Your baby monitor audio streaming solution</p>
+</div>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h4>Audio Monitor</h4>
+            </div>
+            <div class="card-body">
+                <div class="audio-meter mb-3">
+                    <label>Audio Level</label>
+                    <div class="progress">
+                        <div id="audioMeter" class="progress-bar" role="progressbar" style="width: 0%"></div>
+                    </div>
+                    <p>Current Level: <span id="audioLevelText">-90.0 dB</span></p>
+                </div>
+
+                <div id="soundAlert" class="alert alert-warning" style="display: none;"></div>
+
+                <div class="mb-3">
+                    <h5>Audio Streaming</h5>
+                    <button id="startWebRtcStreamBtn" class="btn btn-success me-2">Start Stream</button>
+                    <button id="stopWebRtcStreamBtn" class="btn btn-danger">Stop Stream</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h4>Audio Settings</h4>
+            </div>
+            <div class="card-body">
+                <div id="settingsMessage" style="display: none;"></div>
+
+                <h5 class="mb-3">Camera Settings</h5>
+                <div class="form-group mb-3">
+                    <label for="cameraStreamUrl">Camera Stream URL</label>
+                    <input id="cameraStreamUrl" class="form-control" type="text" value="@Model.CameraStreamUrl" />
+                    <small class="form-text text-muted">RTSP or HTTP URL to your camera stream</small>
+                </div>
+                
+                <div class="form-check mb-3">
+                    <input id="useCameraStream" class="form-check-input" type="checkbox" @(Model.UseCameraAudioStream ? "checked" : "") />
+                    <label for="useCameraStream" class="form-check-label">Use Camera Audio Stream</label>
+                    <small class="d-block form-text text-muted">Enable to use audio from camera instead of local microphone</small>
+                </div>
+
+                <hr class="my-4" />
+                
+                <h5 class="mb-3">Audio Processing</h5>
+                <div class="form-group mb-3">
+                    <label for="volumeAdjustment">Volume Adjustment (dB)</label>
+                    <input id="volumeAdjustment" class="form-control" type="number" step="0.5" value="@Model.VolumeAdjustmentDb" />
+                </div>
+
+                <div class="form-group mb-3">
+                    <label for="soundThreshold">Sound Threshold (dB)</label>
+                    <input id="soundThreshold" class="form-control" type="number" step="0.5" value="@Model.SoundThreshold" />
+                    <small class="form-text text-muted">Lower values are more sensitive</small>
+                </div>
+
+                <div class="form-check mb-3">
+                    <input id="filterEnabled" class="form-check-input" type="checkbox" @(Model.FilterEnabled ? "checked" : "") />
+                    <label for="filterEnabled" class="form-check-label">Enable Audio Filters</label>
+                </div>
+
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label for="highPassFrequency">High Pass (Hz)</label>
+                            <input id="highPassFrequency" class="form-control" type="number" min="20" max="2000" step="10" value="@Model.HighPassFrequency" />
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="form-group">
+                            <label for="lowPassFrequency">Low Pass (Hz)</label>
+                            <input id="lowPassFrequency" class="form-control" type="number" min="200" max="20000" step="100" value="@Model.LowPassFrequency" />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="text-center">
+                    <button id="saveSettingsBtn" class="btn btn-primary">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/lib/microsoft-signalr/signalr.js"></script>
+    <script src="~/js/site.js"></script>
+}
