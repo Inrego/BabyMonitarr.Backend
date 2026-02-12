@@ -1,6 +1,3 @@
-﻿// Please see documentation at https://learn.microsoft.com/aspnet/core/client-side/bundling-and-minification
-// for details on configuring this project to bundle and minify static web assets.
-
 // SignalR connection
 let connection;
 // WebRTC peer connection
@@ -11,6 +8,8 @@ let audioContext;
 let audioElement;
 // Queue for ICE candidates that arrive before peer connection is ready
 let pendingIceCandidates = [];
+// Debounce timer for auto-save
+let saveDebounceTimer;
 
 // Initialize the audio player and connections
 document.addEventListener('DOMContentLoaded', function () {
@@ -26,10 +25,12 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Create button listeners
     setupButtonListeners();
-    
+
+    // Setup toggle and input auto-save listeners
+    setupAutoSaveListeners();
+
     // Initialize audio context
     try {
-        // AudioContext must be created after user interaction
         document.addEventListener('click', initAudioContext, { once: true });
     } catch (error) {
         console.error("Error initializing audio:", error);
@@ -39,15 +40,14 @@ document.addEventListener('DOMContentLoaded', function () {
 function initAudioContext() {
     if (!audioContext) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({
-            latencyHint: 'interactive',  // Optimize for low latency
-            sampleRate: 44100           // Use standard sample rate
+            latencyHint: 'interactive',
+            sampleRate: 44100
         });
         console.log("Audio context initialized with latency mode: interactive");
     }
 }
 
 function initializeSignalRConnection() {
-    // Create the SignalR connection
     connection = new signalR.HubConnectionBuilder()
         .withUrl("/audioHub")
         .withAutomaticReconnect()
@@ -56,7 +56,6 @@ function initializeSignalRConnection() {
     // Handle server ICE candidates
     connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
         console.log("Received server ICE candidate:", candidate);
-        // Ensure the candidate string has the proper format (must start with "candidate:")
         const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
         const iceCandidate = new RTCIceCandidate({
             candidate: candidateStr,
@@ -69,21 +68,17 @@ function initializeSignalRConnection() {
                 await peerConnection.addIceCandidate(iceCandidate);
                 console.log("Added server ICE candidate successfully");
             } catch (err) {
-                // Log but don't fail - connection may still succeed via other candidates
                 console.warn("Could not add server ICE candidate:", err.message);
             }
         } else {
-            // Queue the candidate for later
             console.log("Queuing ICE candidate - peer connection not ready yet");
             pendingIceCandidates.push(iceCandidate);
         }
     });
 
-    // Start the connection
     connection.start()
         .then(() => {
             console.log("SignalR Connected");
-            // Get initial audio settings
             return connection.invoke("GetAudioSettings");
         })
         .then(settings => {
@@ -96,35 +91,49 @@ function initializeSignalRConnection() {
 }
 
 function setupButtonListeners() {
-    // Start WebRTC streaming button
     document.getElementById('startWebRtcStreamBtn')?.addEventListener('click', function() {
         startWebRtcStream();
     });
 
-    // Stop WebRTC streaming button
     document.getElementById('stopWebRtcStreamBtn')?.addEventListener('click', function() {
         stopWebRtcStream();
     });
+}
 
-    // Save settings button
-    document.getElementById('saveSettingsBtn')?.addEventListener('click', function() {
-        saveAudioSettings();
+function setupAutoSaveListeners() {
+    // Toggle switches - save immediately on change
+    const toggleIds = ['useCameraStream', 'reduceNoise', 'filterEnabled'];
+    toggleIds.forEach(id => {
+        document.getElementById(id)?.addEventListener('change', function() {
+            saveAudioSettings();
+        });
+    });
+
+    // Text/number inputs - save after a short debounce
+    const inputIds = ['cameraStreamUrl', 'soundThreshold', 'highPassFrequency', 'lowPassFrequency'];
+    inputIds.forEach(id => {
+        document.getElementById(id)?.addEventListener('change', function() {
+            debouncedSave();
+        });
     });
 }
 
-// WebRTC Implementation with Media Stream for audio streaming
+function debouncedSave() {
+    clearTimeout(saveDebounceTimer);
+    saveDebounceTimer = setTimeout(() => {
+        saveAudioSettings();
+    }, 500);
+}
+
+// WebRTC Implementation
 async function startWebRtcStream() {
     try {
-        // Close any existing peer connection
         if (peerConnection) {
             await stopWebRtcStream();
         }
 
         console.log("Starting WebRTC stream...");
-        // initAudioContext(); // AudioContext not strictly needed for direct MediaStream playback
 
-        // Get the offer SDP from the server
-        // The Hub method should be updated if its responsibilities change, but for now, assume it's just an offer
         console.log("Calling StartWebRtcStream on hub...");
         const offerSdp = await connection.invoke("StartWebRtcStream");
         console.log("Got offer from server");
@@ -146,7 +155,6 @@ async function startWebRtcStream() {
 
         await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
 
-        // Process any ICE candidates that arrived before negotiation completed
         if (pendingIceCandidates.length > 0) {
             console.log(`Processing ${pendingIceCandidates.length} queued ICE candidates`);
             for (const candidate of pendingIceCandidates) {
@@ -154,13 +162,14 @@ async function startWebRtcStream() {
                     await peerConnection.addIceCandidate(candidate);
                     console.log("Added queued ICE candidate successfully");
                 } catch (err) {
-                    // Log but don't fail - connection may still succeed via other candidates
                     console.warn("Could not add queued ICE candidate:", err.message);
                 }
             }
             pendingIceCandidates = [];
         }
 
+        // Update monitoring badge
+        setMonitoringState(true);
         console.log("WebRTC stream negotiation started");
     } catch (error) {
         console.error("Error starting WebRTC stream:", error);
@@ -182,7 +191,6 @@ function setupPeerConnectionHandlers() {
         }
     };
 
-    // Handle incoming data channel for audio level updates
     peerConnection.ondatachannel = (event) => {
         console.log("Data channel received:", event.channel.label);
         const dataChannel = event.channel;
@@ -213,24 +221,24 @@ function setupPeerConnectionHandlers() {
         };
     };
 
-    // Handle connection state changes
     peerConnection.onconnectionstatechange = () => {
         console.log("WebRTC connection state:", peerConnection.connectionState);
 
         if (peerConnection.connectionState === 'connected') {
             console.log("WebRTC connected. Audio should be streaming via track.");
+            setMonitoringState(true);
         }
 
         if (peerConnection.connectionState === 'disconnected' ||
             peerConnection.connectionState === 'failed' ||
             peerConnection.connectionState === 'closed') {
             if (audioElement) {
-                audioElement.srcObject = null; // Clear the stream from audio element
+                audioElement.srcObject = null;
             }
+            setMonitoringState(false);
         }
     };
 
-    // Handle incoming remote tracks
     peerConnection.ontrack = (event) => {
         console.log("Remote track received:", event.track, "Streams:", event.streams);
         if (event.streams && event.streams[0] && audioElement) {
@@ -244,7 +252,6 @@ function setupPeerConnectionHandlers() {
 }
 
 async function stopWebRtcStream() {
-    // Clear any pending ICE candidates
     pendingIceCandidates = [];
 
     if (peerConnection) {
@@ -257,6 +264,8 @@ async function stopWebRtcStream() {
             if (audioElement) {
                 audioElement.srcObject = null;
             }
+
+            setMonitoringState(false);
             console.log("WebRTC stream stopped");
         } catch (error) {
             console.error("Error stopping WebRTC stream:", error);
@@ -265,42 +274,50 @@ async function stopWebRtcStream() {
 }
 
 // UI updates
+function setMonitoringState(isMonitoring) {
+    const badge = document.getElementById('monitoringBadge');
+    const badgeText = document.getElementById('monitoringBadgeText');
+    if (!badge || !badgeText) return;
+
+    if (isMonitoring) {
+        badge.classList.remove('inactive');
+        badgeText.textContent = 'Currently Monitoring';
+    } else {
+        badge.classList.add('inactive');
+        badgeText.textContent = 'Not Monitoring';
+    }
+}
+
 function updateAudioMeter(level) {
     const meter = document.getElementById('audioMeter');
     if (!meter) return;
-    
-    // Map the dB level to a meter percentage
-    // Assuming level is in dB between -90 and 0
+
+    // Map the dB level to a meter percentage (-90 to 0)
     const minDb = -90;
     const percentage = 100 - Math.max(0, Math.min(100, ((level - 0) / minDb) * 100));
-    
+
     meter.style.width = percentage + '%';
-    
-    // Update color based on level
-    if (level > -20) {
-        meter.style.backgroundColor = '#ff6347'; // High (red)
-    } else if (level > -40) {
-        meter.style.backgroundColor = '#ffa500'; // Medium (orange)
-    } else {
-        meter.style.backgroundColor = '#4caf50'; // Low (green)
+
+    // Update large number display
+    const levelValue = document.getElementById('audioLevelValue');
+    if (levelValue) {
+        levelValue.textContent = Math.abs(level).toFixed(1);
     }
-    
-    // Update level text if present
+
+    // Update subtitle text
     const levelText = document.getElementById('audioLevelText');
     if (levelText) {
-        levelText.textContent = level.toFixed(1) + ' dB';
+        levelText.textContent = level.toFixed(1);
     }
 }
 
 function showSoundAlert(level, threshold) {
     const alertElement = document.getElementById('soundAlert');
     if (!alertElement) return;
-    
-    // Show the alert with level and threshold info
+
     alertElement.textContent = `Sound detected: ${level.toFixed(1)} dB (threshold: ${threshold.toFixed(1)} dB)`;
     alertElement.style.display = 'block';
-    
-    // Hide after 5 seconds
+
     setTimeout(() => {
         alertElement.style.display = 'none';
     }, 5000);
@@ -309,45 +326,47 @@ function showSoundAlert(level, threshold) {
 // Settings management
 function updateSettingsUI(settings) {
     if (!settings) return;
-    
-    // Update each setting input
-    const volumeInput = document.getElementById('volumeAdjustment');
-    if (volumeInput) volumeInput.value = settings.volumeAdjustmentDb;
-    
+
     const highPassInput = document.getElementById('highPassFrequency');
     if (highPassInput) highPassInput.value = settings.highPassFrequency;
-    
+
     const lowPassInput = document.getElementById('lowPassFrequency');
     if (lowPassInput) lowPassInput.value = settings.lowPassFrequency;
-    
+
     const thresholdInput = document.getElementById('soundThreshold');
     if (thresholdInput) thresholdInput.value = settings.soundThreshold;
-    
+
+    // Both "Reduce Background Noise" and "Enable Audio Filters" map to filterEnabled
+    const reduceNoiseInput = document.getElementById('reduceNoise');
+    if (reduceNoiseInput) reduceNoiseInput.checked = settings.filterEnabled;
+
     const filterEnabledInput = document.getElementById('filterEnabled');
     if (filterEnabledInput) filterEnabledInput.checked = settings.filterEnabled;
-    
+
     const useCameraStreamInput = document.getElementById('useCameraStream');
     if (useCameraStreamInput) useCameraStreamInput.checked = settings.useCameraAudioStream;
-    
+
     const cameraUrlInput = document.getElementById('cameraStreamUrl');
-    if (cameraUrlInput) cameraUrlInput.value = settings.cameraStreamUrl;
+    if (cameraUrlInput) cameraUrlInput.value = settings.cameraStreamUrl || '';
 }
 
 function saveAudioSettings() {
-    // Collect settings from form inputs
+    // Determine filterEnabled from either toggle (they both control it)
+    const reduceNoise = document.getElementById('reduceNoise')?.checked || false;
+    const filterEnabled = document.getElementById('filterEnabled')?.checked || false;
+
     const settings = {
-        volumeAdjustmentDb: parseFloat(document.getElementById('volumeAdjustment')?.value || 0),
+        volumeAdjustmentDb: -15.0, // Keep default since removed from UI
         highPassFrequency: parseFloat(document.getElementById('highPassFrequency')?.value || 300),
         lowPassFrequency: parseFloat(document.getElementById('lowPassFrequency')?.value || 2000),
         soundThreshold: parseFloat(document.getElementById('soundThreshold')?.value || -50),
-        filterEnabled: document.getElementById('filterEnabled')?.checked || false,
+        filterEnabled: reduceNoise || filterEnabled,
         useCameraAudioStream: document.getElementById('useCameraStream')?.checked || false,
         cameraStreamUrl: document.getElementById('cameraStreamUrl')?.value || '',
-        thresholdPauseDuration: 10, // Default or get from UI if you have an input
-        averageSampleCount: 10 // Default or get from UI if you have an input
+        thresholdPauseDuration: 10,
+        averageSampleCount: 10
     };
-    
-    // Send settings to the server
+
     connection.invoke("UpdateAudioSettings", settings)
         .then(() => {
             showMessage("Settings saved successfully");
@@ -361,12 +380,11 @@ function saveAudioSettings() {
 function showMessage(message, isError = false) {
     const messageElement = document.getElementById('settingsMessage');
     if (!messageElement) return;
-    
+
     messageElement.textContent = message;
-    messageElement.className = isError ? 'error-message' : 'success-message';
+    messageElement.className = 'settings-toast ' + (isError ? 'error' : 'success');
     messageElement.style.display = 'block';
-    
-    // Hide after 3 seconds
+
     setTimeout(() => {
         messageElement.style.display = 'none';
     }, 3000);
