@@ -164,8 +164,8 @@ function renderDashboard() {
     grid.innerHTML = currentRooms.map(room => {
         const isListening = !!audioConnections[room.id];
         const isMuted = !!mutedRooms[room.id];
-        const hasVideo = room.enableVideoStream && room.cameraStreamUrl;
-        const hasAudio = room.enableAudioStream && room.cameraStreamUrl;
+        const hasVideo = room.enableVideoStream && (room.cameraStreamUrl || room.nestDeviceId);
+        const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
         return `
             <div class="dash-card" data-room-id="${room.id}">
                 <div class="dash-card-preview">
@@ -370,7 +370,7 @@ async function stopAllVideoStreams() {
 
 // ===== Audio Stream Management (per-room) =====
 async function manageAudioStreams(previousRooms) {
-    const audioRooms = currentRooms.filter(r => r.enableAudioStream && r.cameraStreamUrl);
+    const audioRooms = currentRooms.filter(r => r.enableAudioStream && (r.cameraStreamUrl || r.nestDeviceId));
     const audioRoomIds = new Set(audioRooms.map(r => r.id));
 
     // Stop audio for rooms that were removed or had audio disabled

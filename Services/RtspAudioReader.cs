@@ -63,7 +63,8 @@ namespace BabyMonitarr.Backend.Services
                 
                 // Set FFmpeg library path to our bundled copy
                 ffmpeg.RootPath = ffmpegPath;
-                
+                DynamicallyLoadedBindings.Initialize();
+
                 // Configure FFmpeg logging
                 ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);  // Only show warnings and errors
                 

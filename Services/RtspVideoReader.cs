@@ -57,6 +57,7 @@ namespace BabyMonitarr.Backend.Services
                 }
 
                 ffmpeg.RootPath = ffmpegPath;
+                DynamicallyLoadedBindings.Initialize();
                 ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);
             }
             catch (Exception ex)
@@ -221,7 +222,7 @@ namespace BabyMonitarr.Backend.Services
                 swsContext = ffmpeg.sws_getContext(
                     srcWidth, srcHeight, srcPixFmt,
                     dstWidth, dstHeight, AVPixelFormat.AV_PIX_FMT_YUV420P,
-                    ffmpeg.SWS_BILINEAR, null, null, null);
+                    (int)SwsFlags.SWS_BILINEAR, null, null, null);
 
                 if (swsContext == null)
                 {

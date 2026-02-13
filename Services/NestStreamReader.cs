@@ -37,6 +37,11 @@ public class NestStreamReader : IDisposable
     // H264 depacketization state
     private readonly List<byte[]> _h264NalBuffer = new();
 
+    // Diagnostic counters
+    private long _rtpVideoPacketCount;
+    private long _rtpAudioPacketCount;
+    private long _decodedFrameCount;
+
     // Frame rate limiting
     private DateTime _lastVideoFrameTime = DateTime.MinValue;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(1000.0 / TargetFps);
@@ -78,11 +83,13 @@ public class NestStreamReader : IDisposable
             string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
             string ffmpegPath = Path.Combine(appPath, "FFmpeg");
 
-            if (Directory.Exists(ffmpegPath))
+            if (!Directory.Exists(ffmpegPath))
             {
-                ffmpeg.RootPath = ffmpegPath;
+                throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
             }
 
+            ffmpeg.RootPath = ffmpegPath;
+            DynamicallyLoadedBindings.Initialize();
             ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);
         }
         catch (Exception ex)
@@ -196,6 +203,11 @@ public class NestStreamReader : IDisposable
             _logger.LogInformation("Nest WebRTC connection state for room {RoomId}: {State}", _roomId, state);
         };
 
+        _peerConnection.oniceconnectionstatechange += (state) =>
+        {
+            _logger.LogInformation("Nest ICE connection state for room {RoomId}: {State}", _roomId, state);
+        };
+
         // Create offer
         var offer = _peerConnection.createOffer();
         await _peerConnection.setLocalDescription(offer);
@@ -215,13 +227,41 @@ public class NestStreamReader : IDisposable
         }
         _mediaSessionId = streamInfo.MediaSessionId;
 
-        // Strip ICE candidate lines from Google's SDP answer - SIPSorcery's parser
-        // can't handle the candidate format Google uses, and the connection info
-        // comes from the SDP c= line for this server-negotiated WebRTC session.
+        // Extract ICE candidates from Google's SDP answer before stripping them.
+        // SIPSorcery's SDP parser can't handle Google's candidate format, so we
+        // strip them from the SDP and add them individually via addIceCandidate().
+        var sdpLines = streamInfo.SdpAnswer.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        var iceCandidates = new List<(string candidate, string? sdpMid, ushort sdpMLineIndex)>();
+        string? currentMid = null;
+        ushort currentMLineIndex = 0;
+        bool firstMLine = true;
+
+        foreach (var line in sdpLines)
+        {
+            if (line.StartsWith("m="))
+            {
+                if (firstMLine)
+                    firstMLine = false;
+                else
+                    currentMLineIndex++;
+            }
+            else if (line.StartsWith("a=mid:"))
+            {
+                currentMid = line.Substring(6);
+            }
+            else if (line.StartsWith("a=candidate:"))
+            {
+                // Store the candidate value (without the "a=" prefix)
+                iceCandidates.Add((line.Substring(2), currentMid, currentMLineIndex));
+            }
+        }
+
+        _logger.LogInformation("Extracted {Count} ICE candidates from Nest SDP answer for room {RoomId}",
+            iceCandidates.Count, _roomId);
+
+        // Strip candidate lines from SDP so SIPSorcery's parser doesn't choke
         var cleanedSdp = string.Join("\r\n",
-            streamInfo.SdpAnswer
-                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
-                .Where(line => !line.StartsWith("a=candidate:")));
+            sdpLines.Where(line => !line.StartsWith("a=candidate:")));
 
         var answer = new RTCSessionDescriptionInit
         {
@@ -232,6 +272,19 @@ public class NestStreamReader : IDisposable
         if (result != SetDescriptionResultEnum.OK)
         {
             throw new Exception($"Failed to set remote description: {result}");
+        }
+
+        // Add ICE candidates individually after remote description is set
+        foreach (var (candidate, mid, index) in iceCandidates)
+        {
+            _logger.LogDebug("Adding ICE candidate for room {RoomId}: mid={Mid}, index={Index}, candidate={Candidate}",
+                _roomId, mid, index, candidate);
+            _peerConnection.addIceCandidate(new RTCIceCandidateInit
+            {
+                candidate = candidate,
+                sdpMid = mid,
+                sdpMLineIndex = index
+            });
         }
 
         _logger.LogInformation("Nest WebRTC connection established for room {RoomId}, media session: {SessionId}",
@@ -327,10 +380,22 @@ public class NestStreamReader : IDisposable
         {
             if (mediaType == SDPMediaTypesEnum.audio)
             {
+                var count = Interlocked.Increment(ref _rtpAudioPacketCount);
+                if (count == 1)
+                    _logger.LogInformation("First audio RTP packet received from Nest for room {RoomId}", _roomId);
+                else if (count % 500 == 0)
+                    _logger.LogDebug("Nest audio RTP packets received for room {RoomId}: {Count}", _roomId, count);
+
                 ProcessAudioRtp(rtpPacket);
             }
             else if (mediaType == SDPMediaTypesEnum.video)
             {
+                var count = Interlocked.Increment(ref _rtpVideoPacketCount);
+                if (count == 1)
+                    _logger.LogInformation("First video RTP packet received from Nest for room {RoomId}", _roomId);
+                else if (count % 500 == 0)
+                    _logger.LogDebug("Nest video RTP packets received for room {RoomId}: {Count}", _roomId, count);
+
                 ProcessVideoRtp(rtpPacket);
             }
         }
@@ -506,6 +571,7 @@ public class NestStreamReader : IDisposable
             }
 
             _videoDecoderInitialized = true;
+            _logger.LogInformation("H264 decoder initialized for Nest stream room {RoomId}", _roomId);
         }
 
         // Send data to decoder
@@ -543,7 +609,7 @@ public class NestStreamReader : IDisposable
                         _swsContext = ffmpeg.sws_getContext(
                             _decodedWidth, _decodedHeight, _videoCodecContext->pix_fmt,
                             dstW, dstH, AVPixelFormat.AV_PIX_FMT_YUV420P,
-                            ffmpeg.SWS_BILINEAR, null, null, null);
+                            (int)SwsFlags.SWS_BILINEAR, null, null, null);
                     }
 
                     EmitI420Frame(frame);
@@ -616,6 +682,13 @@ public class NestStreamReader : IDisposable
         }
 
         ffmpeg.av_frame_free(&i420Frame);
+
+        var frameCount = Interlocked.Increment(ref _decodedFrameCount);
+        if (frameCount == 1)
+            _logger.LogInformation("First decoded video frame emitted for Nest room {RoomId} ({Width}x{Height})",
+                _roomId, dstWidth, dstHeight);
+        else if (frameCount % 100 == 0)
+            _logger.LogDebug("Nest decoded video frames for room {RoomId}: {Count}", _roomId, frameCount);
 
         VideoFrameReceived?.Invoke(this, new VideoFrameEventArgs
         {

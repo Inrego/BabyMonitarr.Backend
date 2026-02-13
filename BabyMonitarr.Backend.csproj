@@ -8,17 +8,17 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
-      <PackageReference Include="Microsoft.AspNetCore.SignalR" Version="1.2.0" />
-      <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="9.0.3" />
+      <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
+      <PackageReference Include="Microsoft.AspNetCore.SignalR" Version="1.2.9" />
+      <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.3" />
       <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.2" />
       <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.2">
         <PrivateAssets>all</PrivateAssets>
         <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       </PackageReference>
       <PackageReference Include="NAudio" Version="2.2.1" />
-      <PackageReference Include="SIPSorcery" Version="8.0.11" />
-      <PackageReference Include="SIPSorceryMedia.Encoders" Version="8.0.7" />
+      <PackageReference Include="SIPSorcery" Version="10.0.3" />
+      <PackageReference Include="SIPSorceryMedia.Encoders" Version="10.0.4" />
     </ItemGroup>
 
     <ItemGroup>
