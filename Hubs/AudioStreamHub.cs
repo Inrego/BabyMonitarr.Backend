@@ -11,54 +11,61 @@ namespace BabyMonitarr.Backend.Hubs;
 public class AudioStreamHub : Hub
 {
     private readonly ILogger<AudioStreamHub> _logger;
-    private readonly IAudioProcessingService _audioService;
-    private readonly IWebRtcService _webRtcService;
+    private readonly IAudioWebRtcService _audioWebRtcService;
+    private readonly IAudioStreamingService _audioStreamingService;
     private readonly IRoomService _roomService;
+    private readonly IVideoWebRtcService _videoWebRtcService;
+    private readonly IVideoStreamingService _videoStreamingService;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
-        IAudioProcessingService audioService,
-        IWebRtcService webRtcService,
-        IRoomService roomService)
+        IAudioWebRtcService audioWebRtcService,
+        IAudioStreamingService audioStreamingService,
+        IRoomService roomService,
+        IVideoWebRtcService videoWebRtcService,
+        IVideoStreamingService videoStreamingService)
     {
         _logger = logger;
-        _audioService = audioService;
-        _webRtcService = webRtcService;
+        _audioWebRtcService = audioWebRtcService;
+        _audioStreamingService = audioStreamingService;
         _roomService = roomService;
+        _videoWebRtcService = videoWebRtcService;
+        _videoStreamingService = videoStreamingService;
     }
 
     public override async Task OnConnectedAsync()
     {
-        _logger.LogInformation($"Client connected: {Context.ConnectionId}");
+        _logger.LogInformation("Client connected: {ConnectionId}", Context.ConnectionId);
         await base.OnConnectedAsync();
     }
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        _logger.LogInformation($"Client disconnected: {Context.ConnectionId}");
+        _logger.LogInformation("Client disconnected: {ConnectionId}", Context.ConnectionId);
 
-        // Close any WebRTC peer connection for this client
-        await _webRtcService.ClosePeerConnection(Context.ConnectionId);
+        // Close all audio peer connections for this client
+        await _audioWebRtcService.CloseAllAudioPeerConnections(Context.ConnectionId);
+
+        // Close all video peer connections for this client
+        await _videoWebRtcService.CloseAllVideoPeerConnections(Context.ConnectionId);
 
         await base.OnDisconnectedAsync(exception);
     }
 
-    #region WebRTC Signaling Methods
-    public async Task<string> StartWebRtcStream()
+    #region Audio WebRTC Signaling Methods
+    public async Task<string> StartAudioStream(int roomId)
     {
-        _logger.LogInformation($"Client {Context.ConnectionId} requested to start WebRTC stream");
+        _logger.LogInformation("Client {ConnectionId} requested audio stream for room {RoomId}",
+            Context.ConnectionId, roomId);
 
-        // Create a peer connection for this client
-        await _webRtcService.CreatePeerConnection(Context.ConnectionId);
-
-        // Create an offer and return the SDP
-        var offerSdp = await _webRtcService.CreateOffer(Context.ConnectionId);
+        var offerSdp = await _audioWebRtcService.CreateAudioPeerConnection(Context.ConnectionId, roomId);
         return offerSdp;
     }
 
-    public async Task SetRemoteDescription(string type, string sdp)
+    public async Task SetAudioRemoteDescription(int roomId, string type, string sdp)
     {
-        _logger.LogInformation($"Client {Context.ConnectionId} sent SDP answer");
+        _logger.LogInformation("Client {ConnectionId} sent audio SDP answer for room {RoomId}",
+            Context.ConnectionId, roomId);
 
         var description = new RTCSessionDescriptionInit
         {
@@ -66,13 +73,11 @@ public class AudioStreamHub : Hub
             sdp = sdp
         };
 
-        await _webRtcService.SetRemoteDescription(Context.ConnectionId, description);
+        await _audioWebRtcService.SetAudioRemoteDescription(Context.ConnectionId, roomId, description);
     }
 
-    public async Task AddIceCandidate(string candidate, string sdpMid, int? sdpMLineIndex)
+    public async Task AddAudioIceCandidate(int roomId, string candidate, string sdpMid, int? sdpMLineIndex)
     {
-        _logger.LogInformation($"Client {Context.ConnectionId} sent ICE candidate");
-
         var iceCandidate = new RTCIceCandidateInit
         {
             candidate = candidate,
@@ -80,13 +85,58 @@ public class AudioStreamHub : Hub
             sdpMLineIndex = (ushort)(sdpMLineIndex ?? 0)
         };
 
-        await _webRtcService.AddIceCandidate(Context.ConnectionId, iceCandidate);
+        await _audioWebRtcService.AddAudioIceCandidate(Context.ConnectionId, roomId, iceCandidate);
     }
 
-    public async Task StopWebRtcStream()
+    public async Task StopAudioStream(int roomId)
     {
-        _logger.LogInformation($"Client {Context.ConnectionId} requested to stop WebRTC stream");
-        await _webRtcService.ClosePeerConnection(Context.ConnectionId);
+        _logger.LogInformation("Client {ConnectionId} requested to stop audio stream for room {RoomId}",
+            Context.ConnectionId, roomId);
+        await _audioWebRtcService.CloseAudioPeerConnection(Context.ConnectionId, roomId);
+    }
+    #endregion
+
+    #region Video WebRTC Signaling Methods
+    public async Task<string> StartVideoStream(int roomId)
+    {
+        _logger.LogInformation("Client {ConnectionId} requested video stream for room {RoomId}",
+            Context.ConnectionId, roomId);
+
+        var offerSdp = await _videoWebRtcService.CreateVideoPeerConnection(Context.ConnectionId, roomId);
+        return offerSdp;
+    }
+
+    public async Task SetVideoRemoteDescription(int roomId, string type, string sdp)
+    {
+        _logger.LogInformation("Client {ConnectionId} sent video SDP answer for room {RoomId}",
+            Context.ConnectionId, roomId);
+
+        var description = new RTCSessionDescriptionInit
+        {
+            type = type == "answer" ? RTCSdpType.answer : RTCSdpType.offer,
+            sdp = sdp
+        };
+
+        await _videoWebRtcService.SetVideoRemoteDescription(Context.ConnectionId, roomId, description);
+    }
+
+    public async Task AddVideoIceCandidate(int roomId, string candidate, string sdpMid, int? sdpMLineIndex)
+    {
+        var iceCandidate = new RTCIceCandidateInit
+        {
+            candidate = candidate,
+            sdpMid = sdpMid,
+            sdpMLineIndex = (ushort)(sdpMLineIndex ?? 0)
+        };
+
+        await _videoWebRtcService.AddVideoIceCandidate(Context.ConnectionId, roomId, iceCandidate);
+    }
+
+    public async Task StopVideoStream(int roomId)
+    {
+        _logger.LogInformation("Client {ConnectionId} requested to stop video stream for room {RoomId}",
+            Context.ConnectionId, roomId);
+        await _videoWebRtcService.CloseVideoPeerConnection(Context.ConnectionId, roomId);
     }
     #endregion
 
@@ -99,6 +149,8 @@ public class AudioStreamHub : Hub
     public async Task<Room> CreateRoom(Room room)
     {
         var created = await _roomService.CreateRoomAsync(room);
+        _videoStreamingService.RefreshRooms();
+        _audioStreamingService.RefreshRooms();
         await Clients.Others.SendAsync("RoomsUpdated");
         return created;
     }
@@ -108,14 +160,9 @@ public class AudioStreamHub : Hub
         var updated = await _roomService.UpdateRoomAsync(room);
         if (updated != null)
         {
+            _videoStreamingService.RefreshRooms();
+            _audioStreamingService.RefreshRooms();
             await Clients.Others.SendAsync("RoomsUpdated");
-
-            // If the updated room is the active one, refresh audio settings
-            if (updated.IsActive)
-            {
-                var settings = await _roomService.GetComposedAudioSettingsAsync();
-                _audioService.UpdateSettings(settings);
-            }
         }
         return updated;
     }
@@ -125,6 +172,8 @@ public class AudioStreamHub : Hub
         var result = await _roomService.DeleteRoomAsync(id);
         if (result)
         {
+            _videoStreamingService.RefreshRooms();
+            _audioStreamingService.RefreshRooms();
             await Clients.Others.SendAsync("RoomsUpdated");
         }
         return result;
@@ -135,10 +184,6 @@ public class AudioStreamHub : Hub
         var room = await _roomService.SetActiveRoomAsync(roomId);
         if (room != null)
         {
-            // Update audio service with new room's settings
-            var settings = await _roomService.GetComposedAudioSettingsAsync();
-            _audioService.UpdateSettings(settings);
-
             await Clients.All.SendAsync("ActiveRoomChanged", room);
         }
         return room;
@@ -163,12 +208,11 @@ public class AudioStreamHub : Hub
 
     public async Task UpdateAudioSettings(GlobalSettings settings)
     {
-        _logger.LogInformation($"Client {Context.ConnectionId} updated audio settings");
+        _logger.LogInformation("Client {ConnectionId} updated audio settings", Context.ConnectionId);
         await _roomService.UpdateGlobalSettingsAsync(settings);
 
-        // Update the running audio service
-        var composed = await _roomService.GetComposedAudioSettingsAsync();
-        _audioService.UpdateSettings(composed);
+        // Refresh audio streaming service so processors pick up new settings
+        _audioStreamingService.RefreshRooms();
 
         await Clients.Others.SendAsync("SettingsUpdated");
     }

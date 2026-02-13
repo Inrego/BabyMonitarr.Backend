@@ -15,6 +15,7 @@ let saveDebounceTimer;
 let currentRooms = [];
 let activeRoomId = null;
 let selectedRoomId = null; // Room being edited in right panel
+let previewRoomId = null;  // Room being audio-previewed
 let globalSettings = {};
 let selectedIcon = 'baby';
 
@@ -64,9 +65,9 @@ function initializeSignalRConnection() {
         .withAutomaticReconnect()
         .build();
 
-    // Handle server ICE candidates
-    connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
-        console.log("Received server ICE candidate:", candidate);
+    // Handle server ICE candidates (audio - per room)
+    connection.on("ReceiveAudioIceCandidate", async (roomId, candidate, sdpMid, sdpMLineIndex) => {
+        console.log("Received server audio ICE candidate for room:", roomId);
         const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
         const iceCandidate = new RTCIceCandidate({
             candidate: candidateStr,
@@ -74,7 +75,7 @@ function initializeSignalRConnection() {
             sdpMLineIndex: sdpMLineIndex
         });
 
-        if (peerConnection && peerConnection.remoteDescription) {
+        if (peerConnection && peerConnection.remoteDescription && previewRoomId === roomId) {
             try {
                 await peerConnection.addIceCandidate(iceCandidate);
                 console.log("Added server ICE candidate successfully");
@@ -246,14 +247,11 @@ function selectMonitorForEditing(id) {
     const enableVideo = document.getElementById('enableVideoStream');
     if (enableVideo) enableVideo.checked = room.enableVideoStream;
 
+    const enableAudio = document.getElementById('enableAudioStream');
+    if (enableAudio) enableAudio.checked = room.enableAudioStream;
+
     const cameraUrl = document.getElementById('cameraStreamUrl');
     if (cameraUrl) cameraUrl.value = room.cameraStreamUrl || '';
-
-    const useCameraAudio = document.getElementById('useCameraStream');
-    if (useCameraAudio) useCameraAudio.checked = room.useCameraAudioStream;
-
-    const fallbackDevice = document.getElementById('fallbackAudioDevice');
-    if (fallbackDevice) fallbackDevice.value = room.fallbackAudioDevice || '';
 
     // Re-render list to show editing state
     renderMonitorList();
@@ -291,11 +289,10 @@ async function addNewMonitor() {
             icon: "baby",
             monitorType: "camera_audio",
             enableVideoStream: false,
+            enableAudioStream: true,
             cameraStreamUrl: "",
             cameraUsername: "",
             cameraPassword: "",
-            useCameraAudioStream: false,
-            fallbackAudioDevice: "",
             isActive: false
         });
 
@@ -325,11 +322,10 @@ async function saveRoomConfig() {
         icon: selectedIcon,
         monitorType: document.getElementById('monitorType')?.value || 'camera_audio',
         enableVideoStream: document.getElementById('enableVideoStream')?.checked || false,
+        enableAudioStream: document.getElementById('enableAudioStream')?.checked || false,
         cameraStreamUrl: document.getElementById('cameraStreamUrl')?.value || '',
         cameraUsername: room.cameraUsername || '',
         cameraPassword: room.cameraPassword || '',
-        useCameraAudioStream: document.getElementById('useCameraStream')?.checked || false,
-        fallbackAudioDevice: document.getElementById('fallbackAudioDevice')?.value || '',
         isActive: room.isActive
     };
 
@@ -424,10 +420,15 @@ async function startWebRtcStream() {
             await stopWebRtcStream();
         }
 
-        console.log("Starting WebRTC stream...");
+        if (!selectedRoomId) {
+            console.error("No room selected for audio preview");
+            return;
+        }
 
-        console.log("Calling StartWebRtcStream on hub...");
-        const offerSdp = await connection.invoke("StartWebRtcStream");
+        previewRoomId = selectedRoomId;
+        console.log("Starting WebRTC audio stream for room:", previewRoomId);
+
+        const offerSdp = await connection.invoke("StartAudioStream", previewRoomId);
         console.log("Got offer from server");
 
         const configuration = {
@@ -445,7 +446,7 @@ async function startWebRtcStream() {
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
 
-        await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
+        await connection.invoke("SetAudioRemoteDescription", previewRoomId, answer.type, answer.sdp);
 
         if (pendingIceCandidates.length > 0) {
             console.log(`Processing ${pendingIceCandidates.length} queued ICE candidates`);
@@ -470,9 +471,10 @@ async function startWebRtcStream() {
 
 function setupPeerConnectionHandlers() {
     peerConnection.onicecandidate = async (event) => {
-        if (event.candidate) {
+        if (event.candidate && previewRoomId) {
             try {
-                await connection.invoke("AddIceCandidate",
+                await connection.invoke("AddAudioIceCandidate",
+                    previewRoomId,
                     event.candidate.candidate,
                     event.candidate.sdpMid,
                     event.candidate.sdpMLineIndex
@@ -548,7 +550,9 @@ async function stopWebRtcStream() {
 
     if (peerConnection) {
         try {
-            await connection.invoke("StopWebRtcStream");
+            if (previewRoomId) {
+                await connection.invoke("StopAudioStream", previewRoomId);
+            }
 
             peerConnection.close();
             peerConnection = null;
@@ -558,6 +562,7 @@ async function stopWebRtcStream() {
             }
 
             setMonitoringState(false);
+            previewRoomId = null;
             console.log("WebRTC stream stopped");
         } catch (error) {
             console.error("Error stopping WebRTC stream:", error);

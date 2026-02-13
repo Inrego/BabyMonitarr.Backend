@@ -43,11 +43,6 @@ public class AudioSettings
     public string? CameraPassword { get; set; }
     
     /// <summary>
-    /// Indicates whether the system should use the camera's audio stream instead of local microphone
-    /// </summary>
-    public bool UseCameraAudioStream { get; set; } = false;
-    
-    /// <summary>
     /// Number of seconds to pause threshold checking after threshold is exceeded
     /// </summary>
     public int ThresholdPauseDuration { get; set; } = 30; // Default pause of 30 seconds

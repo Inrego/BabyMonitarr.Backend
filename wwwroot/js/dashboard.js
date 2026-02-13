@@ -1,26 +1,21 @@
 // SignalR connection
 let connection;
-// WebRTC peer connection
-let peerConnection;
-// Audio element for playback
-let audioElement;
-// Queue for ICE candidates
-let pendingIceCandidates = [];
+
+// Video state
+let videoConnections = {};        // { roomId: RTCPeerConnection }
+let videoPendingCandidates = {};  // { roomId: [RTCIceCandidate] }
+
+// Audio state (per-room)
+let audioConnections = {};        // { roomId: RTCPeerConnection }
+let audioPendingCandidates = {};  // { roomId: [RTCIceCandidate] }
+let audioElements = {};           // { roomId: HTMLAudioElement }
+let mutedRooms = {};              // { roomId: boolean }
 
 // State
 let currentRooms = [];
 let activeRoomId = null;
-let listeningRoomId = null;
-let isMuted = false;
 
 document.addEventListener('DOMContentLoaded', function () {
-    // Create audio element for playback
-    audioElement = document.createElement('audio');
-    audioElement.setAttribute('autoplay', 'true');
-    audioElement.setAttribute('playsinline', 'true');
-    audioElement.style.display = 'none';
-    document.body.appendChild(audioElement);
-
     try {
         initializeSignalRConnection();
     } catch (error) {
@@ -34,8 +29,8 @@ function initializeSignalRConnection() {
         .withAutomaticReconnect()
         .build();
 
-    // Handle server ICE candidates
-    connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
+    // Handle server ICE candidates (audio - per room)
+    connection.on("ReceiveAudioIceCandidate", async (roomId, candidate, sdpMid, sdpMLineIndex) => {
         const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
         const iceCandidate = new RTCIceCandidate({
             candidate: candidateStr,
@@ -43,14 +38,42 @@ function initializeSignalRConnection() {
             sdpMLineIndex: sdpMLineIndex
         });
 
-        if (peerConnection && peerConnection.remoteDescription) {
+        const pc = audioConnections[roomId];
+        if (pc && pc.remoteDescription) {
             try {
-                await peerConnection.addIceCandidate(iceCandidate);
+                await pc.addIceCandidate(iceCandidate);
             } catch (err) {
-                console.warn("Could not add server ICE candidate:", err.message);
+                console.warn(`Could not add audio ICE candidate for room ${roomId}:`, err.message);
             }
         } else {
-            pendingIceCandidates.push(iceCandidate);
+            if (!audioPendingCandidates[roomId]) {
+                audioPendingCandidates[roomId] = [];
+            }
+            audioPendingCandidates[roomId].push(iceCandidate);
+        }
+    });
+
+    // Handle server ICE candidates (video)
+    connection.on("ReceiveVideoIceCandidate", async (roomId, candidate, sdpMid, sdpMLineIndex) => {
+        const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
+        const iceCandidate = new RTCIceCandidate({
+            candidate: candidateStr,
+            sdpMid: sdpMid,
+            sdpMLineIndex: sdpMLineIndex
+        });
+
+        const pc = videoConnections[roomId];
+        if (pc && pc.remoteDescription) {
+            try {
+                await pc.addIceCandidate(iceCandidate);
+            } catch (err) {
+                console.warn(`Could not add video ICE candidate for room ${roomId}:`, err.message);
+            }
+        } else {
+            if (!videoPendingCandidates[roomId]) {
+                videoPendingCandidates[roomId] = [];
+            }
+            videoPendingCandidates[roomId].push(iceCandidate);
         }
     });
 
@@ -62,7 +85,7 @@ function initializeSignalRConnection() {
     // Handle active room changes
     connection.on("ActiveRoomChanged", (room) => {
         activeRoomId = room.id;
-        renderDashboard();
+        updateDashboardState();
     });
 
     connection.start()
@@ -78,16 +101,52 @@ function initializeSignalRConnection() {
 
 async function loadRooms() {
     try {
+        const previousRooms = currentRooms;
         currentRooms = await connection.invoke("GetRooms");
         const activeRoom = currentRooms.find(r => r.isActive);
         activeRoomId = activeRoom ? activeRoom.id : null;
         renderDashboard();
+
+        // Manage video and audio streams after rendering
+        await manageVideoStreams(previousRooms);
+        await manageAudioStreams(previousRooms);
     } catch (err) {
         console.error("Error loading rooms:", err);
     }
 }
 
-// ===== Dashboard Rendering =====
+// ===== Dashboard State Update (surgical, preserves DOM/video) =====
+function updateDashboardState() {
+    for (const room of currentRooms) {
+        const isListening = !!audioConnections[room.id];
+        const isMuted = !!mutedRooms[room.id];
+
+        // Update LIVE badge
+        const badge = document.getElementById(`liveBadge-${room.id}`);
+        if (badge) {
+            badge.classList.toggle('visible', isListening);
+        }
+
+        // Update Listen button
+        const card = document.querySelector(`.dash-card[data-room-id="${room.id}"]`);
+        if (!card) continue;
+        const listenBtn = card.querySelector('.btn-dash-listen');
+        if (listenBtn) {
+            listenBtn.className = `btn-dash-action btn-dash-listen ${isListening ? 'active' : ''}`;
+            listenBtn.innerHTML = `<i class="fas fa-${isListening ? 'stop' : 'headphones'}"></i> ${isListening ? 'Stop' : 'Listen'}`;
+        }
+
+        // Update Audio button
+        const audioBtn = card.querySelector('.btn-dash-audio');
+        if (audioBtn) {
+            audioBtn.className = `btn-dash-action btn-dash-audio ${isListening ? '' : 'disabled'}`;
+            audioBtn.disabled = !isListening;
+            audioBtn.innerHTML = `<i class="fas fa-${isMuted && isListening ? 'volume-mute' : 'volume-up'}"></i> ${isMuted && isListening ? 'Muted' : 'Audio'}`;
+        }
+    }
+}
+
+// ===== Dashboard Rendering (full rebuild) =====
 function renderDashboard() {
     const grid = document.getElementById('dashboardGrid');
     const empty = document.getElementById('dashboardEmpty');
@@ -103,13 +162,20 @@ function renderDashboard() {
     empty.style.display = 'none';
 
     grid.innerHTML = currentRooms.map(room => {
-        const isListening = room.id === listeningRoomId;
-        const isActive = room.isActive;
+        const isListening = !!audioConnections[room.id];
+        const isMuted = !!mutedRooms[room.id];
+        const hasVideo = room.enableVideoStream && room.cameraStreamUrl;
+        const hasAudio = room.enableAudioStream && room.cameraStreamUrl;
         return `
             <div class="dash-card" data-room-id="${room.id}">
                 <div class="dash-card-preview">
-                    <div class="dash-card-icon-placeholder">
+                    <video id="video-${room.id}" class="dash-card-video" autoplay muted playsinline
+                           style="display: none;"></video>
+                    <div id="iconPlaceholder-${room.id}" class="dash-card-icon-placeholder">
                         <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
+                    </div>
+                    <div id="videoLoading-${room.id}" class="dash-card-video-loading" style="display: none;">
+                        <i class="fas fa-spinner fa-spin"></i>
                     </div>
                     <span id="liveBadge-${room.id}" class="dash-card-live-badge ${isListening ? 'visible' : ''}">LIVE</span>
                     <span class="dash-card-room-name">${escapeHtml(room.name)}</span>
@@ -119,7 +185,7 @@ function renderDashboard() {
                     </div>
                 </div>
                 <div class="dash-card-actions">
-                    <button class="btn-dash-action btn-dash-listen ${isListening ? 'active' : ''}" onclick="toggleListen(${room.id})">
+                    <button class="btn-dash-action btn-dash-listen ${isListening ? 'active' : ''}" onclick="toggleListen(${room.id})" ${!hasAudio ? 'disabled' : ''}>
                         <i class="fas fa-${isListening ? 'stop' : 'headphones'}"></i>
                         ${isListening ? 'Stop' : 'Listen'}
                     </button>
@@ -143,29 +209,38 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// ===== Listen / WebRTC =====
-async function toggleListen(roomId) {
-    if (listeningRoomId === roomId) {
-        // Stop listening to this room
-        await stopStream();
-        return;
-    }
+// ===== Video Stream Management =====
+async function manageVideoStreams(previousRooms) {
+    const videoRooms = currentRooms.filter(r => r.enableVideoStream && r.cameraStreamUrl);
+    const videoRoomIds = new Set(videoRooms.map(r => r.id));
 
-    // If listening to a different room, stop first
-    if (listeningRoomId !== null) {
-        await stopStream();
-    }
-
-    // Start listening to the new room
-    try {
-        // Activate this room on the server
-        const room = await connection.invoke("SelectRoom", roomId);
-        if (room) {
-            activeRoomId = room.id;
+    // Stop video for rooms that were removed or had video disabled
+    for (const roomId of Object.keys(videoConnections).map(Number)) {
+        if (!videoRoomIds.has(roomId)) {
+            await stopVideoStream(roomId);
         }
+    }
 
-        // Start WebRTC stream
-        const offerSdp = await connection.invoke("StartWebRtcStream");
+    // Start video for new rooms that need it
+    for (const room of videoRooms) {
+        if (!videoConnections[room.id]) {
+            await startVideoStream(room.id);
+        }
+    }
+}
+
+async function startVideoStream(roomId) {
+    try {
+        // Show loading indicator
+        const loadingEl = document.getElementById(`videoLoading-${roomId}`);
+        if (loadingEl) loadingEl.style.display = '';
+
+        const offerSdp = await connection.invoke("StartVideoStream", roomId);
+        if (!offerSdp) {
+            console.error(`No SDP offer received for video room ${roomId}`);
+            if (loadingEl) loadingEl.style.display = 'none';
+            return;
+        }
 
         const configuration = {
             iceServers: [
@@ -173,119 +248,292 @@ async function toggleListen(roomId) {
             ]
         };
 
-        peerConnection = new RTCPeerConnection(configuration);
-        setupPeerConnectionHandlers(roomId);
+        const pc = new RTCPeerConnection(configuration);
+        videoConnections[roomId] = pc;
 
-        await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
-
-        const answer = await peerConnection.createAnswer();
-        await peerConnection.setLocalDescription(answer);
-
-        await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
-
-        // Process queued ICE candidates
-        if (pendingIceCandidates.length > 0) {
-            for (const candidate of pendingIceCandidates) {
+        // Handle ICE candidates
+        pc.onicecandidate = async (event) => {
+            if (event.candidate) {
                 try {
-                    await peerConnection.addIceCandidate(candidate);
+                    await connection.invoke("AddVideoIceCandidate",
+                        roomId,
+                        event.candidate.candidate,
+                        event.candidate.sdpMid,
+                        event.candidate.sdpMLineIndex
+                    );
                 } catch (err) {
-                    console.warn("Could not add queued ICE candidate:", err.message);
+                    console.error(`Error sending video ICE candidate for room ${roomId}:`, err);
                 }
             }
-            pendingIceCandidates = [];
+        };
+
+        // Handle video track arrival
+        pc.ontrack = (event) => {
+            console.log(`Video track received for room ${roomId}`, event.track.kind);
+            if (event.track.kind === 'video') {
+                const videoEl = document.getElementById(`video-${roomId}`);
+                const iconEl = document.getElementById(`iconPlaceholder-${roomId}`);
+                const loadingIndicator = document.getElementById(`videoLoading-${roomId}`);
+
+                if (videoEl) {
+                    videoEl.srcObject = event.streams[0] || new MediaStream([event.track]);
+                    videoEl.style.display = '';
+                    videoEl.play().catch(e => console.error(`Error playing video for room ${roomId}:`, e));
+                }
+                if (iconEl) iconEl.style.display = 'none';
+                if (loadingIndicator) loadingIndicator.style.display = 'none';
+            }
+        };
+
+        // Handle connection state changes
+        pc.onconnectionstatechange = () => {
+            const state = pc.connectionState;
+            console.log(`Video connection state for room ${roomId}:`, state);
+
+            if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                onVideoDisconnected(roomId);
+            }
+        };
+
+        // Set remote description (the offer from server)
+        await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+
+        // Create and send answer
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await connection.invoke("SetVideoRemoteDescription", roomId, answer.type, answer.sdp);
+
+        // Process queued ICE candidates
+        if (videoPendingCandidates[roomId] && videoPendingCandidates[roomId].length > 0) {
+            for (const candidate of videoPendingCandidates[roomId]) {
+                try {
+                    await pc.addIceCandidate(candidate);
+                } catch (err) {
+                    console.warn(`Could not add queued video ICE candidate for room ${roomId}:`, err.message);
+                }
+            }
+            videoPendingCandidates[roomId] = [];
         }
 
-        listeningRoomId = roomId;
-        isMuted = false;
-        renderDashboard();
-        showMessage(`Listening to: ${room.name}`);
     } catch (error) {
-        console.error("Error starting stream:", error);
+        console.error(`Error starting video stream for room ${roomId}:`, error);
+        const loadingEl = document.getElementById(`videoLoading-${roomId}`);
+        if (loadingEl) loadingEl.style.display = 'none';
+    }
+}
+
+async function stopVideoStream(roomId) {
+    const pc = videoConnections[roomId];
+    if (pc) {
+        try {
+            await connection.invoke("StopVideoStream", roomId);
+        } catch (err) {
+            console.error(`Error stopping video stream for room ${roomId}:`, err);
+        }
+        pc.close();
+        delete videoConnections[roomId];
+    }
+    delete videoPendingCandidates[roomId];
+    onVideoDisconnected(roomId);
+}
+
+function onVideoDisconnected(roomId) {
+    const videoEl = document.getElementById(`video-${roomId}`);
+    const iconEl = document.getElementById(`iconPlaceholder-${roomId}`);
+    const loadingEl = document.getElementById(`videoLoading-${roomId}`);
+
+    if (videoEl) {
+        videoEl.srcObject = null;
+        videoEl.style.display = 'none';
+    }
+    if (iconEl) iconEl.style.display = '';
+    if (loadingEl) loadingEl.style.display = 'none';
+}
+
+async function stopAllVideoStreams() {
+    for (const roomId of Object.keys(videoConnections).map(Number)) {
+        await stopVideoStream(roomId);
+    }
+}
+
+// ===== Audio Stream Management (per-room) =====
+async function manageAudioStreams(previousRooms) {
+    const audioRooms = currentRooms.filter(r => r.enableAudioStream && r.cameraStreamUrl);
+    const audioRoomIds = new Set(audioRooms.map(r => r.id));
+
+    // Stop audio for rooms that were removed or had audio disabled
+    for (const roomId of Object.keys(audioConnections).map(Number)) {
+        if (!audioRoomIds.has(roomId)) {
+            await stopAudioStream(roomId);
+        }
+    }
+}
+
+async function startAudioStream(roomId) {
+    try {
+        const offerSdp = await connection.invoke("StartAudioStream", roomId);
+        if (!offerSdp) {
+            console.error(`No SDP offer received for audio room ${roomId}`);
+            return;
+        }
+
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ]
+        };
+
+        const pc = new RTCPeerConnection(configuration);
+        audioConnections[roomId] = pc;
+
+        // Create audio element for this room
+        const audioEl = document.createElement('audio');
+        audioEl.setAttribute('autoplay', 'true');
+        audioEl.setAttribute('playsinline', 'true');
+        audioEl.style.display = 'none';
+        audioEl.muted = !!mutedRooms[roomId];
+        document.body.appendChild(audioEl);
+        audioElements[roomId] = audioEl;
+
+        // Handle ICE candidates
+        pc.onicecandidate = async (event) => {
+            if (event.candidate) {
+                try {
+                    await connection.invoke("AddAudioIceCandidate",
+                        roomId,
+                        event.candidate.candidate,
+                        event.candidate.sdpMid,
+                        event.candidate.sdpMLineIndex
+                    );
+                } catch (err) {
+                    console.error(`Error sending audio ICE candidate for room ${roomId}:`, err);
+                }
+            }
+        };
+
+        // Handle data channel (audio levels, sound alerts)
+        pc.ondatachannel = (event) => {
+            const dataChannel = event.channel;
+            dataChannel.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    if (message.type === 'audioLevel') {
+                        updateCardMeter(roomId, message.level);
+                    } else if (message.type === 'soundAlert') {
+                        console.log(`Sound alert for room ${roomId}: ${message.level.toFixed(1)} dB (threshold: ${message.threshold.toFixed(1)} dB)`);
+                    }
+                } catch (err) {
+                    console.error("Error parsing data channel message:", err);
+                }
+            };
+        };
+
+        // Handle audio track arrival
+        pc.ontrack = (event) => {
+            if (event.track.kind === 'audio' && audioEl) {
+                audioEl.srcObject = event.streams[0] || new MediaStream([event.track]);
+                audioEl.play().catch(e => console.error(`Error playing audio for room ${roomId}:`, e));
+            }
+        };
+
+        // Handle connection state changes
+        pc.onconnectionstatechange = () => {
+            const state = pc.connectionState;
+            console.log(`Audio connection state for room ${roomId}:`, state);
+
+            if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                onAudioDisconnected(roomId);
+            }
+        };
+
+        // Set remote description (the offer from server)
+        await pc.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+
+        // Create and send answer
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await connection.invoke("SetAudioRemoteDescription", roomId, answer.type, answer.sdp);
+
+        // Process queued ICE candidates
+        if (audioPendingCandidates[roomId] && audioPendingCandidates[roomId].length > 0) {
+            for (const candidate of audioPendingCandidates[roomId]) {
+                try {
+                    await pc.addIceCandidate(candidate);
+                } catch (err) {
+                    console.warn(`Could not add queued audio ICE candidate for room ${roomId}:`, err.message);
+                }
+            }
+            audioPendingCandidates[roomId] = [];
+        }
+
+        updateDashboardState();
+        const room = currentRooms.find(r => r.id === roomId);
+        showMessage(`Listening to: ${room ? room.name : `Room ${roomId}`}`);
+
+    } catch (error) {
+        console.error(`Error starting audio stream for room ${roomId}:`, error);
         showMessage("Error starting audio stream", true);
     }
 }
 
-function setupPeerConnectionHandlers(roomId) {
-    peerConnection.onicecandidate = async (event) => {
-        if (event.candidate) {
-            try {
-                await connection.invoke("AddIceCandidate",
-                    event.candidate.candidate,
-                    event.candidate.sdpMid,
-                    event.candidate.sdpMLineIndex
-                );
-            } catch (err) {
-                console.error("Error sending ICE candidate:", err);
-            }
-        }
-    };
-
-    peerConnection.ondatachannel = (event) => {
-        const dataChannel = event.channel;
-
-        dataChannel.onmessage = (event) => {
-            try {
-                const message = JSON.parse(event.data);
-                if (message.type === 'audioLevel') {
-                    updateCardMeter(roomId, message.level);
-                }
-            } catch (err) {
-                console.error("Error parsing data channel message:", err);
-            }
-        };
-    };
-
-    peerConnection.onconnectionstatechange = () => {
-        const state = peerConnection.connectionState;
-        console.log("WebRTC connection state:", state);
-
-        if (state === 'disconnected' || state === 'failed' || state === 'closed') {
-            if (audioElement) {
-                audioElement.srcObject = null;
-            }
-            listeningRoomId = null;
-            isMuted = false;
-            renderDashboard();
-        }
-    };
-
-    peerConnection.ontrack = (event) => {
-        if (event.streams && event.streams[0] && audioElement) {
-            audioElement.srcObject = event.streams[0];
-            audioElement.play().catch(e => console.error("Error playing audio:", e));
-        }
-    };
-}
-
-async function stopStream() {
-    pendingIceCandidates = [];
-
-    if (peerConnection) {
+async function stopAudioStream(roomId) {
+    const pc = audioConnections[roomId];
+    if (pc) {
         try {
-            await connection.invoke("StopWebRtcStream");
-            peerConnection.close();
-            peerConnection = null;
-        } catch (error) {
-            console.error("Error stopping stream:", error);
+            await connection.invoke("StopAudioStream", roomId);
+        } catch (err) {
+            console.error(`Error stopping audio stream for room ${roomId}:`, err);
         }
+        pc.close();
+        delete audioConnections[roomId];
+    }
+    delete audioPendingCandidates[roomId];
+
+    // Clean up audio element
+    if (audioElements[roomId]) {
+        audioElements[roomId].srcObject = null;
+        audioElements[roomId].remove();
+        delete audioElements[roomId];
     }
 
-    if (audioElement) {
-        audioElement.srcObject = null;
-    }
-
-    listeningRoomId = null;
-    isMuted = false;
-    renderDashboard();
+    delete mutedRooms[roomId];
+    onAudioDisconnected(roomId);
 }
 
-// ===== Audio Mute =====
-function toggleMute(roomId) {
-    if (roomId !== listeningRoomId || !audioElement) return;
+function onAudioDisconnected(roomId) {
+    // Reset meter
+    const meter = document.getElementById(`meter-${roomId}`);
+    if (meter) meter.style.width = '0%';
+    const dbLabel = document.getElementById(`dbLevel-${roomId}`);
+    if (dbLabel) dbLabel.textContent = '--.- dB';
 
-    isMuted = !isMuted;
-    audioElement.muted = isMuted;
-    renderDashboard();
+    updateDashboardState();
+}
+
+async function stopAllAudioStreams() {
+    for (const roomId of Object.keys(audioConnections).map(Number)) {
+        await stopAudioStream(roomId);
+    }
+}
+
+// ===== Listen / Mute Toggles (per-room) =====
+async function toggleListen(roomId) {
+    if (audioConnections[roomId]) {
+        // Stop listening to this room
+        await stopAudioStream(roomId);
+        return;
+    }
+
+    // Start listening to this room
+    await startAudioStream(roomId);
+}
+
+function toggleMute(roomId) {
+    if (!audioConnections[roomId] || !audioElements[roomId]) return;
+
+    mutedRooms[roomId] = !mutedRooms[roomId];
+    audioElements[roomId].muted = mutedRooms[roomId];
+    updateDashboardState();
 }
 
 // ===== Card Meter Updates =====

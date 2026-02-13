@@ -33,9 +33,12 @@ builder.Services.AddDbContext<BabyMonitarrDbContext>(options =>
 
 // Register services
 builder.Services.AddScoped<IRoomService, RoomService>();
-builder.Services.AddSingleton<IAudioProcessingService, AudioProcessingService>();
-builder.Services.AddSingleton<IWebRtcService, WebRtcService>();
-builder.Services.AddHostedService<AudioStreamingBackgroundService>();
+builder.Services.AddSingleton<IAudioStreamingService, AudioStreamingService>();
+builder.Services.AddHostedService(sp => (AudioStreamingService)sp.GetRequiredService<IAudioStreamingService>());
+builder.Services.AddSingleton<IAudioWebRtcService, AudioWebRtcService>();
+builder.Services.AddSingleton<IVideoStreamingService, VideoStreamingService>();
+builder.Services.AddSingleton<IVideoWebRtcService, VideoWebRtcService>();
+builder.Services.AddHostedService(sp => (VideoStreamingService)sp.GetRequiredService<IVideoStreamingService>());
 
 // Add SignalR
 builder.Services.AddSignalR();
@@ -47,6 +50,16 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
     db.Database.EnsureCreated();
+
+    // Add EnableAudioStream column if it doesn't exist (for existing databases)
+    try
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Rooms ADD COLUMN EnableAudioStream INTEGER NOT NULL DEFAULT 1");
+    }
+    catch (Microsoft.Data.Sqlite.SqliteException)
+    {
+        // Column already exists - this is expected for new databases
+    }
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -62,7 +75,6 @@ using (var scope = app.Services.CreateScope())
                 CameraStreamUrl = legacySettings.CameraStreamUrl,
                 CameraUsername = legacySettings.CameraUsername,
                 CameraPassword = legacySettings.CameraPassword,
-                UseCameraAudioStream = legacySettings.UseCameraAudioStream,
                 IsActive = true
             });
         }

@@ -875,6 +875,27 @@ a:hover {
     color: var(--text-primary);
 }
 
+.dash-card-video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 12px 12px 0 0;
+    background: #000;
+}
+
+.dash-card-video-loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    z-index: 2;
+}
+
 /* ===== Responsive ===== */
 @media (max-width: 991px) {
     .main-content {

@@ -16,6 +16,7 @@ public interface IRoomService
     Task<GlobalSettings> GetGlobalSettingsAsync();
     Task<GlobalSettings> UpdateGlobalSettingsAsync(GlobalSettings settings);
     Task<AudioSettings> GetComposedAudioSettingsAsync();
+    Task<AudioSettings> GetAudioSettingsForRoomAsync(int roomId);
 }
 
 public class RoomService : IRoomService
@@ -54,11 +55,10 @@ public class RoomService : IRoomService
         existing.Icon = room.Icon;
         existing.MonitorType = room.MonitorType;
         existing.EnableVideoStream = room.EnableVideoStream;
+        existing.EnableAudioStream = room.EnableAudioStream;
         existing.CameraStreamUrl = room.CameraStreamUrl;
         existing.CameraUsername = room.CameraUsername;
         existing.CameraPassword = room.CameraPassword;
-        existing.UseCameraAudioStream = room.UseCameraAudioStream;
-        existing.FallbackAudioDevice = room.FallbackAudioDevice;
 
         await _db.SaveChangesAsync();
         return existing;
@@ -138,8 +138,27 @@ public class RoomService : IRoomService
             VolumeAdjustmentDb = global.VolumeAdjustmentDb,
             CameraStreamUrl = activeRoom?.CameraStreamUrl,
             CameraUsername = activeRoom?.CameraUsername,
-            CameraPassword = activeRoom?.CameraPassword,
-            UseCameraAudioStream = activeRoom?.UseCameraAudioStream ?? false
+            CameraPassword = activeRoom?.CameraPassword
+        };
+    }
+
+    public async Task<AudioSettings> GetAudioSettingsForRoomAsync(int roomId)
+    {
+        var global = await GetGlobalSettingsAsync();
+        var room = await GetRoomAsync(roomId);
+
+        return new AudioSettings
+        {
+            SoundThreshold = global.SoundThreshold,
+            AverageSampleCount = global.AverageSampleCount,
+            FilterEnabled = global.FilterEnabled,
+            LowPassFrequency = global.LowPassFrequency,
+            HighPassFrequency = global.HighPassFrequency,
+            ThresholdPauseDuration = global.ThresholdPauseDuration,
+            VolumeAdjustmentDb = global.VolumeAdjustmentDb,
+            CameraStreamUrl = room?.CameraStreamUrl,
+            CameraUsername = room?.CameraUsername,
+            CameraPassword = room?.CameraPassword
         };
     }
 }

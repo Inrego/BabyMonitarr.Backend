@@ -11,3 +11,5 @@ FFmpeg/
 # LibMan restored client-side libraries
 wwwroot/lib/*
 *.db
+*.db-shm
+*.db-wal
