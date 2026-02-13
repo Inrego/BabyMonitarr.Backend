@@ -11,6 +11,13 @@ let pendingIceCandidates = [];
 // Debounce timer for auto-save
 let saveDebounceTimer;
 
+// Room state
+let currentRooms = [];
+let activeRoomId = null;
+let selectedRoomId = null; // Room being edited in right panel
+let globalSettings = {};
+let selectedIcon = 'baby';
+
 // Initialize the audio player and connections
 document.addEventListener('DOMContentLoaded', function () {
     // Create audio element for playback
@@ -21,13 +28,17 @@ document.addEventListener('DOMContentLoaded', function () {
     document.body.appendChild(audioElement);
 
     // Initialize the SignalR connection
-    initializeSignalRConnection();
+    try {
+        initializeSignalRConnection();
+    } catch (error) {
+        console.error("Error initializing SignalR connection:", error);
+    }
 
     // Create button listeners
     setupButtonListeners();
 
-    // Setup toggle and input auto-save listeners
-    setupAutoSaveListeners();
+    // Setup icon selector
+    setupIconSelector();
 
     // Initialize audio context
     try {
@@ -76,13 +87,37 @@ function initializeSignalRConnection() {
         }
     });
 
+    // Handle room updates from other clients
+    connection.on("RoomsUpdated", async () => {
+        console.log("Rooms updated by another client");
+        await loadRooms();
+    });
+
+    // Handle active room changes
+    connection.on("ActiveRoomChanged", (room) => {
+        console.log("Active room changed:", room);
+        activeRoomId = room.id;
+        renderMonitorList();
+    });
+
+    // Handle settings updates from other clients
+    connection.on("SettingsUpdated", async () => {
+        console.log("Settings updated by another client");
+        await loadGlobalSettings();
+    });
+
     connection.start()
-        .then(() => {
+        .then(async () => {
             console.log("SignalR Connected");
-            return connection.invoke("GetAudioSettings");
-        })
-        .then(settings => {
-            updateSettingsUI(settings);
+            await loadRooms();
+            await loadGlobalSettings();
+
+            // Handle deep-link from dashboard Configure button
+            const params = new URLSearchParams(window.location.search);
+            const editRoomId = params.get('editRoom');
+            if (editRoomId) {
+                selectMonitorForEditing(parseInt(editRoomId, 10));
+            }
         })
         .catch(err => {
             console.error(err);
@@ -90,42 +125,299 @@ function initializeSignalRConnection() {
         });
 }
 
+async function loadRooms() {
+    try {
+        currentRooms = await connection.invoke("GetRooms");
+        const activeRoom = currentRooms.find(r => r.isActive);
+        activeRoomId = activeRoom ? activeRoom.id : null;
+        renderMonitorList();
+    } catch (err) {
+        console.error("Error loading rooms:", err);
+    }
+}
+
+async function loadGlobalSettings() {
+    try {
+        globalSettings = await connection.invoke("GetGlobalSettings");
+        updateGlobalSettingsUI(globalSettings);
+    } catch (err) {
+        console.error("Error loading global settings:", err);
+    }
+}
+
 function setupButtonListeners() {
-    document.getElementById('startWebRtcStreamBtn')?.addEventListener('click', function() {
+    document.getElementById('startWebRtcStreamBtn')?.addEventListener('click', function () {
         startWebRtcStream();
     });
 
-    document.getElementById('stopWebRtcStreamBtn')?.addEventListener('click', function() {
+    document.getElementById('stopWebRtcStreamBtn')?.addEventListener('click', function () {
         stopWebRtcStream();
     });
 }
 
-function setupAutoSaveListeners() {
-    // Toggle switches - save immediately on change
-    const toggleIds = ['useCameraStream', 'reduceNoise', 'filterEnabled'];
-    toggleIds.forEach(id => {
-        document.getElementById(id)?.addEventListener('change', function() {
-            saveAudioSettings();
-        });
-    });
-
-    // Text/number inputs - save after a short debounce
-    const inputIds = ['cameraStreamUrl', 'soundThreshold', 'highPassFrequency', 'lowPassFrequency'];
-    inputIds.forEach(id => {
-        document.getElementById(id)?.addEventListener('change', function() {
-            debouncedSave();
+function setupIconSelector() {
+    document.querySelectorAll('#iconSelector .icon-option').forEach(btn => {
+        btn.addEventListener('click', function () {
+            document.querySelectorAll('#iconSelector .icon-option').forEach(b => b.classList.remove('selected'));
+            this.classList.add('selected');
+            selectedIcon = this.dataset.icon;
         });
     });
 }
 
-function debouncedSave() {
-    clearTimeout(saveDebounceTimer);
-    saveDebounceTimer = setTimeout(() => {
-        saveAudioSettings();
-    }, 500);
+// ===== Monitor List Rendering =====
+function renderMonitorList() {
+    const container = document.getElementById('monitorList');
+    if (!container) return;
+
+    if (currentRooms.length === 0) {
+        container.innerHTML = '<p style="color: var(--text-muted); text-align: center; padding: 20px;">No monitors configured</p>';
+        return;
+    }
+
+    container.innerHTML = currentRooms.map(room => {
+        const isActive = room.isActive;
+        const isEditing = room.id === selectedRoomId;
+        return `
+            <div class="monitor-card ${isActive ? 'active' : ''} ${isEditing ? 'editing' : ''}" data-room-id="${room.id}">
+                <div class="monitor-card-header">
+                    <div class="monitor-card-icon">
+                        <i class="fas fa-${room.icon || 'baby'}"></i>
+                    </div>
+                    <div class="monitor-card-info">
+                        <div class="monitor-card-name">${escapeHtml(room.name)}</div>
+                        <span class="status-badge ${isActive ? 'active' : 'offline'}">
+                            <span class="status-dot"></span>
+                            ${isActive ? 'Active' : 'Offline'}
+                        </span>
+                    </div>
+                </div>
+                <div class="monitor-card-actions">
+                    ${!isActive ? `<button class="btn-card-action btn-activate" onclick="selectRoomForMonitoring(${room.id})"><i class="fas fa-play"></i> Activate</button>` : ''}
+                    <button class="btn-card-action btn-edit" onclick="selectMonitorForEditing(${room.id})"><i class="fas fa-pen"></i> Edit</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    // Update editing badge
+    const editingBadge = document.getElementById('editingBadge');
+    if (editingBadge) {
+        editingBadge.style.display = selectedRoomId ? 'inline-block' : 'none';
+    }
 }
 
-// WebRTC Implementation
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// ===== Room Selection & Editing =====
+function selectMonitorForEditing(id) {
+    selectedRoomId = id;
+    const room = currentRooms.find(r => r.id === id);
+    if (!room) return;
+
+    // Update breadcrumb and title
+    const breadcrumb = document.getElementById('breadcrumbRoomName');
+    const title = document.getElementById('pageTitleRoomName');
+    if (breadcrumb) breadcrumb.textContent = room.name;
+    if (title) title.textContent = room.name;
+
+    // Show config panel, hide placeholder
+    document.getElementById('noRoomPlaceholder').style.display = 'none';
+    document.getElementById('roomConfigPanel').style.display = 'block';
+
+    // Populate room fields
+    const nameInput = document.getElementById('roomName');
+    if (nameInput) nameInput.value = room.name;
+
+    const typeSelect = document.getElementById('monitorType');
+    if (typeSelect) typeSelect.value = room.monitorType || 'camera_audio';
+
+    // Set icon
+    selectedIcon = room.icon || 'baby';
+    document.querySelectorAll('#iconSelector .icon-option').forEach(btn => {
+        btn.classList.toggle('selected', btn.dataset.icon === selectedIcon);
+    });
+
+    // Source config
+    const enableVideo = document.getElementById('enableVideoStream');
+    if (enableVideo) enableVideo.checked = room.enableVideoStream;
+
+    const cameraUrl = document.getElementById('cameraStreamUrl');
+    if (cameraUrl) cameraUrl.value = room.cameraStreamUrl || '';
+
+    const useCameraAudio = document.getElementById('useCameraStream');
+    if (useCameraAudio) useCameraAudio.checked = room.useCameraAudioStream;
+
+    const fallbackDevice = document.getElementById('fallbackAudioDevice');
+    if (fallbackDevice) fallbackDevice.value = room.fallbackAudioDevice || '';
+
+    // Re-render list to show editing state
+    renderMonitorList();
+}
+
+async function selectRoomForMonitoring(id) {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+        showMessage("Not connected to server.", true);
+        return;
+    }
+
+    try {
+        const room = await connection.invoke("SelectRoom", id);
+        if (room) {
+            activeRoomId = room.id;
+            renderMonitorList();
+            showMessage(`Now monitoring: ${room.name}`);
+        }
+    } catch (err) {
+        console.error("Error selecting room:", err);
+        showMessage("Error activating room", true);
+    }
+}
+
+// ===== Room CRUD =====
+async function addNewMonitor() {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+        showMessage("Not connected to server.", true);
+        return;
+    }
+
+    try {
+        const room = await connection.invoke("CreateRoom", {
+            name: "New Monitor",
+            icon: "baby",
+            monitorType: "camera_audio",
+            enableVideoStream: false,
+            cameraStreamUrl: "",
+            cameraUsername: "",
+            cameraPassword: "",
+            useCameraAudioStream: false,
+            fallbackAudioDevice: "",
+            isActive: false
+        });
+
+        await loadRooms();
+        selectMonitorForEditing(room.id);
+        showMessage("Monitor created");
+    } catch (err) {
+        console.error("Error creating room:", err);
+        showMessage("Error creating monitor", true);
+    }
+}
+
+async function saveRoomConfig() {
+    if (!selectedRoomId) return;
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+        showMessage("Not connected to server.", true);
+        return;
+    }
+
+    const room = currentRooms.find(r => r.id === selectedRoomId);
+    if (!room) return;
+
+    // Gather room-specific fields
+    const updatedRoom = {
+        id: selectedRoomId,
+        name: document.getElementById('roomName')?.value || 'Unnamed',
+        icon: selectedIcon,
+        monitorType: document.getElementById('monitorType')?.value || 'camera_audio',
+        enableVideoStream: document.getElementById('enableVideoStream')?.checked || false,
+        cameraStreamUrl: document.getElementById('cameraStreamUrl')?.value || '',
+        cameraUsername: room.cameraUsername || '',
+        cameraPassword: room.cameraPassword || '',
+        useCameraAudioStream: document.getElementById('useCameraStream')?.checked || false,
+        fallbackAudioDevice: document.getElementById('fallbackAudioDevice')?.value || '',
+        isActive: room.isActive
+    };
+
+    // Gather global audio processing settings
+    const reduceNoise = document.getElementById('reduceNoise')?.checked || false;
+    const filterEnabled = document.getElementById('filterEnabled')?.checked || false;
+
+    const audioSettings = {
+        soundThreshold: parseFloat(document.getElementById('soundThreshold')?.value || -20),
+        averageSampleCount: 10,
+        filterEnabled: reduceNoise || filterEnabled,
+        lowPassFrequency: parseInt(document.getElementById('lowPassFrequency')?.value || 4000),
+        highPassFrequency: parseInt(document.getElementById('highPassFrequency')?.value || 300),
+        thresholdPauseDuration: 30,
+        volumeAdjustmentDb: -15.0
+    };
+
+    try {
+        // Save room and global settings in parallel
+        const [updatedRoomResult] = await Promise.all([
+            connection.invoke("UpdateRoom", updatedRoom),
+            connection.invoke("UpdateAudioSettings", audioSettings)
+        ]);
+
+        if (updatedRoomResult) {
+            await loadRooms();
+            // Re-select to refresh UI
+            selectMonitorForEditing(selectedRoomId);
+            showMessage("Configuration saved");
+        } else {
+            showMessage("Error: room not found", true);
+        }
+    } catch (err) {
+        console.error("Error saving configuration:", err);
+        showMessage("Error saving configuration", true);
+    }
+}
+
+async function deleteCurrentRoom() {
+    if (!selectedRoomId) return;
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+        showMessage("Not connected to server.", true);
+        return;
+    }
+
+    const room = currentRooms.find(r => r.id === selectedRoomId);
+    if (!room) return;
+
+    if (!confirm(`Delete monitor "${room.name}"? This cannot be undone.`)) return;
+
+    try {
+        const result = await connection.invoke("DeleteRoom", selectedRoomId);
+        if (result) {
+            selectedRoomId = null;
+            document.getElementById('noRoomPlaceholder').style.display = 'block';
+            document.getElementById('roomConfigPanel').style.display = 'none';
+            document.getElementById('breadcrumbRoomName').textContent = 'Select a Monitor';
+            document.getElementById('pageTitleRoomName').textContent = 'Monitor';
+            await loadRooms();
+            showMessage("Monitor deleted");
+        }
+    } catch (err) {
+        console.error("Error deleting room:", err);
+        showMessage("Error deleting monitor", true);
+    }
+}
+
+// ===== Global Settings UI =====
+function updateGlobalSettingsUI(settings) {
+    if (!settings) return;
+
+    const thresholdInput = document.getElementById('soundThreshold');
+    if (thresholdInput) thresholdInput.value = settings.soundThreshold;
+
+    const reduceNoiseInput = document.getElementById('reduceNoise');
+    if (reduceNoiseInput) reduceNoiseInput.checked = settings.filterEnabled;
+
+    const filterEnabledInput = document.getElementById('filterEnabled');
+    if (filterEnabledInput) filterEnabledInput.checked = settings.filterEnabled;
+
+    const highPassInput = document.getElementById('highPassFrequency');
+    if (highPassInput) highPassInput.value = settings.highPassFrequency;
+
+    const lowPassInput = document.getElementById('lowPassFrequency');
+    if (lowPassInput) lowPassInput.value = settings.lowPassFrequency;
+}
+
+// ===== WebRTC Implementation =====
 async function startWebRtcStream() {
     try {
         if (peerConnection) {
@@ -273,7 +565,7 @@ async function stopWebRtcStream() {
     }
 }
 
-// UI updates
+// ===== UI Updates =====
 function setMonitoringState(isMonitoring) {
     const badge = document.getElementById('monitoringBadge');
     const badgeText = document.getElementById('monitoringBadgeText');
@@ -321,60 +613,6 @@ function showSoundAlert(level, threshold) {
     setTimeout(() => {
         alertElement.style.display = 'none';
     }, 5000);
-}
-
-// Settings management
-function updateSettingsUI(settings) {
-    if (!settings) return;
-
-    const highPassInput = document.getElementById('highPassFrequency');
-    if (highPassInput) highPassInput.value = settings.highPassFrequency;
-
-    const lowPassInput = document.getElementById('lowPassFrequency');
-    if (lowPassInput) lowPassInput.value = settings.lowPassFrequency;
-
-    const thresholdInput = document.getElementById('soundThreshold');
-    if (thresholdInput) thresholdInput.value = settings.soundThreshold;
-
-    // Both "Reduce Background Noise" and "Enable Audio Filters" map to filterEnabled
-    const reduceNoiseInput = document.getElementById('reduceNoise');
-    if (reduceNoiseInput) reduceNoiseInput.checked = settings.filterEnabled;
-
-    const filterEnabledInput = document.getElementById('filterEnabled');
-    if (filterEnabledInput) filterEnabledInput.checked = settings.filterEnabled;
-
-    const useCameraStreamInput = document.getElementById('useCameraStream');
-    if (useCameraStreamInput) useCameraStreamInput.checked = settings.useCameraAudioStream;
-
-    const cameraUrlInput = document.getElementById('cameraStreamUrl');
-    if (cameraUrlInput) cameraUrlInput.value = settings.cameraStreamUrl || '';
-}
-
-function saveAudioSettings() {
-    // Determine filterEnabled from either toggle (they both control it)
-    const reduceNoise = document.getElementById('reduceNoise')?.checked || false;
-    const filterEnabled = document.getElementById('filterEnabled')?.checked || false;
-
-    const settings = {
-        volumeAdjustmentDb: -15.0, // Keep default since removed from UI
-        highPassFrequency: parseFloat(document.getElementById('highPassFrequency')?.value || 300),
-        lowPassFrequency: parseFloat(document.getElementById('lowPassFrequency')?.value || 2000),
-        soundThreshold: parseFloat(document.getElementById('soundThreshold')?.value || -50),
-        filterEnabled: reduceNoise || filterEnabled,
-        useCameraAudioStream: document.getElementById('useCameraStream')?.checked || false,
-        cameraStreamUrl: document.getElementById('cameraStreamUrl')?.value || '',
-        thresholdPauseDuration: 10,
-        averageSampleCount: 10
-    };
-
-    connection.invoke("UpdateAudioSettings", settings)
-        .then(() => {
-            showMessage("Settings saved successfully");
-        })
-        .catch(err => {
-            console.error("Error saving settings:", err);
-            showMessage("Error saving settings", true);
-        });
 }
 
 function showMessage(message, isError = false) {

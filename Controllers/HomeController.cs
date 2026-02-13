@@ -10,29 +10,23 @@ namespace BabyMonitarr.Backend.Controllers
     public class HomeController : Controller
     {
         private readonly ILogger<HomeController> _logger;
-        private readonly IAudioProcessingService _audioService;
+        private readonly IRoomService _roomService;
 
-        public HomeController(ILogger<HomeController> logger, IAudioProcessingService audioService)
+        public HomeController(ILogger<HomeController> logger, IRoomService roomService)
         {
             _logger = logger;
-            _audioService = audioService;
+            _roomService = roomService;
         }
 
-        public IActionResult Index()
+        public IActionResult Dashboard()
         {
-            // Send the current settings to the view
-            return View(_audioService.GetSettings());
+            return View();
         }
 
-        [HttpPost]
-        public IActionResult UpdateSettings(AudioSettings settings)
+        public async Task<IActionResult> Index()
         {
-            if (ModelState.IsValid)
-            {
-                _audioService.UpdateSettings(settings);
-                return RedirectToAction(nameof(Index));
-            }
-            return View("Index", settings);
+            var settings = await _roomService.GetComposedAudioSettingsAsync();
+            return View(settings);
         }
 
         [ResponseCache(Duration = 0, Location = ResponseCacheLocation.None, NoStore = true)]

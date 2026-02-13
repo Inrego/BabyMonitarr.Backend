@@ -22,21 +22,17 @@
             <span class="sidebar-logo">BabyMonitarr</span>
         </div>
         <nav class="sidebar-nav">
-            <a href="#" class="sidebar-link">
+            <a asp-controller="Home" asp-action="Dashboard" class="sidebar-link @(currentPage.Contains("Dashboard") ? "active" : "")">
                 <i class="fas fa-th-large"></i>
                 <span>Dashboard</span>
             </a>
-            <a href="#" class="sidebar-link">
-                <i class="fas fa-wave-square"></i>
-                <span>Audio Monitor</span>
-            </a>
-            <a asp-controller="Home" asp-action="Index" class="sidebar-link active">
-                <i class="fas fa-sliders-h"></i>
-                <span>Audio Settings</span>
-            </a>
-            <a href="#" class="sidebar-link">
+            <a asp-controller="Home" asp-action="Index" class="sidebar-link @(currentPage.Contains("Audio Monitors") ? "active" : "")">
                 <i class="fas fa-video"></i>
-                <span>Camera Settings</span>
+                <span>Audio Monitors</span>
+            </a>
+            <a href="#" class="sidebar-link">
+                <i class="fas fa-sliders-h"></i>
+                <span>Monitor Settings</span>
             </a>
             <a href="#" class="sidebar-link">
                 <i class="fas fa-cog"></i>

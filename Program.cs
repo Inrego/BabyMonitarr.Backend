@@ -1,3 +1,8 @@
+using Microsoft.EntityFrameworkCore;
+using BabyMonitarr.Backend.Data;
+using BabyMonitarr.Backend.Models;
+using BabyMonitarr.Backend.Services;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
@@ -22,19 +27,62 @@ builder.Services.AddCors(options =>
     });
 });
 
-// Configure Audio Settings from appsettings.json
-builder.Services.Configure<BabyMonitarr.Backend.Models.AudioSettings>(
-    builder.Configuration.GetSection("AudioSettings"));
+// Add SQLite via EF Core
+builder.Services.AddDbContext<BabyMonitarrDbContext>(options =>
+    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
 
 // Register services
-builder.Services.AddSingleton<BabyMonitarr.Backend.Services.IAudioProcessingService, BabyMonitarr.Backend.Services.AudioProcessingService>();
-builder.Services.AddSingleton<BabyMonitarr.Backend.Services.IWebRtcService, BabyMonitarr.Backend.Services.WebRtcService>();
-builder.Services.AddHostedService<BabyMonitarr.Backend.Services.AudioStreamingBackgroundService>();
+builder.Services.AddScoped<IRoomService, RoomService>();
+builder.Services.AddSingleton<IAudioProcessingService, AudioProcessingService>();
+builder.Services.AddSingleton<IWebRtcService, WebRtcService>();
+builder.Services.AddHostedService<AudioStreamingBackgroundService>();
 
 // Add SignalR
 builder.Services.AddSignalR();
 
 var app = builder.Build();
+
+// Initialize database and seed data
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
+    db.Database.EnsureCreated();
+
+    // Seed from appsettings.json if DB has no rooms yet
+    if (!db.Rooms.Any())
+    {
+        var legacySettings = builder.Configuration.GetSection("AudioSettings").Get<AudioSettings>();
+        if (legacySettings != null && !string.IsNullOrEmpty(legacySettings.CameraStreamUrl))
+        {
+            db.Rooms.Add(new Room
+            {
+                Name = "Default Room",
+                Icon = "baby",
+                MonitorType = "camera_audio",
+                CameraStreamUrl = legacySettings.CameraStreamUrl,
+                CameraUsername = legacySettings.CameraUsername,
+                CameraPassword = legacySettings.CameraPassword,
+                UseCameraAudioStream = legacySettings.UseCameraAudioStream,
+                IsActive = true
+            });
+        }
+
+        // Seed global settings from legacy config
+        var globalSettings = db.GlobalSettings.Find(1);
+        if (globalSettings != null && legacySettings != null)
+        {
+            globalSettings.SoundThreshold = legacySettings.SoundThreshold;
+            globalSettings.AverageSampleCount = legacySettings.AverageSampleCount;
+            globalSettings.FilterEnabled = legacySettings.FilterEnabled;
+            globalSettings.LowPassFrequency = legacySettings.LowPassFrequency;
+            globalSettings.HighPassFrequency = legacySettings.HighPassFrequency;
+            globalSettings.ThresholdPauseDuration = legacySettings.ThresholdPauseDuration;
+            globalSettings.VolumeAdjustmentDb = legacySettings.VolumeAdjustmentDb;
+        }
+
+        db.SaveChanges();
+    }
+}
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
@@ -58,6 +106,6 @@ app.MapHub<BabyMonitarr.Backend.Hubs.AudioStreamHub>("/audioHub")
 
 app.MapControllerRoute(
         name: "default",
-        pattern: "{controller=Home}/{action=Index}/{id?}");
+        pattern: "{controller=Home}/{action=Dashboard}/{id?}");
 
 app.Run();

@@ -8,7 +8,6 @@ using System.IO;
 using System.Text;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using BabyMonitarr.Backend.Models;
 using NAudio.Wave;
 using NAudio.CoreAudioApi;
@@ -60,10 +59,10 @@ public class AudioProcessingService : IAudioProcessingService, IDisposable
     public event EventHandler<AudioSampleEventArgs>? AudioSampleProcessed;
     public event EventHandler<SoundThresholdEventArgs>? SoundThresholdExceeded;
 
-    public AudioProcessingService(ILogger<AudioProcessingService> logger, IOptions<AudioSettings> settings)
+    public AudioProcessingService(ILogger<AudioProcessingService> logger)
     {
         _logger = logger;
-        _settings = settings?.Value ?? new AudioSettings();
+        _settings = new AudioSettings();
         InitializeFilters();
     }
 

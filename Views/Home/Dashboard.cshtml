@@ -1,0 +1,27 @@
+@{
+    ViewData["Title"] = "BabyMonitarr - Dashboard";
+}
+
+<div class="breadcrumb-dark">Dashboard > <span>Monitor Dashboard</span></div>
+<h1 class="page-title">Monitor Dashboard</h1>
+
+<div id="dashboardGrid" class="dashboard-grid">
+    <!-- Cards rendered by JS -->
+</div>
+
+<div id="dashboardEmpty" class="content-card text-center" style="display: none; padding: 80px 32px;">
+    <i class="fas fa-baby" style="font-size: 3rem; color: var(--text-muted); margin-bottom: 16px;"></i>
+    <h3 style="color: var(--text-secondary);">No monitors configured</h3>
+    <p style="color: var(--text-muted);">Add a monitor to start watching your rooms</p>
+    <a asp-controller="Home" asp-action="Index" class="btn-monitor-start" style="margin-top: 16px; text-decoration: none;">
+        <i class="fas fa-plus"></i> Add Monitor
+    </a>
+</div>
+
+<!-- Settings message toast -->
+<div id="settingsMessage" class="settings-toast" style="display: none;"></div>
+
+@section Scripts {
+    <script src="~/lib/microsoft-signalr/signalr.js" asp-append-version="true"></script>
+    <script src="~/js/dashboard.js" asp-append-version="true"></script>
+}

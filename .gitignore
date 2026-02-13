@@ -10,3 +10,4 @@ FFmpeg/
 
 # LibMan restored client-side libraries
 wwwroot/lib/*
+*.db
