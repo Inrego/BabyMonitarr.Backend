@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Reflection;
@@ -162,7 +163,8 @@ public class NestStreamReader : IDisposable
             iceServers = new List<RTCIceServer>
             {
                 new RTCIceServer { urls = "stun:stun.l.google.com:19302" }
-            }
+            },
+            X_UseRtpFeedbackProfile = true
         };
 
         _peerConnection = new RTCPeerConnection(config);
@@ -178,10 +180,13 @@ public class NestStreamReader : IDisposable
         // Add receive-only video transceiver (H264)
         var videoFormats = new List<VideoFormat>
         {
-            new VideoFormat(VideoCodecsEnum.H264, 96, 90000, "packetization-mode=1")
+            new VideoFormat(VideoCodecsEnum.H264, 96, 90000, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
         };
         var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.RecvOnly);
         _peerConnection.addTrack(videoTrack);
+
+        // Add data channel required by Google Nest (produces m=application line in SDP)
+        var dataChannel = await _peerConnection.createDataChannel("data", new RTCDataChannelInit());
 
         // Handle incoming RTP packets
         _peerConnection.OnRtpPacketReceived += OnRtpPacketReceived;
@@ -195,22 +200,33 @@ public class NestStreamReader : IDisposable
         var offer = _peerConnection.createOffer();
         await _peerConnection.setLocalDescription(offer);
 
+        // Patch SDP with attributes required by Google Nest WebRTC
+        var patchedSdp = PatchSdpForNest(offer.sdp);
+
         _logger.LogInformation("Sending SDP offer to Nest camera for room {RoomId}", _roomId);
+        _logger.LogDebug("Patched SDP offer for room {RoomId}:\n{Sdp}", _roomId, patchedSdp);
 
         // Send offer to Google and get answer
         Models.NestStreamInfo streamInfo;
         using (var scope = _scopeFactory.CreateScope())
         {
             var deviceService = scope.ServiceProvider.GetRequiredService<IGoogleNestDeviceService>();
-            streamInfo = await deviceService.GenerateWebRtcStreamAsync(_nestDeviceId, offer.sdp);
+            streamInfo = await deviceService.GenerateWebRtcStreamAsync(_nestDeviceId, patchedSdp);
         }
         _mediaSessionId = streamInfo.MediaSessionId;
 
-        // Set remote description with Google's SDP answer
+        // Strip ICE candidate lines from Google's SDP answer - SIPSorcery's parser
+        // can't handle the candidate format Google uses, and the connection info
+        // comes from the SDP c= line for this server-negotiated WebRTC session.
+        var cleanedSdp = string.Join("\r\n",
+            streamInfo.SdpAnswer
+                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                .Where(line => !line.StartsWith("a=candidate:")));
+
         var answer = new RTCSessionDescriptionInit
         {
             type = RTCSdpType.answer,
-            sdp = streamInfo.SdpAnswer
+            sdp = cleanedSdp
         };
         var result = _peerConnection.setRemoteDescription(answer);
         if (result != SetDescriptionResultEnum.OK)
@@ -295,6 +311,14 @@ public class NestStreamReader : IDisposable
             _peerConnection.Dispose();
             _peerConnection = null;
         }
+    }
+
+    /// <summary>
+    /// Patches the SDP offer to support google nest.
+    /// </summary>
+    private static string PatchSdpForNest(string sdp)
+    {
+        return sdp.Replace("OPUS", "opus");
     }
 
     private void OnRtpPacketReceived(IPEndPoint remoteEndPoint, SDPMediaTypesEnum mediaType, RTPPacket rtpPacket)
