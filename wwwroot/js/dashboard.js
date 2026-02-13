@@ -209,9 +209,21 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+function canStartVideoForRoom(room) {
+    if (!room || !room.enableVideoStream) {
+        return false;
+    }
+
+    if (room.streamSourceType === 'google_nest') {
+        return !!room.nestDeviceId;
+    }
+
+    return !!room.cameraStreamUrl;
+}
+
 // ===== Video Stream Management =====
 async function manageVideoStreams(previousRooms) {
-    const videoRooms = currentRooms.filter(r => r.enableVideoStream && r.cameraStreamUrl);
+    const videoRooms = currentRooms.filter(canStartVideoForRoom);
     const videoRoomIds = new Set(videoRooms.map(r => r.id));
 
     // Stop video for rooms that were removed or had video disabled

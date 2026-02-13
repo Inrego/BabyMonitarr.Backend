@@ -96,10 +96,34 @@
                 </div>
 
                 <div class="mb-3">
-                    <label for="cameraStreamUrl" class="form-label-dark">Camera Stream URL</label>
-                    <input id="cameraStreamUrl" class="form-control-dark" type="text"
-                           placeholder="rtsp://192.168.1.100:554/stream" />
-                    <div class="form-hint">RTSP, HTTP, or MJPEG camera URL</div>
+                    <label for="streamSourceType" class="form-label-dark">Stream Source</label>
+                    <select id="streamSourceType" class="form-select-dark" onchange="onStreamSourceTypeChanged()">
+                        <option value="rtsp">RTSP Camera</option>
+                        <option value="google_nest">Google Nest Camera</option>
+                    </select>
+                </div>
+
+                <div id="rtspSourceFields">
+                    <div class="mb-3">
+                        <label for="cameraStreamUrl" class="form-label-dark">Camera Stream URL</label>
+                        <input id="cameraStreamUrl" class="form-control-dark" type="text"
+                               placeholder="rtsp://192.168.1.100:554/stream" />
+                        <div class="form-hint">RTSP, HTTP, or MJPEG camera URL</div>
+                    </div>
+                </div>
+
+                <div id="nestSourceFields" style="display: none;">
+                    <div id="nestNotLinkedWarning" class="sound-alert mb-3" style="display: none;">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        Google Nest account is not linked. <a href="/Home/System">Configure it in System settings</a>.
+                    </div>
+                    <div class="mb-3">
+                        <label for="nestDeviceSelect" class="form-label-dark">Nest Camera</label>
+                        <select id="nestDeviceSelect" class="form-select-dark">
+                            <option value="">Select a Nest camera...</option>
+                        </select>
+                        <div class="form-hint">Select a camera from your linked Google Nest account</div>
+                    </div>
                 </div>
 
             </div>

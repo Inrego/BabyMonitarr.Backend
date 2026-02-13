@@ -1,0 +1,66 @@
+@{
+    ViewData["Title"] = "BabyMonitarr - System";
+}
+
+<div class="breadcrumb-dark">System > <span>Configuration</span></div>
+<h1 class="page-title">System Configuration</h1>
+
+<!-- Google Nest Configuration -->
+<div class="content-card config-section mb-4">
+    <h2 class="config-section-title">Google Nest Configuration</h2>
+
+    <div class="mb-3">
+        <label for="nestClientId" class="form-label-dark">Client ID</label>
+        <input id="nestClientId" class="form-control-dark" type="text"
+               placeholder="Enter your Google OAuth Client ID" />
+    </div>
+
+    <div class="mb-3">
+        <label for="nestClientSecret" class="form-label-dark">Client Secret</label>
+        <input id="nestClientSecret" class="form-control-dark" type="password"
+               placeholder="Enter your Google OAuth Client Secret" />
+    </div>
+
+    <div class="mb-3">
+        <label for="nestProjectId" class="form-label-dark">Project ID</label>
+        <input id="nestProjectId" class="form-control-dark" type="text"
+               placeholder="Enter your SDM Project ID" />
+        <div class="form-hint">
+            Find these values in the <a href="https://console.nest.google.com/device-access" target="_blank" rel="noopener">Google Device Access Console</a>
+        </div>
+    </div>
+
+    <button id="saveNestCredentialsBtn" class="btn-monitor-start" onclick="saveNestCredentials()">
+        <i class="fas fa-save"></i> Save Credentials
+    </button>
+</div>
+
+<!-- Google Account Linking -->
+<div class="content-card config-section mb-4">
+    <h2 class="config-section-title">Google Account Linking</h2>
+
+    <div class="mb-3">
+        <span class="form-label-dark" style="display: block;">Account Status</span>
+        <span id="nestLinkStatus" class="status-badge offline" style="font-size: 0.85rem; margin-top: 8px;">
+            <span class="status-dot"></span>
+            <span id="nestLinkStatusText">Not Linked</span>
+        </span>
+    </div>
+
+    <div class="d-flex gap-3">
+        <button id="linkNestAccountBtn" class="btn-monitor-start" onclick="linkNestAccount()">
+            <i class="fas fa-link"></i> Link Account
+        </button>
+        <button id="unlinkNestAccountBtn" class="btn-monitor-stop" onclick="unlinkNestAccount()">
+            <i class="fas fa-unlink"></i> Unlink Account
+        </button>
+    </div>
+</div>
+
+<!-- Settings message toast -->
+<div id="settingsMessage" class="settings-toast" style="display: none;"></div>
+
+@section Scripts {
+    <script src="~/lib/microsoft-signalr/signalr.js" asp-append-version="true"></script>
+    <script src="~/js/system.js" asp-append-version="true"></script>
+}

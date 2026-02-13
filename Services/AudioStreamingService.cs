@@ -29,7 +29,8 @@ namespace BabyMonitarr.Backend.Services
     {
         private readonly ILogger<AudioStreamingService> _logger;
         private readonly IServiceScopeFactory _scopeFactory;
-        private readonly ConcurrentDictionary<int, RtspAudioReader> _readers = new();
+        private readonly NestStreamReaderManager _nestReaderManager;
+        private readonly ConcurrentDictionary<int, IDisposable> _readers = new();
         private readonly ConcurrentDictionary<int, AudioProcessingService> _processors = new();
         private readonly ConcurrentDictionary<int, ConcurrentBag<Action<AudioFrameEventArgs>>> _subscribers = new();
         private readonly ConcurrentDictionary<int, Room> _roomCache = new();
@@ -40,10 +41,12 @@ namespace BabyMonitarr.Backend.Services
 
         public AudioStreamingService(
             ILogger<AudioStreamingService> logger,
-            IServiceScopeFactory scopeFactory)
+            IServiceScopeFactory scopeFactory,
+            NestStreamReaderManager nestReaderManager)
         {
             _logger = logger;
             _scopeFactory = scopeFactory;
+            _nestReaderManager = nestReaderManager;
         }
 
         public async Task StartAsync(CancellationToken ct)
@@ -133,7 +136,8 @@ namespace BabyMonitarr.Backend.Services
             }
 
             var audioRooms = rooms
-                .Where(r => r.EnableAudioStream && !string.IsNullOrEmpty(r.CameraStreamUrl))
+                .Where(r => r.EnableAudioStream &&
+                    (r.StreamSourceType == "google_nest" ? !string.IsNullOrEmpty(r.NestDeviceId) : !string.IsNullOrEmpty(r.CameraStreamUrl)))
                 .ToDictionary(r => r.Id);
 
             // Stop readers for rooms that no longer need audio
@@ -143,7 +147,6 @@ namespace BabyMonitarr.Backend.Services
                 {
                     _logger.LogInformation("Room {RoomId} no longer needs audio, stopping reader", roomId);
                     StopReader(roomId);
-                    _readers.TryRemove(roomId, out _);
                     _roomCache.TryRemove(roomId, out _);
                     if (_processors.TryRemove(roomId, out var processor))
                     {
@@ -201,11 +204,12 @@ namespace BabyMonitarr.Backend.Services
                 rooms = await roomService.GetAllRoomsAsync();
             }
 
-            foreach (var room in rooms.Where(r => r.EnableAudioStream && !string.IsNullOrEmpty(r.CameraStreamUrl)))
+            foreach (var room in rooms.Where(r => r.EnableAudioStream &&
+                (r.StreamSourceType == "google_nest" ? !string.IsNullOrEmpty(r.NestDeviceId) : !string.IsNullOrEmpty(r.CameraStreamUrl))))
             {
                 _roomCache[room.Id] = room;
-                _logger.LogInformation("Audio-enabled room {RoomId} ({Name}) registered, will start on first subscriber",
-                    room.Id, room.Name);
+                _logger.LogInformation("Audio-enabled room {RoomId} ({Name}) [{SourceType}] registered, will start on first subscriber",
+                    room.Id, room.Name, room.StreamSourceType);
             }
         }
 
@@ -236,27 +240,48 @@ namespace BabyMonitarr.Backend.Services
                 var roomSettings = CreateAudioSettingsForRoom(room, globalSettings);
 
                 // Create per-room audio processor
-                var processor = new AudioProcessingService(room.Id, roomSettings,
-                    _logger);
+                var processor = new AudioProcessingService(room.Id, roomSettings, _logger);
                 processor.AudioSampleProcessed += OnAudioSampleProcessed;
                 processor.SoundThresholdExceeded += OnSoundThresholdExceeded;
 
-                // Create per-room RTSP reader
-                var reader = new RtspAudioReader(roomSettings, _logger);
-                reader.AudioDataReceived += processor.OnAudioDataReceived;
-
-                if (_readers.TryAdd(room.Id, reader) && _processors.TryAdd(room.Id, processor))
+                if (room.StreamSourceType == "google_nest" && !string.IsNullOrEmpty(room.NestDeviceId))
                 {
-                    reader.StartAsync(_cts.Token);
-                    _logger.LogInformation("Started audio reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    // Google Nest: use shared NestStreamReader
+                    var nestReader = _nestReaderManager.GetOrCreateReader(room.Id, room.NestDeviceId, _cts.Token);
+                    nestReader.AudioDataReceived += processor.OnAudioDataReceived;
+
+                    if (_readers.TryAdd(room.Id, nestReader) && _processors.TryAdd(room.Id, processor))
+                    {
+                        _logger.LogInformation("Started Nest audio reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    }
+                    else
+                    {
+                        nestReader.AudioDataReceived -= processor.OnAudioDataReceived;
+                        processor.AudioSampleProcessed -= OnAudioSampleProcessed;
+                        processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;
+                        _nestReaderManager.ReleaseReader(room.Id);
+                        processor.Dispose();
+                    }
                 }
                 else
                 {
-                    reader.AudioDataReceived -= processor.OnAudioDataReceived;
-                    processor.AudioSampleProcessed -= OnAudioSampleProcessed;
-                    processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;
-                    reader.Dispose();
-                    processor.Dispose();
+                    // RTSP: existing behavior
+                    var reader = new RtspAudioReader(roomSettings, _logger);
+                    reader.AudioDataReceived += processor.OnAudioDataReceived;
+
+                    if (_readers.TryAdd(room.Id, reader) && _processors.TryAdd(room.Id, processor))
+                    {
+                        reader.StartAsync(_cts.Token);
+                        _logger.LogInformation("Started RTSP audio reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    }
+                    else
+                    {
+                        reader.AudioDataReceived -= processor.OnAudioDataReceived;
+                        processor.AudioSampleProcessed -= OnAudioSampleProcessed;
+                        processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;
+                        reader.Dispose();
+                        processor.Dispose();
+                    }
                 }
             }
             catch (Exception ex)
@@ -271,11 +296,24 @@ namespace BabyMonitarr.Backend.Services
             {
                 if (_processors.TryGetValue(roomId, out var processor))
                 {
-                    reader.AudioDataReceived -= processor.OnAudioDataReceived;
+                    if (reader is RtspAudioReader rtspReader)
+                    {
+                        rtspReader.AudioDataReceived -= processor.OnAudioDataReceived;
+                    }
+                    else if (reader is NestStreamReader nestReader)
+                    {
+                        nestReader.AudioDataReceived -= processor.OnAudioDataReceived;
+                        _nestReaderManager.ReleaseReader(roomId);
+                    }
                     processor.AudioSampleProcessed -= OnAudioSampleProcessed;
                     processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;
                 }
-                reader.Dispose();
+
+                // Only dispose RTSP readers directly; Nest readers are managed by NestStreamReaderManager
+                if (reader is RtspAudioReader)
+                {
+                    reader.Dispose();
+                }
                 _logger.LogInformation("Stopped audio reader for room {RoomId}", roomId);
             }
 

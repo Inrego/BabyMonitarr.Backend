@@ -16,6 +16,8 @@ public class AudioStreamHub : Hub
     private readonly IRoomService _roomService;
     private readonly IVideoWebRtcService _videoWebRtcService;
     private readonly IVideoStreamingService _videoStreamingService;
+    private readonly IGoogleNestAuthService _nestAuthService;
+    private readonly IGoogleNestDeviceService _nestDeviceService;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
@@ -23,7 +25,9 @@ public class AudioStreamHub : Hub
         IAudioStreamingService audioStreamingService,
         IRoomService roomService,
         IVideoWebRtcService videoWebRtcService,
-        IVideoStreamingService videoStreamingService)
+        IVideoStreamingService videoStreamingService,
+        IGoogleNestAuthService nestAuthService,
+        IGoogleNestDeviceService nestDeviceService)
     {
         _logger = logger;
         _audioWebRtcService = audioWebRtcService;
@@ -31,6 +35,8 @@ public class AudioStreamHub : Hub
         _roomService = roomService;
         _videoWebRtcService = videoWebRtcService;
         _videoStreamingService = videoStreamingService;
+        _nestAuthService = nestAuthService;
+        _nestDeviceService = nestDeviceService;
     }
 
     public override async Task OnConnectedAsync()
@@ -215,6 +221,36 @@ public class AudioStreamHub : Hub
         _audioStreamingService.RefreshRooms();
 
         await Clients.Others.SendAsync("SettingsUpdated");
+    }
+    #endregion
+
+    #region Google Nest
+    public async Task<GoogleNestSettings> GetNestSettings()
+    {
+        return await _nestAuthService.GetSettings();
+    }
+
+    public async Task UpdateNestSettings(GoogleNestSettings settings)
+    {
+        await _nestAuthService.UpdateSettings(settings);
+    }
+
+    public async Task<string> GetNestAuthUrl()
+    {
+        var redirectUri = Context.GetHttpContext()?.Request is { } req
+            ? $"{req.Scheme}://{req.Host}/nest/auth/callback"
+            : "/nest/auth/callback";
+        return await _nestAuthService.GetAuthorizationUrl(redirectUri);
+    }
+
+    public async Task<List<NestDevice>> GetNestDevices()
+    {
+        return await _nestDeviceService.ListDevicesAsync();
+    }
+
+    public async Task<bool> IsNestLinked()
+    {
+        return await _nestAuthService.IsLinked();
     }
     #endregion
 }

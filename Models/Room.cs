@@ -11,6 +11,8 @@ public class Room
     public string? CameraStreamUrl { get; set; }
     public string? CameraUsername { get; set; }
     public string? CameraPassword { get; set; }
+    public string StreamSourceType { get; set; } = "rtsp";
+    public string? NestDeviceId { get; set; }
     public bool IsActive { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

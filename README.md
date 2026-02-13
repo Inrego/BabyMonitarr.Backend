@@ -17,6 +17,20 @@ WebRTC provides:
 - Built-in NAT traversal via ICE candidates
 - Data channels for lightweight metadata transmission
 
+## Google Nest Camera Setup
+
+To use Google Nest cameras, you need to configure OAuth 2.0 credentials in the Google Cloud Console for the Smart Device Management (SDM) API.
+
+### Authorized Redirect URI
+
+Add the following redirect URI to your OAuth 2.0 client credentials:
+
+```
+http://localhost:5148/nest/auth/callback
+```
+
+Replace `localhost:5148` with your actual host and port if running in a different environment.
+
 ## Client Integration Guide
 
 To build a client that connects to BabyMonitarr, follow this protocol:

@@ -250,8 +250,14 @@ function selectMonitorForEditing(id) {
     const enableAudio = document.getElementById('enableAudioStream');
     if (enableAudio) enableAudio.checked = room.enableAudioStream;
 
+    const sourceType = document.getElementById('streamSourceType');
+    if (sourceType) sourceType.value = room.streamSourceType || 'rtsp';
+
     const cameraUrl = document.getElementById('cameraStreamUrl');
     if (cameraUrl) cameraUrl.value = room.cameraStreamUrl || '';
+
+    // Toggle source fields visibility (pass nestDeviceId so it can be selected after async load)
+    onStreamSourceTypeChanged(room.nestDeviceId);
 
     // Re-render list to show editing state
     renderMonitorList();
@@ -290,7 +296,9 @@ async function addNewMonitor() {
             monitorType: "camera_audio",
             enableVideoStream: false,
             enableAudioStream: true,
+            streamSourceType: "rtsp",
             cameraStreamUrl: "",
+            nestDeviceId: "",
             cameraUsername: "",
             cameraPassword: "",
             isActive: false
@@ -323,7 +331,9 @@ async function saveRoomConfig() {
         monitorType: document.getElementById('monitorType')?.value || 'camera_audio',
         enableVideoStream: document.getElementById('enableVideoStream')?.checked || false,
         enableAudioStream: document.getElementById('enableAudioStream')?.checked || false,
+        streamSourceType: document.getElementById('streamSourceType')?.value || 'rtsp',
         cameraStreamUrl: document.getElementById('cameraStreamUrl')?.value || '',
+        nestDeviceId: document.getElementById('nestDeviceSelect')?.value || '',
         cameraUsername: room.cameraUsername || '',
         cameraPassword: room.cameraPassword || '',
         isActive: room.isActive
@@ -631,4 +641,68 @@ function showMessage(message, isError = false) {
     setTimeout(() => {
         messageElement.style.display = 'none';
     }, 3000);
+}
+
+// ===== Nest Source Type Support =====
+function onStreamSourceTypeChanged(nestDeviceId) {
+    const sourceType = document.getElementById('streamSourceType')?.value || 'rtsp';
+    const rtspFields = document.getElementById('rtspSourceFields');
+    const nestFields = document.getElementById('nestSourceFields');
+
+    if (rtspFields) rtspFields.style.display = sourceType === 'rtsp' ? 'block' : 'none';
+    if (nestFields) {
+        nestFields.style.display = sourceType === 'google_nest' ? 'block' : 'none';
+        if (sourceType === 'google_nest') {
+            loadNestDevices(nestDeviceId);
+            checkNestLinked();
+        }
+    }
+}
+
+async function loadNestDevices(deviceIdToSelect) {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) return;
+
+    const select = document.getElementById('nestDeviceSelect');
+    if (!select) return;
+
+    // Preserve current selection
+    const currentValue = select.value;
+
+    try {
+        const devices = await connection.invoke("GetNestDevices");
+        // Keep the placeholder option
+        select.innerHTML = '<option value="">Select a Nest camera...</option>';
+
+        devices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.deviceId;
+            const label = device.displayName || device.roomName || device.deviceId;
+            option.textContent = device.roomName && device.displayName
+                ? `${device.displayName} (${device.roomName})`
+                : label;
+            select.appendChild(option);
+        });
+
+        // Restore selection (prefer explicitly passed device ID over pre-population value)
+        const valueToRestore = deviceIdToSelect || currentValue;
+        if (valueToRestore) select.value = valueToRestore;
+    } catch (err) {
+        console.error("Error loading Nest devices:", err);
+        select.innerHTML = '<option value="">Error loading devices</option>';
+    }
+}
+
+async function checkNestLinked() {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) return;
+
+    const warning = document.getElementById('nestNotLinkedWarning');
+    if (!warning) return;
+
+    try {
+        const isLinked = await connection.invoke("IsNestLinked");
+        warning.style.display = isLinked ? 'none' : 'block';
+    } catch (err) {
+        console.error("Error checking Nest link status:", err);
+        warning.style.display = 'block';
+    }
 }

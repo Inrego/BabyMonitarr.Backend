@@ -59,6 +59,8 @@ public class RoomService : IRoomService
         existing.CameraStreamUrl = room.CameraStreamUrl;
         existing.CameraUsername = room.CameraUsername;
         existing.CameraPassword = room.CameraPassword;
+        existing.StreamSourceType = room.StreamSourceType;
+        existing.NestDeviceId = room.NestDeviceId;
 
         await _db.SaveChangesAsync();
         return existing;

@@ -9,6 +9,7 @@ public class BabyMonitarrDbContext : DbContext
 
     public DbSet<Room> Rooms => Set<Room>();
     public DbSet<GlobalSettings> GlobalSettings => Set<GlobalSettings>();
+    public DbSet<GoogleNestSettings> GoogleNestSettings => Set<GoogleNestSettings>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -20,5 +21,6 @@ public class BabyMonitarrDbContext : DbContext
         });
 
         modelBuilder.Entity<GlobalSettings>().HasData(new GlobalSettings { Id = 1 });
+        modelBuilder.Entity<GoogleNestSettings>().HasData(new GoogleNestSettings { Id = 1 });
     }
 }

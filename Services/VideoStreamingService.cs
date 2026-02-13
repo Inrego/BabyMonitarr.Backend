@@ -19,7 +19,8 @@ namespace BabyMonitarr.Backend.Services
     {
         private readonly ILogger<VideoStreamingService> _logger;
         private readonly IServiceScopeFactory _scopeFactory;
-        private readonly ConcurrentDictionary<int, RtspVideoReader> _readers = new();
+        private readonly NestStreamReaderManager _nestReaderManager;
+        private readonly ConcurrentDictionary<int, IDisposable> _readers = new();
         private readonly ConcurrentDictionary<int, ConcurrentBag<Action<VideoFrameEventArgs>>> _subscribers = new();
         private readonly ConcurrentDictionary<int, Room> _roomCache = new();
         private CancellationTokenSource? _cts;
@@ -27,10 +28,12 @@ namespace BabyMonitarr.Backend.Services
 
         public VideoStreamingService(
             ILogger<VideoStreamingService> logger,
-            IServiceScopeFactory scopeFactory)
+            IServiceScopeFactory scopeFactory,
+            NestStreamReaderManager nestReaderManager)
         {
             _logger = logger;
             _scopeFactory = scopeFactory;
+            _nestReaderManager = nestReaderManager;
         }
 
         public async Task StartAsync(CancellationToken ct)
@@ -115,7 +118,8 @@ namespace BabyMonitarr.Backend.Services
             }
 
             var videoRooms = rooms
-                .Where(r => r.EnableVideoStream && !string.IsNullOrEmpty(r.CameraStreamUrl))
+                .Where(r => r.EnableVideoStream &&
+                    (r.StreamSourceType == "google_nest" ? !string.IsNullOrEmpty(r.NestDeviceId) : !string.IsNullOrEmpty(r.CameraStreamUrl)))
                 .ToDictionary(r => r.Id);
 
             // Stop readers for rooms that no longer need video
@@ -168,12 +172,12 @@ namespace BabyMonitarr.Backend.Services
                 rooms = await roomService.GetAllRoomsAsync();
             }
 
-            foreach (var room in rooms.Where(r => r.EnableVideoStream && !string.IsNullOrEmpty(r.CameraStreamUrl)))
+            foreach (var room in rooms.Where(r => r.EnableVideoStream &&
+                (r.StreamSourceType == "google_nest" ? !string.IsNullOrEmpty(r.NestDeviceId) : !string.IsNullOrEmpty(r.CameraStreamUrl))))
             {
                 _roomCache[room.Id] = room;
-                // Don't start readers yet - wait for subscribers (lazy start)
-                _logger.LogInformation("Video-enabled room {RoomId} ({Name}) registered, will start on first subscriber",
-                    room.Id, room.Name);
+                _logger.LogInformation("Video-enabled room {RoomId} ({Name}) [{SourceType}] registered, will start on first subscriber",
+                    room.Id, room.Name, room.StreamSourceType);
             }
         }
 
@@ -193,17 +197,37 @@ namespace BabyMonitarr.Backend.Services
 
             try
             {
-                var reader = new RtspVideoReader(room, _logger);
-                reader.VideoFrameReceived += OnVideoFrameReceived;
-
-                if (_readers.TryAdd(room.Id, reader))
+                if (room.StreamSourceType == "google_nest" && !string.IsNullOrEmpty(room.NestDeviceId))
                 {
-                    reader.StartAsync(_cts.Token);
-                    _logger.LogInformation("Started video reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    // Google Nest: use shared NestStreamReader
+                    var nestReader = _nestReaderManager.GetOrCreateReader(room.Id, room.NestDeviceId, _cts.Token);
+                    nestReader.VideoFrameReceived += OnVideoFrameReceived;
+
+                    if (_readers.TryAdd(room.Id, nestReader))
+                    {
+                        _logger.LogInformation("Started Nest video reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    }
+                    else
+                    {
+                        nestReader.VideoFrameReceived -= OnVideoFrameReceived;
+                        _nestReaderManager.ReleaseReader(room.Id);
+                    }
                 }
                 else
                 {
-                    reader.Dispose();
+                    // RTSP: existing behavior
+                    var reader = new RtspVideoReader(room, _logger);
+                    reader.VideoFrameReceived += OnVideoFrameReceived;
+
+                    if (_readers.TryAdd(room.Id, reader))
+                    {
+                        reader.StartAsync(_cts.Token);
+                        _logger.LogInformation("Started RTSP video reader for room {RoomId} ({Name})", room.Id, room.Name);
+                    }
+                    else
+                    {
+                        reader.Dispose();
+                    }
                 }
             }
             catch (Exception ex)
@@ -216,20 +240,26 @@ namespace BabyMonitarr.Backend.Services
         {
             if (_readers.TryRemove(roomId, out var reader))
             {
-                reader.VideoFrameReceived -= OnVideoFrameReceived;
-                reader.Dispose();
+                if (reader is RtspVideoReader rtspReader)
+                {
+                    rtspReader.VideoFrameReceived -= OnVideoFrameReceived;
+                    rtspReader.Dispose();
+                }
+                else if (reader is NestStreamReader nestReader)
+                {
+                    nestReader.VideoFrameReceived -= OnVideoFrameReceived;
+                    _nestReaderManager.ReleaseReader(roomId);
+                }
                 _logger.LogInformation("Stopped video reader for room {RoomId}", roomId);
             }
         }
 
         private void OnVideoFrameReceived(object? sender, VideoFrameEventArgs e)
         {
-            if (sender is not RtspVideoReader reader) return;
-
             // Find the room ID for this reader
             foreach (var kvp in _readers)
             {
-                if (ReferenceEquals(kvp.Value, reader))
+                if (ReferenceEquals(kvp.Value, sender))
                 {
                     int roomId = kvp.Key;
                     if (_subscribers.TryGetValue(roomId, out var handlers))
