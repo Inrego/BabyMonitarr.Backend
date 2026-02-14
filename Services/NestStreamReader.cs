@@ -274,17 +274,52 @@ public class NestStreamReader : IDisposable
             throw new Exception($"Failed to set remote description: {result}");
         }
 
-        // Add ICE candidates individually after remote description is set
+        // Add ICE candidates individually after remote description is set.
+        // Some Nest candidates can be malformed for SIPSorcery's parser; skip
+        // invalid entries so valid candidates still get applied.
+        var addedCandidates = 0;
+        var skippedCandidates = 0;
+
         foreach (var (candidate, mid, index) in iceCandidates)
         {
-            _logger.LogDebug("Adding ICE candidate for room {RoomId}: mid={Mid}, index={Index}, candidate={Candidate}",
-                _roomId, mid, index, candidate);
-            _peerConnection.addIceCandidate(new RTCIceCandidateInit
+            if (!TryNormalizeIceCandidateForSipsorcery(candidate, out var normalizedCandidate, out var reason))
             {
-                candidate = candidate,
-                sdpMid = mid,
-                sdpMLineIndex = index
-            });
+                skippedCandidates++;
+                _logger.LogWarning(
+                    "Skipping malformed Nest ICE candidate for room {RoomId}: mid={Mid}, index={Index}, reason={Reason}, candidate={Candidate}",
+                    _roomId, mid, index, reason, candidate);
+                continue;
+            }
+
+            try
+            {
+                _logger.LogDebug("Adding ICE candidate for room {RoomId}: mid={Mid}, index={Index}, candidate={Candidate}",
+                    _roomId, mid, index, normalizedCandidate);
+                _peerConnection.addIceCandidate(new RTCIceCandidateInit
+                {
+                    candidate = normalizedCandidate,
+                    sdpMid = mid,
+                    sdpMLineIndex = index
+                });
+                addedCandidates++;
+            }
+            catch (FormatException ex)
+            {
+                skippedCandidates++;
+                _logger.LogWarning(ex,
+                    "Failed to parse Nest ICE candidate for room {RoomId}: mid={Mid}, index={Index}, candidate={Candidate}",
+                    _roomId, mid, index, normalizedCandidate);
+            }
+        }
+
+        _logger.LogInformation(
+            "Processed Nest ICE candidates for room {RoomId}: added={Added}, skipped={Skipped}",
+            _roomId, addedCandidates, skippedCandidates);
+        if (iceCandidates.Count > 0 && addedCandidates == 0)
+        {
+            _logger.LogWarning(
+                "No valid Nest ICE candidates were applied for room {RoomId}; stream connectivity may fail",
+                _roomId);
         }
 
         _logger.LogInformation("Nest WebRTC connection established for room {RoomId}, media session: {SessionId}",
@@ -372,6 +407,144 @@ public class NestStreamReader : IDisposable
     private static string PatchSdpForNest(string sdp)
     {
         return sdp.Replace("OPUS", "opus");
+    }
+
+    private static bool TryNormalizeIceCandidateForSipsorcery(
+        string candidate,
+        out string normalizedCandidate,
+        out string reason)
+    {
+        normalizedCandidate = string.Empty;
+        reason = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            reason = "empty candidate";
+            return false;
+        }
+
+        var candidateText = candidate.Trim();
+        if (candidateText.StartsWith("a=", StringComparison.OrdinalIgnoreCase))
+        {
+            candidateText = candidateText.Substring(2).Trim();
+        }
+
+        if (!candidateText.StartsWith("candidate:", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "missing candidate: prefix";
+            return false;
+        }
+
+        var candidateBody = candidateText.Substring("candidate:".Length).TrimStart();
+        var fields = candidateBody.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (fields.Length < 7)
+        {
+            reason = $"expected at least 7 candidate fields but got {fields.Length}";
+            return false;
+        }
+
+        // Nest SDP answers can omit the foundation and start at component-id:
+        // candidate: 1 udp 2113939711 74.125.247.232 19305 typ host ...
+        // SIPSorcery expects a normalized token stream with foundation present.
+        var hasFoundation = fields.Length >= 8 &&
+            ushort.TryParse(fields[1], out _) &&
+            IsIceTransportToken(fields[2]);
+        var missingFoundation = ushort.TryParse(fields[0], out _) &&
+            IsIceTransportToken(fields[1]);
+
+        if (!hasFoundation && !missingFoundation)
+        {
+            reason = "unrecognized candidate token layout";
+            return false;
+        }
+
+        var tokens = new List<string>(fields.Length + 1);
+        if (hasFoundation)
+        {
+            if (string.IsNullOrWhiteSpace(fields[0]))
+            {
+                reason = "candidate foundation missing";
+                return false;
+            }
+
+            tokens.Add($"candidate:{fields[0]}");
+            for (var i = 1; i < fields.Length; i++)
+            {
+                tokens.Add(fields[i]);
+            }
+        }
+        else
+        {
+            // Synthesize a deterministic foundation from priority to satisfy parser.
+            tokens.Add($"candidate:nest{fields[2]}");
+            for (var i = 0; i < fields.Length; i++)
+            {
+                tokens.Add(fields[i]);
+            }
+        }
+
+        if (tokens.Count < 8)
+        {
+            reason = $"expected at least 8 normalized tokens but got {tokens.Count}";
+            return false;
+        }
+        if (!ushort.TryParse(tokens[1], out _))
+        {
+            reason = $"invalid component token '{tokens[1]}'";
+            return false;
+        }
+        if (!IsIceTransportToken(tokens[2]))
+        {
+            reason = $"invalid transport token '{tokens[2]}'";
+            return false;
+        }
+        if (!ushort.TryParse(tokens[5], out _))
+        {
+            reason = $"invalid port token '{tokens[5]}'";
+            return false;
+        }
+        if (!tokens[6].Equals("typ", StringComparison.OrdinalIgnoreCase))
+        {
+            reason = $"expected 'typ' token at position 7 but found '{tokens[6]}'";
+            return false;
+        }
+
+        if (tokens[2].Equals("ssltcp", StringComparison.OrdinalIgnoreCase))
+        {
+            tokens[2] = "tcp";
+        }
+        else
+        {
+            tokens[2] = tokens[2].ToLowerInvariant(); // Protocol token expected by SIPSorcery parser.
+        }
+
+        tokens[6] = tokens[6].ToLowerInvariant(); // "typ" key.
+        tokens[7] = tokens[7].ToLowerInvariant(); // Candidate type value.
+        for (var i = 0; i < tokens.Count; i++)
+        {
+            if (tokens[i].Equals("tcptype", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens[i] = "tcpType"; // SIPSorcery parser expects camel-case key.
+            }
+            else if (tokens[i].Equals("raddr", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens[i] = "raddr";
+            }
+            else if (tokens[i].Equals("rport", StringComparison.OrdinalIgnoreCase))
+            {
+                tokens[i] = "rport";
+            }
+        }
+
+        normalizedCandidate = string.Join(" ", tokens);
+        return true;
+    }
+
+    private static bool IsIceTransportToken(string token)
+    {
+        return token.Equals("udp", StringComparison.OrdinalIgnoreCase) ||
+            token.Equals("tcp", StringComparison.OrdinalIgnoreCase) ||
+            token.Equals("ssltcp", StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnRtpPacketReceived(IPEndPoint remoteEndPoint, SDPMediaTypesEnum mediaType, RTPPacket rtpPacket)
