@@ -13,7 +13,6 @@ let saveDebounceTimer;
 
 // Room state
 let currentRooms = [];
-let activeRoomId = null;
 let selectedRoomId = null; // Room being edited in right panel
 let previewRoomId = null;  // Room being audio-previewed
 let globalSettings = {};
@@ -94,13 +93,6 @@ function initializeSignalRConnection() {
         await loadRooms();
     });
 
-    // Handle active room changes
-    connection.on("ActiveRoomChanged", (room) => {
-        console.log("Active room changed:", room);
-        activeRoomId = room.id;
-        renderMonitorList();
-    });
-
     // Handle settings updates from other clients
     connection.on("SettingsUpdated", async () => {
         console.log("Settings updated by another client");
@@ -129,8 +121,6 @@ function initializeSignalRConnection() {
 async function loadRooms() {
     try {
         currentRooms = await connection.invoke("GetRooms");
-        const activeRoom = currentRooms.find(r => r.isActive);
-        activeRoomId = activeRoom ? activeRoom.id : null;
         renderMonitorList();
     } catch (err) {
         console.error("Error loading rooms:", err);
@@ -177,24 +167,22 @@ function renderMonitorList() {
     }
 
     container.innerHTML = currentRooms.map(room => {
-        const isActive = room.isActive;
         const isEditing = room.id === selectedRoomId;
         return `
-            <div class="monitor-card ${isActive ? 'active' : ''} ${isEditing ? 'editing' : ''}" data-room-id="${room.id}">
+            <div class="monitor-card ${isEditing ? 'editing' : ''}" data-room-id="${room.id}">
                 <div class="monitor-card-header">
                     <div class="monitor-card-icon">
                         <i class="fas fa-${room.icon || 'baby'}"></i>
                     </div>
                     <div class="monitor-card-info">
                         <div class="monitor-card-name">${escapeHtml(room.name)}</div>
-                        <span class="status-badge ${isActive ? 'active' : 'offline'}">
+                        <span class="status-badge configured">
                             <span class="status-dot"></span>
-                            ${isActive ? 'Active' : 'Offline'}
+                            Configured
                         </span>
                     </div>
                 </div>
                 <div class="monitor-card-actions">
-                    ${!isActive ? `<button class="btn-card-action btn-activate" onclick="selectRoomForMonitoring(${room.id})"><i class="fas fa-play"></i> Activate</button>` : ''}
                     <button class="btn-card-action btn-edit" onclick="selectMonitorForEditing(${room.id})"><i class="fas fa-pen"></i> Edit</button>
                 </div>
             </div>
@@ -261,25 +249,6 @@ function selectMonitorForEditing(id) {
 
     // Re-render list to show editing state
     renderMonitorList();
-}
-
-async function selectRoomForMonitoring(id) {
-    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
-        showMessage("Not connected to server.", true);
-        return;
-    }
-
-    try {
-        const room = await connection.invoke("SelectRoom", id);
-        if (room) {
-            activeRoomId = room.id;
-            renderMonitorList();
-            showMessage(`Now monitoring: ${room.name}`);
-        }
-    } catch (err) {
-        console.error("Error selecting room:", err);
-        showMessage("Error activating room", true);
-    }
 }
 
 // ===== Room CRUD =====

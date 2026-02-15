@@ -4,16 +4,16 @@ let connection;
 // Video state
 let videoConnections = {};        // { roomId: RTCPeerConnection }
 let videoPendingCandidates = {};  // { roomId: [RTCIceCandidate] }
+let videoTracks = {};             // { roomId: MediaStreamTrack }
 
 // Audio state (per-room)
 let audioConnections = {};        // { roomId: RTCPeerConnection }
 let audioPendingCandidates = {};  // { roomId: [RTCIceCandidate] }
 let audioElements = {};           // { roomId: HTMLAudioElement }
-let mutedRooms = {};              // { roomId: boolean }
 
 // State
 let currentRooms = [];
-let activeRoomId = null;
+let monitoringRooms = new Set();  // roomIds this client is actively monitoring
 
 document.addEventListener('DOMContentLoaded', function () {
     try {
@@ -82,12 +82,6 @@ function initializeSignalRConnection() {
         await loadRooms();
     });
 
-    // Handle active room changes
-    connection.on("ActiveRoomChanged", (room) => {
-        activeRoomId = room.id;
-        updateDashboardState();
-    });
-
     connection.start()
         .then(async () => {
             console.log("Dashboard SignalR Connected");
@@ -101,52 +95,24 @@ function initializeSignalRConnection() {
 
 async function loadRooms() {
     try {
-        const previousRooms = currentRooms;
+        const previousRoomIds = new Set(currentRooms.map(r => r.id));
         currentRooms = await connection.invoke("GetRooms");
-        const activeRoom = currentRooms.find(r => r.isActive);
-        activeRoomId = activeRoom ? activeRoom.id : null;
-        renderDashboard();
+        const currentRoomIds = new Set(currentRooms.map(r => r.id));
 
-        // Manage video and audio streams after rendering
-        await manageVideoStreams(previousRooms);
-        await manageAudioStreams(previousRooms);
+        // Stop streams for rooms that were removed from config
+        for (const roomId of monitoringRooms) {
+            if (!currentRoomIds.has(roomId)) {
+                await stopMonitoring(roomId, true);
+            }
+        }
+
+        renderDashboard();
     } catch (err) {
         console.error("Error loading rooms:", err);
     }
 }
 
-// ===== Dashboard State Update (surgical, preserves DOM/video) =====
-function updateDashboardState() {
-    for (const room of currentRooms) {
-        const isListening = !!audioConnections[room.id];
-        const isMuted = !!mutedRooms[room.id];
-
-        // Update LIVE badge
-        const badge = document.getElementById(`liveBadge-${room.id}`);
-        if (badge) {
-            badge.classList.toggle('visible', isListening);
-        }
-
-        // Update Listen button
-        const card = document.querySelector(`.dash-card[data-room-id="${room.id}"]`);
-        if (!card) continue;
-        const listenBtn = card.querySelector('.btn-dash-listen');
-        if (listenBtn) {
-            listenBtn.className = `btn-dash-action btn-dash-listen ${isListening ? 'active' : ''}`;
-            listenBtn.innerHTML = `<i class="fas fa-${isListening ? 'stop' : 'headphones'}"></i> ${isListening ? 'Stop' : 'Listen'}`;
-        }
-
-        // Update Audio button
-        const audioBtn = card.querySelector('.btn-dash-audio');
-        if (audioBtn) {
-            audioBtn.className = `btn-dash-action btn-dash-audio ${isListening ? '' : 'disabled'}`;
-            audioBtn.disabled = !isListening;
-            audioBtn.innerHTML = `<i class="fas fa-${isMuted && isListening ? 'volume-mute' : 'volume-up'}"></i> ${isMuted && isListening ? 'Muted' : 'Audio'}`;
-        }
-    }
-}
-
-// ===== Dashboard Rendering (full rebuild) =====
+// ===== Dashboard Rendering =====
 function renderDashboard() {
     const grid = document.getElementById('dashboardGrid');
     const empty = document.getElementById('dashboardEmpty');
@@ -162,45 +128,121 @@ function renderDashboard() {
     empty.style.display = 'none';
 
     grid.innerHTML = currentRooms.map(room => {
-        const isListening = !!audioConnections[room.id];
-        const isMuted = !!mutedRooms[room.id];
-        const hasVideo = room.enableVideoStream && (room.cameraStreamUrl || room.nestDeviceId);
-        const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
-        return `
-            <div class="dash-card" data-room-id="${room.id}">
-                <div class="dash-card-preview">
-                    <video id="video-${room.id}" class="dash-card-video" autoplay muted playsinline
-                           style="display: none;"></video>
-                    <div id="iconPlaceholder-${room.id}" class="dash-card-icon-placeholder">
-                        <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
-                    </div>
-                    <div id="videoLoading-${room.id}" class="dash-card-video-loading" style="display: none;">
-                        <i class="fas fa-spinner fa-spin"></i>
-                    </div>
-                    <span id="liveBadge-${room.id}" class="dash-card-live-badge ${isListening ? 'visible' : ''}">LIVE</span>
-                    <span class="dash-card-room-name">${escapeHtml(room.name)}</span>
-                    <span id="dbLevel-${room.id}" class="dash-card-db-level">--.- dB</span>
-                    <div class="dash-card-meter-bar">
-                        <div id="meter-${room.id}" class="dash-card-meter-fill"></div>
-                    </div>
+        if (monitoringRooms.has(room.id)) {
+            return renderMonitoringCard(room);
+        } else {
+            return renderInactiveCard(room);
+        }
+    }).join('');
+
+    reattachVideoStreams();
+}
+
+function updateRoomCard(roomId) {
+    const room = currentRooms.find(r => r.id === roomId);
+    if (!room) return;
+    const existingCard = document.querySelector(`.dash-card[data-room-id="${roomId}"]`);
+    if (!existingCard) return;
+    const html = monitoringRooms.has(roomId) ? renderMonitoringCard(room) : renderInactiveCard(room);
+    const temp = document.createElement('div');
+    temp.innerHTML = html;
+    existingCard.replaceWith(temp.firstElementChild);
+}
+
+function reattachVideoStreams() {
+    for (const roomId of Object.keys(videoConnections)) {
+        const track = videoTracks[roomId];
+        const videoEl = document.getElementById(`video-${roomId}`);
+        if (!videoEl || !track || track.readyState !== 'live') continue;
+        videoEl.srcObject = new MediaStream([track]);
+        videoEl.style.display = '';
+        videoEl.play().catch(e => console.error(`Error replaying video for room ${roomId}:`, e));
+        const iconEl = document.getElementById(`iconPlaceholder-${roomId}`);
+        if (iconEl) iconEl.style.display = 'none';
+        const loadingEl = document.getElementById(`videoLoading-${roomId}`);
+        if (loadingEl) loadingEl.style.display = 'none';
+    }
+}
+
+function renderInactiveCard(room) {
+    return `
+        <div class="dash-card" data-room-id="${room.id}">
+            <div class="dash-card-header">
+                <div class="dash-card-header-icon">
+                    <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
                 </div>
-                <div class="dash-card-actions">
-                    <button class="btn-dash-action btn-dash-listen ${isListening ? 'active' : ''}" onclick="toggleListen(${room.id})" ${!hasAudio ? 'disabled' : ''}>
-                        <i class="fas fa-${isListening ? 'stop' : 'headphones'}"></i>
-                        ${isListening ? 'Stop' : 'Listen'}
-                    </button>
-                    <button class="btn-dash-action btn-dash-audio ${isListening ? '' : 'disabled'}" onclick="toggleMute(${room.id})" ${isListening ? '' : 'disabled'}>
-                        <i class="fas fa-${isMuted && isListening ? 'volume-mute' : 'volume-up'}"></i>
-                        ${isMuted && isListening ? 'Muted' : 'Audio'}
-                    </button>
-                    <button class="btn-dash-action btn-dash-configure" onclick="navigateToConfigure(${room.id})">
-                        <i class="fas fa-cog"></i>
-                        Configure
-                    </button>
+                <span class="dash-card-header-name">${escapeHtml(room.name)}</span>
+                <div class="dash-card-header-badges">
+                    <span class="status-badge inactive">
+                        <span class="status-dot"></span>
+                        Inactive
+                    </span>
                 </div>
             </div>
-        `;
-    }).join('');
+            <div class="dash-card-inactive-body">
+                <div class="dash-card-inactive-icon">
+                    <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
+                </div>
+                <div class="dash-card-inactive-message">Monitor is not active</div>
+                <button class="btn-start-monitoring" onclick="startMonitoring(${room.id})">
+                    <i class="fas fa-play"></i> Start Monitoring
+                </button>
+                <div class="dash-card-inactive-links">
+                    <a href="/Home/Index?editRoom=${room.id}"><i class="fas fa-cog"></i> Settings</a>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderMonitoringCard(room) {
+    const hasVideo = room.enableVideoStream && (room.cameraStreamUrl || room.nestDeviceId);
+    const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
+    const isMuted = !audioElements[room.id] || audioElements[room.id].muted;
+
+    return `
+        <div class="dash-card" data-room-id="${room.id}">
+            <div class="dash-card-header">
+                <div class="dash-card-header-icon">
+                    <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
+                </div>
+                <span class="dash-card-header-name">${escapeHtml(room.name)}</span>
+                <div class="dash-card-header-badges">
+                    <span class="status-badge monitoring">
+                        <span class="status-dot"></span>
+                        Monitoring
+                    </span>
+                    <span class="dash-card-live-badge">LIVE</span>
+                </div>
+            </div>
+            <div class="dash-card-preview">
+                <video id="video-${room.id}" class="dash-card-video" autoplay muted playsinline
+                       style="display: none;"></video>
+                <div id="iconPlaceholder-${room.id}" class="dash-card-icon-placeholder">
+                    <i class="fas fa-${escapeHtml(room.icon || 'baby')}"></i>
+                </div>
+                <div id="videoLoading-${room.id}" class="dash-card-video-loading" style="display: none;">
+                    <i class="fas fa-spinner fa-spin"></i>
+                </div>
+            </div>
+            <div class="dash-card-monitoring-info">
+                <span id="dbLevel-${room.id}" class="dash-card-db-level">--.- dB</span>
+                <div class="dash-card-meter-bar">
+                    <div id="meter-${room.id}" class="dash-card-meter-fill"></div>
+                </div>
+            </div>
+            <div class="dash-card-actions">
+                <button class="btn-dash-action btn-dash-mute ${isMuted ? 'muted' : ''}" onclick="toggleMute(${room.id})" ${!hasAudio ? 'disabled' : ''}>
+                    <i class="fas fa-${isMuted ? 'volume-mute' : 'volume-up'}"></i>
+                    ${isMuted ? 'Muted' : 'Sound On'}
+                </button>
+                <button class="btn-dash-action btn-dash-stop" onclick="stopMonitoring(${room.id})">
+                    <i class="fas fa-stop"></i>
+                    Stop
+                </button>
+            </div>
+        </div>
+    `;
 }
 
 function escapeHtml(text) {
@@ -209,6 +251,45 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// ===== Start / Stop Monitoring =====
+async function startMonitoring(roomId) {
+    if (monitoringRooms.has(roomId)) return;
+    const room = currentRooms.find(r => r.id === roomId);
+    if (!room) return;
+
+    monitoringRooms.add(roomId);
+    updateRoomCard(roomId);
+
+    const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
+    const hasVideo = room.enableVideoStream && (room.cameraStreamUrl || room.nestDeviceId);
+
+    // Start streams (audio unmuted by default — noise meter data arrives via data channel)
+    if (hasAudio) {
+        await startAudioStream(roomId);
+        updateMuteButton(roomId);
+    }
+    if (hasVideo) {
+        await startVideoStream(roomId);
+    }
+}
+
+async function stopMonitoring(roomId, skipRender) {
+    // Stop both streams
+    if (audioConnections[roomId]) {
+        await stopAudioStream(roomId);
+    }
+    if (videoConnections[roomId]) {
+        await stopVideoStream(roomId);
+    }
+
+    monitoringRooms.delete(roomId);
+
+    if (!skipRender) {
+        updateRoomCard(roomId);
+    }
+}
+
+// ===== Video Stream Management =====
 function canStartVideoForRoom(room) {
     if (!room || !room.enableVideoStream) {
         return false;
@@ -219,26 +300,6 @@ function canStartVideoForRoom(room) {
     }
 
     return !!room.cameraStreamUrl;
-}
-
-// ===== Video Stream Management =====
-async function manageVideoStreams(previousRooms) {
-    const videoRooms = currentRooms.filter(canStartVideoForRoom);
-    const videoRoomIds = new Set(videoRooms.map(r => r.id));
-
-    // Stop video for rooms that were removed or had video disabled
-    for (const roomId of Object.keys(videoConnections).map(Number)) {
-        if (!videoRoomIds.has(roomId)) {
-            await stopVideoStream(roomId);
-        }
-    }
-
-    // Start video for new rooms that need it
-    for (const room of videoRooms) {
-        if (!videoConnections[room.id]) {
-            await startVideoStream(room.id);
-        }
-    }
 }
 
 async function startVideoStream(roomId) {
@@ -283,6 +344,8 @@ async function startVideoStream(roomId) {
         pc.ontrack = (event) => {
             console.log(`Video track received for room ${roomId}`, event.track.kind);
             if (event.track.kind === 'video') {
+                videoTracks[roomId] = event.track;
+
                 const videoEl = document.getElementById(`video-${roomId}`);
                 const iconEl = document.getElementById(`iconPlaceholder-${roomId}`);
                 const loadingIndicator = document.getElementById(`videoLoading-${roomId}`);
@@ -346,6 +409,7 @@ async function stopVideoStream(roomId) {
         delete videoConnections[roomId];
     }
     delete videoPendingCandidates[roomId];
+    delete videoTracks[roomId];
     onVideoDisconnected(roomId);
 }
 
@@ -362,25 +426,7 @@ function onVideoDisconnected(roomId) {
     if (loadingEl) loadingEl.style.display = 'none';
 }
 
-async function stopAllVideoStreams() {
-    for (const roomId of Object.keys(videoConnections).map(Number)) {
-        await stopVideoStream(roomId);
-    }
-}
-
 // ===== Audio Stream Management (per-room) =====
-async function manageAudioStreams(previousRooms) {
-    const audioRooms = currentRooms.filter(r => r.enableAudioStream && (r.cameraStreamUrl || r.nestDeviceId));
-    const audioRoomIds = new Set(audioRooms.map(r => r.id));
-
-    // Stop audio for rooms that were removed or had audio disabled
-    for (const roomId of Object.keys(audioConnections).map(Number)) {
-        if (!audioRoomIds.has(roomId)) {
-            await stopAudioStream(roomId);
-        }
-    }
-}
-
 async function startAudioStream(roomId) {
     try {
         const offerSdp = await connection.invoke("StartAudioStream", roomId);
@@ -398,12 +444,12 @@ async function startAudioStream(roomId) {
         const pc = new RTCPeerConnection(configuration);
         audioConnections[roomId] = pc;
 
-        // Create audio element for this room
+        // Create audio element for this room — unmuted by default (sound on)
         const audioEl = document.createElement('audio');
         audioEl.setAttribute('autoplay', 'true');
         audioEl.setAttribute('playsinline', 'true');
         audioEl.style.display = 'none';
-        audioEl.muted = !!mutedRooms[roomId];
+        audioEl.muted = false;
         document.body.appendChild(audioEl);
         audioElements[roomId] = audioEl;
 
@@ -444,7 +490,13 @@ async function startAudioStream(roomId) {
         pc.ontrack = (event) => {
             if (event.track.kind === 'audio' && audioEl) {
                 audioEl.srcObject = event.streams[0] || new MediaStream([event.track]);
-                audioEl.play().catch(e => console.error(`Error playing audio for room ${roomId}:`, e));
+                audioEl.play().catch(e => {
+                    // Autoplay policy may block unmuted playback — fall back to muted
+                    console.warn(`Autoplay blocked for room ${roomId}, falling back to muted:`, e.message);
+                    audioEl.muted = true;
+                    audioEl.play().catch(e2 => console.error(`Error playing audio for room ${roomId}:`, e2));
+                    updateMuteButton(roomId);
+                });
             }
         };
 
@@ -478,10 +530,6 @@ async function startAudioStream(roomId) {
             audioPendingCandidates[roomId] = [];
         }
 
-        updateDashboardState();
-        const room = currentRooms.find(r => r.id === roomId);
-        showMessage(`Listening to: ${room ? room.name : `Room ${roomId}`}`);
-
     } catch (error) {
         console.error(`Error starting audio stream for room ${roomId}:`, error);
         showMessage("Error starting audio stream", true);
@@ -508,7 +556,6 @@ async function stopAudioStream(roomId) {
         delete audioElements[roomId];
     }
 
-    delete mutedRooms[roomId];
     onAudioDisconnected(roomId);
 }
 
@@ -518,41 +565,36 @@ function onAudioDisconnected(roomId) {
     if (meter) meter.style.width = '0%';
     const dbLabel = document.getElementById(`dbLevel-${roomId}`);
     if (dbLabel) dbLabel.textContent = '--.- dB';
-
-    updateDashboardState();
 }
 
-async function stopAllAudioStreams() {
-    for (const roomId of Object.keys(audioConnections).map(Number)) {
-        await stopAudioStream(roomId);
-    }
-}
-
-// ===== Listen / Mute Toggles (per-room) =====
-async function toggleListen(roomId) {
-    if (audioConnections[roomId]) {
-        // Stop listening to this room
-        await stopAudioStream(roomId);
-        return;
-    }
-
-    // Start listening to this room
-    await startAudioStream(roomId);
-}
-
+// ===== Mute Toggle (per-room, surgical DOM update) =====
 function toggleMute(roomId) {
-    if (!audioConnections[roomId] || !audioElements[roomId]) return;
+    const audioEl = audioElements[roomId];
+    if (!audioEl) return;
 
-    mutedRooms[roomId] = !mutedRooms[roomId];
-    audioElements[roomId].muted = mutedRooms[roomId];
-    updateDashboardState();
+    audioEl.muted = !audioEl.muted;
+    updateMuteButton(roomId);
+}
+
+function updateMuteButton(roomId) {
+    const card = document.querySelector(`.dash-card[data-room-id="${roomId}"]`);
+    if (!card) return;
+
+    const audioEl = audioElements[roomId];
+    if (!audioEl) return;
+
+    const isMuted = audioEl.muted;
+    const muteBtn = card.querySelector('.btn-dash-mute');
+    if (muteBtn) {
+        muteBtn.className = `btn-dash-action btn-dash-mute ${isMuted ? 'muted' : ''}`;
+        muteBtn.innerHTML = `<i class="fas fa-${isMuted ? 'volume-mute' : 'volume-up'}"></i> ${isMuted ? 'Muted' : 'Sound On'}`;
+    }
 }
 
 // ===== Card Meter Updates =====
 function updateCardMeter(roomId, level) {
     const meter = document.getElementById(`meter-${roomId}`);
     const dbLabel = document.getElementById(`dbLevel-${roomId}`);
-    const badge = document.getElementById(`liveBadge-${roomId}`);
 
     const minDb = -90;
     const percentage = 100 - Math.max(0, Math.min(100, ((level - 0) / minDb) * 100));
@@ -563,10 +605,6 @@ function updateCardMeter(roomId, level) {
 
     if (dbLabel) {
         dbLabel.textContent = level.toFixed(1) + ' dB';
-    }
-
-    if (badge) {
-        badge.classList.add('visible');
     }
 }
 

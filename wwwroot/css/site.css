@@ -733,6 +733,156 @@ a:hover {
     overflow: hidden;
 }
 
+/* ===== Dashboard Card Header (shared by both states) ===== */
+.dash-card-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.dash-card-header-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background-color: rgba(255, 176, 136, 0.15);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.dash-card-header-icon i {
+    font-size: 0.95rem;
+    color: var(--accent-peach);
+}
+
+.dash-card-header-name {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.dash-card-header-badges {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+/* Status badges for cards */
+.status-badge.monitoring {
+    color: var(--accent-teal);
+}
+
+.status-badge.monitoring .status-dot {
+    background-color: var(--accent-teal);
+}
+
+.status-badge.inactive {
+    color: var(--text-muted);
+}
+
+.status-badge.inactive .status-dot {
+    background-color: var(--text-muted);
+}
+
+.status-badge.configured {
+    color: var(--accent-peach);
+}
+
+.status-badge.configured .status-dot {
+    background-color: var(--accent-peach);
+}
+
+.dash-card-live-badge {
+    background-color: var(--accent-pink);
+    color: #fff;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    display: inline-block;
+}
+
+/* ===== Inactive Card Body ===== */
+.dash-card-inactive-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 24px 32px;
+    text-align: center;
+}
+
+.dash-card-inactive-icon {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+    background-color: rgba(255, 176, 136, 0.08);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 16px;
+}
+
+.dash-card-inactive-icon i {
+    font-size: 1.5rem;
+    color: var(--accent-peach);
+    opacity: 0.4;
+}
+
+.dash-card-inactive-message {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-bottom: 24px;
+}
+
+.btn-start-monitoring {
+    background-color: var(--accent-peach);
+    color: #1a1a1a;
+    border: none;
+    padding: 12px 32px;
+    border-radius: 14px;
+    font-weight: 600;
+    font-size: 0.9rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s ease;
+    font-family: inherit;
+}
+
+.btn-start-monitoring:hover {
+    background-color: #ffc4a8;
+}
+
+.dash-card-inactive-links {
+    margin-top: 16px;
+    display: flex;
+    gap: 16px;
+}
+
+.dash-card-inactive-links a {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 500;
+    transition: color 0.15s ease;
+}
+
+.dash-card-inactive-links a:hover {
+    color: var(--text-primary);
+}
+
+/* ===== Monitoring Card Body ===== */
 .dash-card-preview {
     position: relative;
     aspect-ratio: 16 / 9;
@@ -758,51 +908,33 @@ a:hover {
     opacity: 0.5;
 }
 
-.dash-card-live-badge {
+.dash-card-preview .dash-card-live-badge {
     position: absolute;
     top: 12px;
     left: 12px;
-    background-color: var(--accent-pink);
-    color: #fff;
-    font-size: 0.65rem;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    padding: 4px 10px;
-    border-radius: 6px;
-    display: none;
 }
 
-.dash-card-live-badge.visible {
-    display: inline-block;
-}
-
-.dash-card-room-name {
-    position: absolute;
-    bottom: 16px;
-    left: 16px;
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-primary);
-    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+.dash-card-monitoring-info {
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
 }
 
 .dash-card-db-level {
-    position: absolute;
-    bottom: 16px;
-    right: 16px;
     font-size: 0.85rem;
     font-weight: 600;
     color: var(--accent-peach);
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
 .dash-card-meter-bar {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 4px;
+    flex: 1;
+    height: 6px;
     background-color: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    overflow: hidden;
 }
 
 .dash-card-meter-fill {
@@ -812,6 +944,7 @@ a:hover {
     width: 0%;
 }
 
+/* ===== Dashboard Card Actions ===== */
 .dash-card-actions {
     display: flex;
     gap: 0;
@@ -832,47 +965,31 @@ a:hover {
     font-family: inherit;
 }
 
-.btn-dash-listen {
+.btn-dash-mute {
     background-color: var(--accent-teal);
     color: #1a1a1a;
 }
 
-.btn-dash-listen:hover {
+.btn-dash-mute:hover {
     background-color: #9ce0d0;
 }
 
-.btn-dash-listen.active {
-    background-color: var(--accent-pink);
-    color: #fff;
+.btn-dash-mute.muted {
+    background-color: rgba(255, 176, 136, 0.15);
+    color: var(--accent-peach);
 }
 
-.btn-dash-listen.active:hover {
-    background-color: #ff9da5;
+.btn-dash-mute.muted:hover {
+    background-color: rgba(255, 176, 136, 0.25);
 }
 
-.btn-dash-audio {
-    background-color: var(--bg-input);
-    color: var(--text-secondary);
+.btn-dash-stop {
+    background-color: rgba(255, 139, 148, 0.15);
+    color: var(--accent-pink);
 }
 
-.btn-dash-audio:hover:not(:disabled) {
-    background-color: #333336;
-    color: var(--text-primary);
-}
-
-.btn-dash-audio:disabled {
-    opacity: 0.4;
-    cursor: default;
-}
-
-.btn-dash-configure {
-    background-color: var(--bg-input);
-    color: var(--text-secondary);
-}
-
-.btn-dash-configure:hover {
-    background-color: #333336;
-    color: var(--text-primary);
+.btn-dash-stop:hover {
+    background-color: rgba(255, 139, 148, 0.25);
 }
 
 .dash-card-video {
@@ -882,7 +999,6 @@ a:hover {
     width: 100%;
     height: 100%;
     object-fit: cover;
-    border-radius: 12px 12px 0 0;
     background: #000;
 }
 

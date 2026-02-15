@@ -30,15 +30,11 @@
                 <i class="fas fa-video"></i>
                 <span>Audio Monitors</span>
             </a>
-            <a href="#" class="sidebar-link">
-                <i class="fas fa-sliders-h"></i>
-                <span>Monitor Settings</span>
-            </a>
             <a asp-controller="Home" asp-action="System" class="sidebar-link @(currentPage.Contains("System") ? "active" : "")">
                 <i class="fas fa-cog"></i>
                 <span>System</span>
             </a>
-            <a href="#" class="sidebar-link">
+            <a asp-controller="Home" asp-action="About" class="sidebar-link @(currentPage.Contains("About") ? "active" : "")">
                 <i class="fas fa-info-circle"></i>
                 <span>About</span>
             </a>
