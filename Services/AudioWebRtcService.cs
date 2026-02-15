@@ -110,26 +110,56 @@ namespace BabyMonitarr.Backend.Services
             // Add to connections FIRST
             _peerConnections.TryAdd(key, pc);
 
-            // Create and add audio track with Opus
+            // Create and add audio track
+            bool isNestRoom = _audioStreamingService.IsNestRoom(roomId);
             try
             {
-                var audioEncoder = new AudioEncoder(includeOpus: true);
-                var audioSource = new AudioExtrasSource(audioEncoder, new AudioSourceOptions { AudioSource = AudioSourcesEnum.None });
-
-                var audioTrack = new MediaStreamTrack(audioSource.GetAudioSourceFormats(), MediaStreamStatusEnum.SendOnly);
-                pc.addTrack(audioTrack);
-
-                pc.OnAudioFormatsNegotiated += (audioFormats) =>
+                if (isNestRoom)
                 {
-                    var selectedFormat = audioFormats.First();
-                    _logger.LogInformation("Audio formats negotiated for {Key}: {Formats}. Selected: {Selected}",
-                        key, string.Join(", ", audioFormats.Select(f => f.FormatName)), selectedFormat.FormatName);
-                    audioSource.SetAudioSourceFormat(selectedFormat);
-                    _negotiatedFormats[key] = selectedFormat;
-                };
+                    // Nest passthrough: Opus-only track ensures browser negotiates Opus,
+                    // matching the raw Opus data we pass through from the Nest camera.
+                    var opusFormat = new AudioFormat(AudioCodecsEnum.OPUS, 111, 48000, 2,
+                        "minptime=10;useinbandfec=1");
+                    var audioTrack = new MediaStreamTrack(
+                        new List<AudioFormat> { opusFormat }, MediaStreamStatusEnum.SendOnly);
+                    pc.addTrack(audioTrack);
 
-                _audioSources.TryAdd(key, audioSource);
-                _audioEncoders.TryAdd(key, audioEncoder);
+                    pc.OnAudioFormatsNegotiated += (audioFormats) =>
+                    {
+                        var selectedFormat = audioFormats.First();
+                        _logger.LogInformation(
+                            "Audio formats negotiated for {Key}: {Formats}. Selected: {Selected}",
+                            key,
+                            string.Join(", ", audioFormats.Select(f => f.FormatName)),
+                            selectedFormat.FormatName);
+                        _negotiatedFormats[key] = selectedFormat;
+                    };
+                }
+                else
+                {
+                    // RTSP: multi-codec encoder
+                    var audioEncoder = new AudioEncoder(includeOpus: true);
+                    var audioSource = new AudioExtrasSource(audioEncoder,
+                        new AudioSourceOptions { AudioSource = AudioSourcesEnum.None });
+                    var audioTrack = new MediaStreamTrack(
+                        audioSource.GetAudioSourceFormats(), MediaStreamStatusEnum.SendOnly);
+                    pc.addTrack(audioTrack);
+
+                    pc.OnAudioFormatsNegotiated += (audioFormats) =>
+                    {
+                        var selectedFormat = audioFormats.First();
+                        _logger.LogInformation(
+                            "Audio formats negotiated for {Key}: {Formats}. Selected: {Selected}",
+                            key,
+                            string.Join(", ", audioFormats.Select(f => f.FormatName)),
+                            selectedFormat.FormatName);
+                        audioSource.SetAudioSourceFormat(selectedFormat);
+                        _negotiatedFormats[key] = selectedFormat;
+                    };
+
+                    _audioSources.TryAdd(key, audioSource);
+                    _audioEncoders.TryAdd(key, audioEncoder);
+                }
             }
             catch (Exception ex)
             {
@@ -157,7 +187,16 @@ namespace BabyMonitarr.Backend.Services
             // Subscribe to audio frames for this room
             Action<AudioFrameEventArgs> frameHandler = (args) =>
             {
-                SendAudioDataToPeer(key, args.AudioData, args.SampleRate);
+                if (args.RawOpusData != null)
+                {
+                    // Nest passthrough: send raw Opus directly
+                    SendRawAudioToPeer(key, args.RawOpusData, args.DurationRtpUnits);
+                }
+                else
+                {
+                    // RTSP: encode PCM to Opus
+                    SendAudioDataToPeer(key, args.AudioData, args.SampleRate);
+                }
                 SendAudioLevelToPeer(key, args.AudioLevel, args.Timestamp);
             };
             _frameHandlers.TryAdd(key, frameHandler);
@@ -312,6 +351,30 @@ namespace BabyMonitarr.Backend.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error creating audio data channel for {Key}", key);
+            }
+        }
+
+        private void SendRawAudioToPeer(string key, byte[] rawOpusData, uint durationRtpUnits)
+        {
+            if (!_peerConnections.TryGetValue(key, out var pc)) return;
+            if (pc.connectionState != RTCPeerConnectionState.connected) return;
+
+            if (_negotiatedFormats.TryGetValue(key, out var fmt) &&
+                fmt.Codec != AudioCodecsEnum.OPUS)
+            {
+                _logger.LogWarning(
+                    "Nest audio passthrough for {Key} requires Opus but negotiated {Format}; dropping frame",
+                    key, fmt.FormatName);
+                return;
+            }
+
+            try
+            {
+                pc.SendAudio(durationRtpUnits, rawOpusData);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug("Error sending raw audio to peer {Key}: {Error}", key, ex.Message);
             }
         }
 

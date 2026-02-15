@@ -13,6 +13,7 @@ namespace BabyMonitarr.Backend.Services
         void SubscribeToRoom(int roomId, Action<VideoFrameEventArgs> handler);
         void UnsubscribeFromRoom(int roomId, Action<VideoFrameEventArgs> handler);
         void RefreshRooms();
+        bool IsNestRoom(int roomId);
     }
 
     public class VideoStreamingService : IVideoStreamingService, IHostedService, IDisposable
@@ -253,6 +254,9 @@ namespace BabyMonitarr.Backend.Services
                 _logger.LogInformation("Stopped video reader for room {RoomId}", roomId);
             }
         }
+
+        public bool IsNestRoom(int roomId) =>
+            _roomCache.TryGetValue(roomId, out var room) && room.StreamSourceType == "google_nest";
 
         private void OnVideoFrameReceived(object? sender, VideoFrameEventArgs e)
         {

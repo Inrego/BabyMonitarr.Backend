@@ -41,6 +41,16 @@ public class RoomService : IRoomService
     public async Task<Room> CreateRoomAsync(Room room)
     {
         room.CreatedAt = DateTime.UtcNow;
+
+        // If the name already exists, append a number to make it unique
+        var baseName = room.Name;
+        var suffix = 2;
+        while (await _db.Rooms.AnyAsync(r => r.Name == room.Name))
+        {
+            room.Name = $"{baseName} {suffix}";
+            suffix++;
+        }
+
         _db.Rooms.Add(room);
         await _db.SaveChangesAsync();
         return room;

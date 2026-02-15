@@ -13,6 +13,8 @@ public class AudioSampleEventArgs : EventArgs
     public double AudioLevel { get; set; }
     public int SampleRate { get; set; }
     public DateTime Timestamp { get; set; }
+    public byte[]? RawOpusData { get; set; }
+    public uint DurationRtpUnits { get; set; }
 }
 
 public class SoundThresholdEventArgs : EventArgs
@@ -84,7 +86,7 @@ public class AudioProcessingService : IDisposable
             }
 
             float[] samples = ConvertBytesToSamples(e.AudioData, e.AudioData.Length, e.BytesPerSample, e.SampleFormat);
-            ProcessAudioSamples(samples, e.SampleRate);
+            ProcessAudioSamples(samples, e.SampleRate, e.RawOpusData, e.DurationRtpUnits);
         }
         catch (Exception ex)
         {
@@ -92,9 +94,10 @@ public class AudioProcessingService : IDisposable
         }
     }
 
-    private void ProcessAudioSamples(float[] samples, int sampleRate)
+    private void ProcessAudioSamples(float[] samples, int sampleRate, byte[]? rawOpusData = null, uint durationRtpUnits = 0)
     {
-        if (_settings.FilterEnabled && _lowPassFilter != null && _highPassFilter != null)
+        // Only apply filters for non-passthrough (RTSP) streams
+        if (rawOpusData == null && _settings.FilterEnabled && _lowPassFilter != null && _highPassFilter != null)
         {
             for (int i = 0; i < samples.Length; i++)
             {
@@ -140,13 +143,22 @@ public class AudioProcessingService : IDisposable
             });
         }
 
-        // Convert float samples to int16 PCM bytes
-        byte[] pcmBytes = new byte[samples.Length * 2];
-        for (int i = 0; i < samples.Length; i++)
+        // For passthrough (Nest), skip PCM conversion - raw Opus will be sent directly
+        byte[] pcmBytes;
+        if (rawOpusData != null)
         {
-            short pcmSample = (short)(Math.Clamp(samples[i], -1.0f, 1.0f) * 32767);
-            pcmBytes[i * 2] = (byte)(pcmSample & 0xFF);
-            pcmBytes[i * 2 + 1] = (byte)((pcmSample >> 8) & 0xFF);
+            pcmBytes = Array.Empty<byte>();
+        }
+        else
+        {
+            // Convert float samples to int16 PCM bytes for RTSP path
+            pcmBytes = new byte[samples.Length * 2];
+            for (int i = 0; i < samples.Length; i++)
+            {
+                short pcmSample = (short)(Math.Clamp(samples[i], -1.0f, 1.0f) * 32767);
+                pcmBytes[i * 2] = (byte)(pcmSample & 0xFF);
+                pcmBytes[i * 2 + 1] = (byte)((pcmSample >> 8) & 0xFF);
+            }
         }
 
         AudioSampleProcessed?.Invoke(this, new AudioSampleEventArgs
@@ -154,7 +166,9 @@ public class AudioProcessingService : IDisposable
             AudioData = pcmBytes,
             AudioLevel = averageLevel,
             SampleRate = sampleRate,
-            Timestamp = now
+            Timestamp = now,
+            RawOpusData = rawOpusData,
+            DurationRtpUnits = durationRtpUnits
         });
     }
 

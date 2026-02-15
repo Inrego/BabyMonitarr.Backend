@@ -17,6 +17,8 @@ namespace BabyMonitarr.Backend.Services
         public int Channels { get; set; }
         public bool IsPlanar { get; set; }
         public AVSampleFormat SampleFormat { get; set; }
+        public byte[]? RawOpusData { get; set; }
+        public uint DurationRtpUnits { get; set; }
     }
 
     internal class RtspAudioReader : IDisposable

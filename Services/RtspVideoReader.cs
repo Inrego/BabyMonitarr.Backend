@@ -13,6 +13,8 @@ namespace BabyMonitarr.Backend.Services
         public int Width { get; set; }
         public int Height { get; set; }
         public long TimestampMs { get; set; }
+        public byte[]? RawH264Data { get; set; }
+        public uint DurationRtpUnits { get; set; }
     }
 
     internal class RtspVideoReader : IDisposable

@@ -1,15 +1,12 @@
 using System;
 using System.Linq;
 using System.Net;
-using System.Runtime.InteropServices;
-using System.Reflection;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using BabyMonitarr.Backend.Models;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
 using SIPSorceryMedia.Abstractions;
-using SIPSorceryMedia.Encoders;
 using FFmpeg.AutoGen;
 
 namespace BabyMonitarr.Backend.Services;
@@ -30,9 +27,6 @@ public class NestStreamReader : IDisposable
     private const int MaxRetryAttempts = 3;
     private const int RetryDelayMs = 5000;
     private const int StreamExtensionIntervalMs = 4 * 60 * 1000; // 4 minutes
-    private const int TargetFps = 10;
-    private const int MaxWidth = 640;
-    private const int MaxHeight = 480;
 
     // H264 depacketization state
     private readonly List<byte[]> _h264NalBuffer = new();
@@ -40,22 +34,14 @@ public class NestStreamReader : IDisposable
     // Diagnostic counters
     private long _rtpVideoPacketCount;
     private long _rtpAudioPacketCount;
-    private long _decodedFrameCount;
+    private long _emittedFrameCount;
 
-    // Frame rate limiting
-    private DateTime _lastVideoFrameTime = DateTime.MinValue;
-    private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(1000.0 / TargetFps);
+    // RTP timestamp tracking for video duration calculation
+    private uint _lastVideoRtpTimestamp;
+    private bool _hasLastVideoRtpTimestamp;
 
-    // Opus audio decoder
+    // Opus audio decoder (for dB measurement only)
     private AudioEncoder? _opusDecoder;
-
-    // FFmpeg H264 decoder
-    private unsafe AVCodecContext* _videoCodecContext;
-    private unsafe SwsContext* _swsContext;
-    private bool _videoDecoderInitialized;
-    private int _decodedWidth;
-    private int _decodedHeight;
-    private readonly object _videoDecoderLock = new();
 
     public event EventHandler<AudioFormatEventArgs>? AudioDataReceived;
     public event EventHandler<VideoFrameEventArgs>? VideoFrameReceived;
@@ -72,31 +58,6 @@ public class NestStreamReader : IDisposable
         _nestDeviceId = nestDeviceId;
         _scopeFactory = scopeFactory;
         _logger = logger;
-
-        InitializeFFmpeg();
-    }
-
-    private void InitializeFFmpeg()
-    {
-        try
-        {
-            string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-            string ffmpegPath = Path.Combine(appPath, "FFmpeg");
-
-            if (!Directory.Exists(ffmpegPath))
-            {
-                throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
-            }
-
-            ffmpeg.RootPath = ffmpegPath;
-            DynamicallyLoadedBindings.Initialize();
-            ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to initialize FFmpeg for Nest stream reader (room {RoomId})", _roomId);
-            throw;
-        }
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -580,12 +541,15 @@ public class NestStreamReader : IDisposable
 
     private void ProcessAudioRtp(RTPPacket rtpPacket)
     {
-        // Opus RTP payload is the raw Opus frame
-        // Decode Opus to PCM using SIPSorcery's AudioEncoder
         try
         {
             _opusDecoder ??= new AudioEncoder(includeOpus: true);
 
+            // Keep the raw Opus payload for passthrough
+            var rawOpusData = new byte[rtpPacket.Payload.Length];
+            Buffer.BlockCopy(rtpPacket.Payload, 0, rawOpusData, 0, rtpPacket.Payload.Length);
+
+            // Decode Opus to PCM for dB level measurement
             var pcmSamples = _opusDecoder.DecodeAudio(rtpPacket.Payload,
                 new AudioFormat(AudioCodecsEnum.OPUS, 111, 48000, 2, "minptime=10;useinbandfec=1"));
 
@@ -595,14 +559,19 @@ public class NestStreamReader : IDisposable
                 var audioData = new byte[pcmSamples.Length * 2];
                 Buffer.BlockCopy(pcmSamples, 0, audioData, 0, audioData.Length);
 
+                // Opus RTP clock = 48kHz. For stereo, pcmSamples has 2 samples per clock tick.
+                uint durationRtpUnits = (uint)(pcmSamples.Length / 2);
+
                 AudioDataReceived?.Invoke(this, new AudioFormatEventArgs
                 {
                     AudioData = audioData,
                     BytesPerSample = 2,
                     SampleRate = 48000,
-                    Channels = 1,
+                    Channels = 2,
                     IsPlanar = false,
-                    SampleFormat = AVSampleFormat.AV_SAMPLE_FMT_S16
+                    SampleFormat = AVSampleFormat.AV_SAMPLE_FMT_S16,
+                    RawOpusData = rawOpusData,
+                    DurationRtpUnits = durationRtpUnits
                 });
             }
         }
@@ -675,21 +644,27 @@ public class NestStreamReader : IDisposable
         // If RTP marker bit is set, this is the last packet of the frame
         if (rtpPacket.Header.MarkerBit == 1 && _h264NalBuffer.Count > 0)
         {
-            // Frame rate limiting
-            var now = DateTime.UtcNow;
-            if (now - _lastVideoFrameTime < _minFrameInterval)
+            // Compute duration from RTP timestamps (90kHz clock)
+            uint currentTimestamp = rtpPacket.Header.Timestamp;
+            uint durationRtpUnits;
+            if (_hasLastVideoRtpTimestamp)
             {
-                _h264NalBuffer.Clear();
-                return;
+                durationRtpUnits = currentTimestamp - _lastVideoRtpTimestamp;
             }
-            _lastVideoFrameTime = now;
+            else
+            {
+                // Default to 30fps for first frame (3000 units at 90kHz)
+                durationRtpUnits = 3000;
+            }
+            _lastVideoRtpTimestamp = currentTimestamp;
+            _hasLastVideoRtpTimestamp = true;
 
-            DecodeH264Frame();
+            EmitRawH264Frame(durationRtpUnits);
             _h264NalBuffer.Clear();
         }
     }
 
-    private void DecodeH264Frame()
+    private void EmitRawH264Frame(uint durationRtpUnits)
     {
         // Build an Annex B byte stream from NAL units
         int totalSize = 0;
@@ -711,179 +686,19 @@ public class NestStreamReader : IDisposable
             offset += nal.Length;
         }
 
-        lock (_videoDecoderLock)
-        {
-            unsafe
-            {
-                DecodeH264FrameUnsafe(annexB);
-            }
-        }
-    }
-
-    private unsafe void DecodeH264FrameUnsafe(byte[] annexBData)
-    {
-        // Initialize decoder if needed
-        if (!_videoDecoderInitialized)
-        {
-            AVCodec* codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_H264);
-            if (codec == null)
-            {
-                _logger.LogError("H264 decoder not found");
-                return;
-            }
-
-            _videoCodecContext = ffmpeg.avcodec_alloc_context3(codec);
-            _videoCodecContext->err_recognition = 0;
-            _videoCodecContext->flags2 |= ffmpeg.AV_CODEC_FLAG2_FAST;
-
-            int ret = ffmpeg.avcodec_open2(_videoCodecContext, codec, null);
-            if (ret < 0)
-            {
-                _logger.LogError("Failed to open H264 decoder for room {RoomId}", _roomId);
-                return;
-            }
-
-            _videoDecoderInitialized = true;
-            _logger.LogInformation("H264 decoder initialized for Nest stream room {RoomId}", _roomId);
-        }
-
-        // Send data to decoder
-        AVPacket* packet = ffmpeg.av_packet_alloc();
-        AVFrame* frame = ffmpeg.av_frame_alloc();
-
-        try
-        {
-            fixed (byte* pData = annexBData)
-            {
-                packet->data = pData;
-                packet->size = annexBData.Length;
-
-                int ret = ffmpeg.avcodec_send_packet(_videoCodecContext, packet);
-                if (ret < 0) return;
-
-                while (true)
-                {
-                    ret = ffmpeg.avcodec_receive_frame(_videoCodecContext, frame);
-                    if (ret < 0) break;
-
-                    // Initialize scaler on first decoded frame
-                    if (_swsContext == null || _decodedWidth != frame->width || _decodedHeight != frame->height)
-                    {
-                        if (_swsContext != null)
-                        {
-                            ffmpeg.sws_freeContext(_swsContext);
-                        }
-
-                        _decodedWidth = frame->width;
-                        _decodedHeight = frame->height;
-
-                        CalculateScaledDimensions(_decodedWidth, _decodedHeight, out int dstW, out int dstH);
-
-                        _swsContext = ffmpeg.sws_getContext(
-                            _decodedWidth, _decodedHeight, _videoCodecContext->pix_fmt,
-                            dstW, dstH, AVPixelFormat.AV_PIX_FMT_YUV420P,
-                            (int)SwsFlags.SWS_BILINEAR, null, null, null);
-                    }
-
-                    EmitI420Frame(frame);
-                    ffmpeg.av_frame_unref(frame);
-                }
-            }
-        }
-        finally
-        {
-            ffmpeg.av_frame_free(&frame);
-            ffmpeg.av_packet_free(&packet);
-        }
-    }
-
-    private unsafe void EmitI420Frame(AVFrame* frame)
-    {
-        if (_swsContext == null) return;
-
-        CalculateScaledDimensions(frame->width, frame->height, out int dstWidth, out int dstHeight);
-
-        // Allocate output frame
-        AVFrame* i420Frame = ffmpeg.av_frame_alloc();
-        i420Frame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
-        i420Frame->width = dstWidth;
-        i420Frame->height = dstHeight;
-        int ret = ffmpeg.av_frame_get_buffer(i420Frame, 32);
-        if (ret < 0)
-        {
-            ffmpeg.av_frame_free(&i420Frame);
-            return;
-        }
-
-        // Scale/convert
-        ffmpeg.sws_scale(_swsContext,
-            frame->data, frame->linesize, 0, frame->height,
-            i420Frame->data, i420Frame->linesize);
-
-        // Copy I420 data to managed byte array
-        int ySize = dstWidth * dstHeight;
-        int uvSize = (dstWidth / 2) * (dstHeight / 2);
-        int totalSize = ySize + uvSize * 2;
-
-        byte[] i420Data = new byte[totalSize];
-        int offset = 0;
-
-        // Y plane
-        for (int row = 0; row < dstHeight; row++)
-        {
-            Marshal.Copy((IntPtr)(i420Frame->data[0] + row * i420Frame->linesize[0]),
-                i420Data, offset, dstWidth);
-            offset += dstWidth;
-        }
-
-        // U plane
-        int uvWidth = dstWidth / 2;
-        int uvHeight = dstHeight / 2;
-        for (int row = 0; row < uvHeight; row++)
-        {
-            Marshal.Copy((IntPtr)(i420Frame->data[1] + row * i420Frame->linesize[1]),
-                i420Data, offset, uvWidth);
-            offset += uvWidth;
-        }
-
-        // V plane
-        for (int row = 0; row < uvHeight; row++)
-        {
-            Marshal.Copy((IntPtr)(i420Frame->data[2] + row * i420Frame->linesize[2]),
-                i420Data, offset, uvWidth);
-            offset += uvWidth;
-        }
-
-        ffmpeg.av_frame_free(&i420Frame);
-
-        var frameCount = Interlocked.Increment(ref _decodedFrameCount);
+        var frameCount = Interlocked.Increment(ref _emittedFrameCount);
         if (frameCount == 1)
-            _logger.LogInformation("First decoded video frame emitted for Nest room {RoomId} ({Width}x{Height})",
-                _roomId, dstWidth, dstHeight);
+            _logger.LogInformation("First raw H.264 frame emitted for Nest room {RoomId} ({Size} bytes)",
+                _roomId, annexB.Length);
         else if (frameCount % 100 == 0)
-            _logger.LogDebug("Nest decoded video frames for room {RoomId}: {Count}", _roomId, frameCount);
+            _logger.LogDebug("Nest raw H.264 frames emitted for room {RoomId}: {Count}", _roomId, frameCount);
 
         VideoFrameReceived?.Invoke(this, new VideoFrameEventArgs
         {
-            I420Data = i420Data,
-            Width = dstWidth,
-            Height = dstHeight,
+            RawH264Data = annexB,
+            DurationRtpUnits = durationRtpUnits,
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
-    }
-
-    private static void CalculateScaledDimensions(int srcWidth, int srcHeight, out int dstWidth, out int dstHeight)
-    {
-        if (srcWidth <= MaxWidth && srcHeight <= MaxHeight)
-        {
-            dstWidth = srcWidth & ~1;
-            dstHeight = srcHeight & ~1;
-            return;
-        }
-
-        double scale = Math.Min((double)MaxWidth / srcWidth, (double)MaxHeight / srcHeight);
-        dstWidth = ((int)(srcWidth * scale)) & ~1;
-        dstHeight = ((int)(srcHeight * scale)) & ~1;
     }
 
     public void Stop()
@@ -923,22 +738,6 @@ public class NestStreamReader : IDisposable
             {
                 Stop();
                 _extensionTimer?.Dispose();
-
-                unsafe
-                {
-                    if (_swsContext != null)
-                    {
-                        ffmpeg.sws_freeContext(_swsContext);
-                        _swsContext = null;
-                    }
-
-                    if (_videoCodecContext != null)
-                    {
-                        var ctx = _videoCodecContext;
-                        ffmpeg.avcodec_free_context(&ctx);
-                        _videoCodecContext = null;
-                    }
-                }
             }
             _isDisposed = true;
         }

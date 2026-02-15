@@ -29,6 +29,9 @@ namespace BabyMonitarr.Backend.Services
         private readonly ConcurrentDictionary<string, VpxVideoEncoder> _videoEncoders = new();
         private readonly ConcurrentDictionary<string, List<RTCIceCandidateInit>> _pendingIceCandidates = new();
 
+        // Track which connections use H.264 passthrough (Nest) vs VP8 encoding (RTSP)
+        private readonly ConcurrentDictionary<string, bool> _isPassthrough = new();
+
         // Track which rooms each peer is subscribed to, and the handler reference for unsubscription
         private readonly ConcurrentDictionary<string, Action<VideoFrameEventArgs>> _frameHandlers = new();
 
@@ -95,17 +98,34 @@ namespace BabyMonitarr.Backend.Services
                 }
             };
 
-            // Add video track with VP8
-            var videoEncoder = new VpxVideoEncoder();
-            var videoFormats = new List<VideoFormat>
+            // Determine codec based on room type
+            bool isNest = _videoStreamingService.IsNestRoom(roomId);
+            _isPassthrough.TryAdd(key, isNest);
+
+            if (isNest)
             {
-                new VideoFormat(VideoCodecsEnum.VP8, VpxVideoEncoder.VP8_FORMATID)
-            };
-            var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.SendOnly);
-            pc.addTrack(videoTrack);
+                // H.264 passthrough for Nest rooms - no encoder needed
+                var videoFormats = new List<VideoFormat>
+                {
+                    new VideoFormat(VideoCodecsEnum.H264, 96, 90000, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
+                };
+                var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.SendOnly);
+                pc.addTrack(videoTrack);
+            }
+            else
+            {
+                // VP8 encoding for RTSP rooms
+                var videoEncoder = new VpxVideoEncoder();
+                var videoFormats = new List<VideoFormat>
+                {
+                    new VideoFormat(VideoCodecsEnum.VP8, VpxVideoEncoder.VP8_FORMATID)
+                };
+                var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.SendOnly);
+                pc.addTrack(videoTrack);
+                _videoEncoders.TryAdd(key, videoEncoder);
+            }
 
             _peerConnections.TryAdd(key, pc);
-            _videoEncoders.TryAdd(key, videoEncoder);
 
             // Create SDP offer
             var offerInit = pc.createOffer(null);
@@ -122,7 +142,7 @@ namespace BabyMonitarr.Backend.Services
             // Subscribe to video frames for this room
             Action<VideoFrameEventArgs> frameHandler = (args) =>
             {
-                SendVideoFrameToPeer(key, args.I420Data, args.Width, args.Height, args.TimestampMs);
+                SendVideoFrameToPeer(key, args);
             };
             _frameHandlers.TryAdd(key, frameHandler);
             _videoStreamingService.SubscribeToRoom(roomId, frameHandler);
@@ -220,6 +240,7 @@ namespace BabyMonitarr.Backend.Services
 
             _pendingIceCandidates.TryRemove(key, out _);
             _videoEncoders.TryRemove(key, out _);
+            _isPassthrough.TryRemove(key, out _);
 
             if (_peerConnections.TryRemove(key, out var pc))
             {
@@ -234,24 +255,29 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
-        private void SendVideoFrameToPeer(string key, byte[] i420Data, int width, int height, long timestampMs)
+        private void SendVideoFrameToPeer(string key, VideoFrameEventArgs args)
         {
             if (!_peerConnections.TryGetValue(key, out var pc)) return;
             if (pc.connectionState != RTCPeerConnectionState.connected) return;
-            if (!_videoEncoders.TryGetValue(key, out var encoder)) return;
 
             try
             {
-                // Encode I420 to VP8
-                byte[] encodedFrame = encoder.EncodeVideo(width, height, i420Data,
-                    VideoPixelFormatsEnum.I420, VideoCodecsEnum.VP8);
-
-                if (encodedFrame != null && encodedFrame.Length > 0)
+                if (args.RawH264Data != null)
                 {
-                    // Calculate duration in RTP timestamp units (90kHz clock for video)
-                    uint durationRtpUnits = (uint)(90000 / 10); // 10 fps -> 9000 units per frame
+                    // H.264 passthrough (Nest) - send raw Annex B data directly
+                    pc.SendVideo(args.DurationRtpUnits, args.RawH264Data);
+                }
+                else if (_videoEncoders.TryGetValue(key, out var encoder))
+                {
+                    // VP8 encoding (RTSP) - encode I420 to VP8
+                    byte[] encodedFrame = encoder.EncodeVideo(args.Width, args.Height, args.I420Data,
+                        VideoPixelFormatsEnum.I420, VideoCodecsEnum.VP8);
 
-                    pc.SendVideo(durationRtpUnits, encodedFrame);
+                    if (encodedFrame != null && encodedFrame.Length > 0)
+                    {
+                        uint durationRtpUnits = (uint)(90000 / 10); // 10 fps -> 9000 units per frame
+                        pc.SendVideo(durationRtpUnits, encodedFrame);
+                    }
                 }
             }
             catch (Exception ex)
@@ -274,6 +300,7 @@ namespace BabyMonitarr.Backend.Services
 
             _peerConnections.Clear();
             _videoEncoders.Clear();
+            _isPassthrough.Clear();
             _frameHandlers.Clear();
             _pendingIceCandidates.Clear();
         }

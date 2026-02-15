@@ -13,6 +13,8 @@ namespace BabyMonitarr.Backend.Services
         public int SampleRate { get; set; }
         public int RoomId { get; set; }
         public DateTime Timestamp { get; set; }
+        public byte[]? RawOpusData { get; set; }
+        public uint DurationRtpUnits { get; set; }
     }
 
     public interface IAudioStreamingService
@@ -22,6 +24,7 @@ namespace BabyMonitarr.Backend.Services
         void SubscribeToRoom(int roomId, Action<AudioFrameEventArgs> handler);
         void UnsubscribeFromRoom(int roomId, Action<AudioFrameEventArgs> handler);
         void RefreshRooms();
+        bool IsNestRoom(int roomId);
         event EventHandler<SoundThresholdEventArgs> SoundThresholdExceeded;
     }
 
@@ -323,6 +326,9 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
+        public bool IsNestRoom(int roomId) =>
+            _roomCache.TryGetValue(roomId, out var room) && room.StreamSourceType == "google_nest";
+
         private void OnAudioSampleProcessed(object? sender, AudioSampleEventArgs e)
         {
             if (sender is not AudioProcessingService processor) return;
@@ -336,7 +342,9 @@ namespace BabyMonitarr.Backend.Services
                     AudioLevel = e.AudioLevel,
                     SampleRate = e.SampleRate,
                     RoomId = roomId,
-                    Timestamp = e.Timestamp
+                    Timestamp = e.Timestamp,
+                    RawOpusData = e.RawOpusData,
+                    DurationRtpUnits = e.DurationRtpUnits
                 };
 
                 foreach (var handler in handlers)
