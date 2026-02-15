@@ -1,9 +1,21 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using BabyMonitarr.Backend.Models;
 
 namespace BabyMonitarr.Backend.Services;
+
+public class RateLimitException : Exception
+{
+    public int RetryAfterSeconds { get; }
+
+    public RateLimitException(int retryAfterSeconds, string message)
+        : base(message)
+    {
+        RetryAfterSeconds = retryAfterSeconds;
+    }
+}
 
 public interface IGoogleNestDeviceService
 {
@@ -53,6 +65,27 @@ public class GoogleNestDeviceService : IGoogleNestDeviceService
             throw new InvalidOperationException("Google Nest Project ID is not configured.");
         }
         return settings.ProjectId;
+    }
+
+    private void ThrowIfRateLimited(HttpResponseMessage response, string operation)
+    {
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            int retryAfterSeconds = 60; // Default backoff
+            if (response.Headers.RetryAfter?.Delta is TimeSpan delta)
+            {
+                retryAfterSeconds = Math.Max((int)delta.TotalSeconds, 30);
+            }
+            else if (response.Headers.RetryAfter?.Date is DateTimeOffset date)
+            {
+                retryAfterSeconds = Math.Max((int)(date - DateTimeOffset.UtcNow).TotalSeconds, 30);
+            }
+
+            _logger.LogWarning("Rate limited by Nest SDM API during {Operation}, retry after {Seconds}s",
+                operation, retryAfterSeconds);
+            throw new RateLimitException(retryAfterSeconds,
+                $"Rate limited during {operation}. Retry after {retryAfterSeconds}s.");
+        }
     }
 
     public async Task<List<NestDevice>> ListDevicesAsync()
@@ -189,6 +222,7 @@ public class GoogleNestDeviceService : IGoogleNestDeviceService
 
         if (!response.IsSuccessStatusCode)
         {
+            ThrowIfRateLimited(response, "GenerateWebRtcStream");
             _logger.LogError("Failed to generate WebRTC stream for {DeviceId}: {StatusCode} {Response}",
                 deviceId, response.StatusCode, content);
             throw new Exception($"Failed to generate WebRTC stream: {response.StatusCode}");
@@ -225,6 +259,7 @@ public class GoogleNestDeviceService : IGoogleNestDeviceService
 
         if (!response.IsSuccessStatusCode)
         {
+            ThrowIfRateLimited(response, "ExtendWebRtcStream");
             _logger.LogError("Failed to extend WebRTC stream for {DeviceId}: {StatusCode} {Response}",
                 deviceId, response.StatusCode, content);
             throw new Exception($"Failed to extend WebRTC stream: {response.StatusCode}");
@@ -262,6 +297,12 @@ public class GoogleNestDeviceService : IGoogleNestDeviceService
 
             if (!response.IsSuccessStatusCode)
             {
+                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                {
+                    _logger.LogWarning("Rate limited stopping WebRTC stream for {DeviceId}, stream will expire naturally", deviceId);
+                    return; // Stream will expire on its own
+                }
+
                 var content = await response.Content.ReadAsStringAsync();
                 _logger.LogWarning("Failed to stop WebRTC stream for {DeviceId}: {StatusCode} {Response}",
                     deviceId, response.StatusCode, content);

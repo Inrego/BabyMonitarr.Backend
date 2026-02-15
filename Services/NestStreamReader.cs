@@ -25,8 +25,16 @@ public class NestStreamReader : IDisposable
     private Timer? _extensionTimer;
 
     private const int MaxRetryAttempts = 3;
-    private const int RetryDelayMs = 5000;
+    private const int InitialRetryDelayMs = 5000;
     private const int StreamExtensionIntervalMs = 4 * 60 * 1000; // 4 minutes
+    private const int MinStableConnectionMs = 60_000; // 1 minute - connection must last this long to reset retry count
+    private const int MaxConsecutiveExtendFailures = 3;
+
+    // Extension failure tracking
+    private int _consecutiveExtendFailures;
+
+    // Connection timing
+    private long _connectionStartTicks;
 
     // H264 depacketization state
     private readonly List<byte[]> _h264NalBuffer = new();
@@ -86,26 +94,52 @@ public class NestStreamReader : IDisposable
             {
                 if (retryCount > 0)
                 {
-                    _logger.LogInformation("Retrying Nest WebRTC connection for room {RoomId} (attempt {Attempt} of {Max})",
-                        _roomId, retryCount + 1, MaxRetryAttempts);
-                    await Task.Delay(RetryDelayMs, cancellationToken);
+                    int delayMs = InitialRetryDelayMs * (int)Math.Pow(3, retryCount - 1); // 5s, 15s, 45s
+                    _logger.LogInformation("Retrying Nest WebRTC connection for room {RoomId} in {DelayMs}ms (attempt {Attempt} of {Max})",
+                        _roomId, delayMs, retryCount + 1, MaxRetryAttempts);
+                    await Task.Delay(delayMs, cancellationToken);
                 }
 
+                _connectionStartTicks = Environment.TickCount64;
                 await ConnectWebRtc(cancellationToken);
 
-                // If we reach here, the connection was established and then ended normally
-                // Reset retry count for the next reconnection cycle
-                retryCount = 0;
+                // Connection ended normally — only reset retries if it was stable
+                var connectionDurationMs = Environment.TickCount64 - _connectionStartTicks;
+                if (connectionDurationMs >= MinStableConnectionMs)
+                {
+                    retryCount = 0;
+                }
+                else
+                {
+                    retryCount++;
+                    _logger.LogWarning("Nest WebRTC connection for room {RoomId} lasted only {DurationMs}ms, counting as failed attempt {Attempt}",
+                        _roomId, connectionDurationMs, retryCount);
+                }
 
                 if (!cancellationToken.IsCancellationRequested)
                 {
                     _logger.LogInformation("Nest WebRTC stream ended for room {RoomId}, will reconnect", _roomId);
-                    await Task.Delay(RetryDelayMs, cancellationToken);
+                    await Task.Delay(InitialRetryDelayMs, cancellationToken);
                 }
             }
             catch (OperationCanceledException)
             {
                 break;
+            }
+            catch (RateLimitException ex)
+            {
+                retryCount++;
+                var delayMs = ex.RetryAfterSeconds * 1000;
+                _logger.LogWarning("Rate limited connecting Nest stream for room {RoomId}, waiting {Seconds}s (attempt {Attempt} of {Max})",
+                    _roomId, ex.RetryAfterSeconds, retryCount, MaxRetryAttempts);
+
+                if (retryCount >= MaxRetryAttempts)
+                {
+                    _logger.LogError("Max retry attempts reached for Nest stream room {RoomId} (rate limited)", _roomId);
+                    break;
+                }
+
+                await Task.Delay(delayMs, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -286,6 +320,8 @@ public class NestStreamReader : IDisposable
         _logger.LogInformation("Nest WebRTC connection established for room {RoomId}, media session: {SessionId}",
             _roomId, _mediaSessionId);
 
+        _consecutiveExtendFailures = 0;
+
         // Start extension timer to keep stream alive (every 4 minutes)
         _extensionTimer = new Timer(
             async _ => await ExtendStream(),
@@ -323,13 +359,39 @@ public class NestStreamReader : IDisposable
             var deviceService = scope.ServiceProvider.GetRequiredService<IGoogleNestDeviceService>();
             var streamInfo = await deviceService.ExtendWebRtcStreamAsync(_nestDeviceId, _mediaSessionId);
             _mediaSessionId = streamInfo.MediaSessionId;
+            _consecutiveExtendFailures = 0;
             _logger.LogDebug("Extended Nest stream for room {RoomId}, new expiry: {Expiry}", _roomId, streamInfo.ExpiresAt);
+        }
+        catch (RateLimitException ex)
+        {
+            _consecutiveExtendFailures++;
+            // Stream is still alive for ~5 minutes; reschedule extension after the rate limit window
+            var retryMs = ex.RetryAfterSeconds * 1000;
+            _logger.LogWarning("Rate limited extending Nest stream for room {RoomId}, will retry in {Seconds}s (failure {Count}/{Max})",
+                _roomId, ex.RetryAfterSeconds, _consecutiveExtendFailures, MaxConsecutiveExtendFailures);
+
+            if (_consecutiveExtendFailures >= MaxConsecutiveExtendFailures)
+            {
+                _logger.LogError("Too many consecutive extend failures for room {RoomId}, reconnecting", _roomId);
+                _peerConnection?.close();
+                return;
+            }
+
+            // Reschedule a one-shot retry after the rate limit window
+            _extensionTimer?.Change(retryMs, StreamExtensionIntervalMs);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to extend Nest stream for room {RoomId}, will reconnect", _roomId);
-            // Kill current connection to trigger reconnect
-            _peerConnection?.close();
+            _consecutiveExtendFailures++;
+            _logger.LogWarning(ex, "Failed to extend Nest stream for room {RoomId} (failure {Count}/{Max})",
+                _roomId, _consecutiveExtendFailures, MaxConsecutiveExtendFailures);
+
+            if (_consecutiveExtendFailures >= MaxConsecutiveExtendFailures)
+            {
+                _logger.LogError("Too many consecutive extend failures for room {RoomId}, reconnecting", _roomId);
+                _peerConnection?.close();
+            }
+            // Otherwise let the regular timer retry at the next interval
         }
     }
 
