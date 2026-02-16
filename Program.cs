@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Models;
@@ -102,6 +103,12 @@ using (var scope = app.Services.CreateScope())
         db.SaveChanges();
     }
 }
+
+// Support reverse proxies that terminate TLS (e.g., nginx)
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+});
 
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
