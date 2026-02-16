@@ -21,7 +21,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 
 # Install FFmpeg 7.x from Jellyfin repository (supports amd64 + arm64)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl gnupg && \
+    apt-get install -y --no-install-recommends curl gnupg gosu && \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg arch=$(dpkg --print-architecture)] https://repo.jellyfin.org/debian bookworm main" \
         > /etc/apt/sources.list.d/jellyfin.list && \
@@ -42,12 +42,12 @@ WORKDIR /app
 RUN mkdir -p /app/data && chown -R babymonitarr:babymonitarr /app/data
 
 COPY --from=build /app/publish .
-RUN chown -R babymonitarr:babymonitarr /app
-
-USER babymonitarr
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chown -R babymonitarr:babymonitarr /app && \
+    chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
 ENV ConnectionStrings__DefaultConnection="Data Source=/app/data/babymonitarr.db"
 
-ENTRYPOINT ["dotnet", "BabyMonitarr.Backend.dll"]
+ENTRYPOINT ["/app/entrypoint.sh"]

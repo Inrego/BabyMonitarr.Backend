@@ -49,6 +49,19 @@ builder.Services.AddSignalR();
 
 var app = builder.Build();
 
+// Ensure the database directory exists
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+if (connectionString != null)
+{
+    var match = System.Text.RegularExpressions.Regex.Match(connectionString, @"Data Source=(.+)");
+    if (match.Success)
+    {
+        var dir = Path.GetDirectoryName(match.Groups[1].Value);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
+    }
+}
+
 // Initialize database and seed data
 using (var scope = app.Services.CreateScope())
 {

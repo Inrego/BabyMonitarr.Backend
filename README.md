@@ -57,7 +57,7 @@ docker run -d \
   --name babymonitarr \
   -p 8080:8080 \
   -v babymonitarr-data:/app/data \
-  babymonitarr/babymonitarr:latest
+  ghcr.io/inrego/babymonitarr:latest
 ```
 
 Then open [http://localhost:8080](http://localhost:8080) in your browser.
@@ -67,7 +67,7 @@ Then open [http://localhost:8080](http://localhost:8080) in your browser.
 ```yaml
 services:
   babymonitarr:
-    image: babymonitarr/babymonitarr:latest
+    image: ghcr.io/inrego/babymonitarr:latest
     container_name: babymonitarr
     ports:
       - "8080:8080"
