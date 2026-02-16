@@ -68,8 +68,9 @@ a:hover {
 }
 
 .sidebar-logo-icon {
-    font-size: 1.4rem;
-    color: var(--accent-peach);
+    width: 56px;
+    height: 56px;
+    flex-shrink: 0;
 }
 
 .sidebar-logo {
