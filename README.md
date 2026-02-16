@@ -1,412 +1,159 @@
-# BabyMonitarr
+<p align="center">
+  <img src="wwwroot/images/icon_transparent.svg" alt="BabyMonitarr" width="160" />
+</p>
 
-A baby monitor audio streaming application that captures audio from a local microphone or IP camera and streams it to connected clients via WebRTC.
+<h1 align="center">BabyMonitarr</h1>
 
-## Architecture Overview
+<p align="center">
+  <strong>A self-hosted, real-time baby monitor for your IP cameras and microphones.</strong>
+  <br />
+  Stream audio and video from any RTSP camera or Google Nest device straight to your browser — no cloud, no subscriptions, no latency.
+</p>
 
-The application uses:
-- **ASP.NET Core** backend with SignalR for WebRTC signaling
-- **WebRTC** for low-latency audio streaming
-- **WebRTC Data Channel** for real-time audio level updates and sound alerts
+<p align="center">
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#features">Features</a> •
+  <a href="#screenshots">Screenshots</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#google-nest-setup">Nest Setup</a> •
+  <a href="#contributing">Contributing</a>
+</p>
 
-### Why WebRTC?
+---
 
-WebRTC provides:
-- Low-latency peer-to-peer audio streaming
-- Opus codec for efficient audio compression
-- Built-in NAT traversal via ICE candidates
-- Data channels for lightweight metadata transmission
+## Why BabyMonitarr?
 
-## Google Nest Camera Setup
+Most baby monitors are either expensive proprietary hardware, cloud-dependent apps with monthly fees, or laggy phone-based solutions. If you already have an IP camera (or a Google Nest), you shouldn't need any of that.
 
-To use Google Nest cameras, you need to configure OAuth 2.0 credentials in the Google Cloud Console for the Smart Device Management (SDM) API.
+BabyMonitarr turns your existing cameras into a low-latency, privacy-first baby monitor you can access from any browser on your network. It uses **WebRTC** for near-instant peer-to-peer streaming — the same technology behind video calls — so audio reaches you in milliseconds, not seconds.
 
-### Authorized Redirect URI
+**No data leaves your network. No accounts required. No subscriptions. Ever.**
 
-Add the following redirect URI to your OAuth 2.0 client credentials:
+## Features
 
-```
-http://localhost:5148/nest/auth/callback
-```
+- **Multi-Room Monitoring** — Set up as many rooms as you need, each with its own camera and settings. See them all at a glance from the dashboard.
+- **Low-Latency Audio & Video** — WebRTC peer-to-peer streaming with Opus audio. Hear your baby the moment they stir, not 5 seconds later.
+- **Sound Detection & Alerts** — Configurable audio threshold alerts tell you when noise exceeds a level you set. No more staring at a screen waiting.
+- **RTSP Camera Support** — Works with virtually any IP camera, DVR, or NVR that supports RTSP or HTTP streams.
+- **Google Nest Integration** — Connect your Nest cameras via the Smart Device Management API with built-in OAuth setup.
+- **Audio Filtering** — Built-in high-pass and low-pass filters let you cut out background noise like fans or air conditioners.
+- **Real-Time Audio Level Meter** — Live dB visualization so you can see activity at a glance.
+- **Volume Control** — Adjustable volume boost/reduction (-20 to +20 dB) per stream.
+- **Docker Ready** — One container, one volume. Up and running in under a minute.
+- **Privacy First** — Fully self-hosted. SQLite database. Nothing phones home.
 
-Replace `localhost:5148` with your actual host and port if running in a different environment.
+## Screenshots
 
-## Client Integration Guide
+| Dashboard | Camera Configuration | Audio Settings |
+|:-:|:-:|:-:|
+| ![Dashboard](Design/Dashboard.png) | ![Camera Config](Design/CameraConfig.png) | ![Audio Settings](Design/AudioSettings.png) |
 
-To build a client that connects to BabyMonitarr, follow this protocol:
+## Quick Start
 
-### 1. SignalR Connection
+### Docker (Recommended)
 
-Connect to the SignalR hub at `/audioHub`:
-
-```javascript
-const connection = new signalR.HubConnectionBuilder()
-    .withUrl("/audioHub")
-    .withAutomaticReconnect()
-    .build();
-
-await connection.start();
-```
-
-### 2. WebRTC Connection Flow
-
-#### Step 1: Request Stream (Client invokes)
-
-```javascript
-// Returns SDP offer string
-const offerSdp = await connection.invoke("StartWebRtcStream");
-```
-
-#### Step 2: Create RTCPeerConnection
-
-```javascript
-const configuration = {
-    iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' }
-    ]
-};
-
-const peerConnection = new RTCPeerConnection(configuration);
+```bash
+docker run -d \
+  --name babymonitarr \
+  -p 8080:8080 \
+  -v babymonitarr-data:/app/data \
+  babymonitarr/babymonitarr:latest
 ```
 
-#### Step 3: Set Remote Description and Create Answer
+Then open [http://localhost:8080](http://localhost:8080) in your browser.
 
-```javascript
-await peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
-const answer = await peerConnection.createAnswer();
-await peerConnection.setLocalDescription(answer);
+### Docker Compose
 
-// Send answer to server
-await connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
+```yaml
+services:
+  babymonitarr:
+    image: babymonitarr/babymonitarr:latest
+    container_name: babymonitarr
+    ports:
+      - "8080:8080"
+    volumes:
+      - babymonitarr-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  babymonitarr-data:
 ```
 
-#### Step 4: Handle ICE Candidates
+### Build from Source
 
-The server sends ICE candidates via SignalR. Queue them if they arrive before the peer connection is ready:
+Requires [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) and FFmpeg.
 
-```javascript
-let pendingIceCandidates = [];
-
-connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
-    // Server may send candidates without "candidate:" prefix
-    const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
-    const iceCandidate = new RTCIceCandidate({
-        candidate: candidateStr,
-        sdpMid: sdpMid,
-        sdpMLineIndex: sdpMLineIndex
-    });
-
-    if (peerConnection && peerConnection.remoteDescription) {
-        await peerConnection.addIceCandidate(iceCandidate);
-    } else {
-        pendingIceCandidates.push(iceCandidate);
-    }
-});
+```bash
+git clone https://github.com/your-username/BabyMonitarr.git
+cd BabyMonitarr/BabyMonitarr.Backend
+dotnet restore
+dotnet run
 ```
 
-Send client ICE candidates to the server:
+## Configuration
 
-```javascript
-peerConnection.onicecandidate = async (event) => {
-    if (event.candidate) {
-        await connection.invoke("AddIceCandidate",
-            event.candidate.candidate,
-            event.candidate.sdpMid,
-            event.candidate.sdpMLineIndex
-        );
-    }
-};
-```
+All settings are managed through the web UI — no config files to edit.
 
-#### Step 5: Receive Audio Track
+### Adding a Monitor
 
-```javascript
-peerConnection.ontrack = (event) => {
-    if (event.streams && event.streams[0]) {
-        const audioElement = document.createElement('audio');
-        audioElement.srcObject = event.streams[0];
-        audioElement.play();
-    }
-};
-```
+1. Open the **Monitors** page
+2. Click **Add Room** and give it a name and icon
+3. Choose your source type:
+   - **RTSP Camera** — Enter your camera's stream URL (e.g., `rtsp://192.168.1.100:554/stream`)
+   - **Google Nest** — Select a linked Nest device (see [Nest Setup](#google-nest-setup))
+4. Enable audio and/or video streaming
+5. Adjust sound threshold, filters, and volume to your liking
+6. Save — your monitor appears on the dashboard
 
-#### Step 6: Handle Data Channel
+### Audio Settings
 
-The server creates a data channel named `audioLevels` for sending audio level updates and sound alerts:
+| Setting | Description |
+|---------|-------------|
+| Sound Threshold | dB level that triggers an alert (default: -20 dB) |
+| Audio Filters | High-pass / low-pass filters to remove background noise |
+| Volume Adjustment | Boost or reduce stream volume (-20 to +20 dB) |
+| Alert Cooldown | Pause between repeated alerts (default: 30s) |
 
-```javascript
-peerConnection.ondatachannel = (event) => {
-    const dataChannel = event.channel;
+## Google Nest Setup
 
-    dataChannel.onmessage = (event) => {
-        const message = JSON.parse(event.data);
+To use Google Nest cameras, you'll need OAuth 2.0 credentials from the [Google Cloud Console](https://console.cloud.google.com/) for the Smart Device Management (SDM) API.
 
-        if (message.type === 'audioLevel') {
-            // message.level: audio level in dB (typically -90 to 0)
-            // message.timestamp: Unix timestamp in milliseconds
-            console.log(`Audio level: ${message.level} dB`);
-        } else if (message.type === 'soundAlert') {
-            // message.level: current audio level in dB
-            // message.threshold: threshold that was exceeded
-            // message.timestamp: Unix timestamp in milliseconds
-            console.log(`Sound alert: ${message.level} dB exceeded threshold ${message.threshold} dB`);
-        }
-    };
-};
-```
+1. Create a project in the Google Cloud Console and enable the SDM API
+2. Set up OAuth 2.0 credentials with the redirect URI:
+   ```
+   http://localhost:8080/nest/auth/callback
+   ```
+   *(Replace `localhost:8080` with your actual host if needed)*
+3. In BabyMonitarr, go to **System** → enter your Client ID, Client Secret, and Project ID
+4. Click **Link Account** and complete the Google OAuth flow
+5. Your Nest devices will now appear when creating a new monitor
 
-#### Step 7: Stop Stream
+## Tech Stack
 
-```javascript
-await connection.invoke("StopWebRtcStream");
-peerConnection.close();
-```
+| Component | Technology |
+|-----------|-----------|
+| Backend | ASP.NET Core 9 |
+| Real-time | SignalR + WebRTC |
+| Media | FFmpeg, SIPSorcery, NAudio |
+| Audio Codec | Opus (48kHz mono) |
+| Database | SQLite |
+| Frontend | Bootstrap 5, jQuery, SignalR JS |
+| Container | Docker (multi-arch: amd64/arm64) |
 
-### 3. Data Channel Message Formats
+## Client Integration
 
-#### Audio Level Update
-```json
-{
-    "type": "audioLevel",
-    "level": -45.2,
-    "timestamp": 1702742400000
-}
-```
+BabyMonitarr exposes a SignalR hub at `/audioHub` for building custom clients. See the [Client Integration Guide](docs/CLIENT_INTEGRATION.md) for the full WebRTC signaling protocol, data channel message formats, and a complete JavaScript example.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | Always `"audioLevel"` |
-| `level` | number | Audio level in decibels (dB), typically -90 to 0 |
-| `timestamp` | number | Unix timestamp in milliseconds |
+## Contributing
 
-#### Sound Alert
-```json
-{
-    "type": "soundAlert",
-    "level": -15.3,
-    "threshold": -20.0,
-    "timestamp": 1702742400000
-}
-```
+Contributions are welcome! Whether it's bug reports, feature requests, or pull requests — all help is appreciated.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | Always `"soundAlert"` |
-| `level` | number | Current audio level in dB that triggered the alert |
-| `threshold` | number | The threshold setting that was exceeded |
-| `timestamp` | number | Unix timestamp in milliseconds |
-
-### 4. Audio Settings Management
-
-#### Get Current Settings
-
-```javascript
-const settings = await connection.invoke("GetAudioSettings");
-```
-
-Returns an `AudioSettings` object:
-
-```json
-{
-    "soundThreshold": -20.0,
-    "averageSampleCount": 10,
-    "filterEnabled": false,
-    "lowPassFrequency": 4000,
-    "highPassFrequency": 300,
-    "cameraStreamUrl": null,
-    "useCameraAudioStream": false,
-    "thresholdPauseDuration": 30,
-    "volumeAdjustmentDb": -15.0
-}
-```
-
-#### Update Settings
-
-```javascript
-await connection.invoke("UpdateAudioSettings", {
-    soundThreshold: -25.0,
-    averageSampleCount: 10,
-    filterEnabled: true,
-    lowPassFrequency: 4000,
-    highPassFrequency: 300,
-    cameraStreamUrl: "rtsp://192.168.1.100:554/stream",
-    useCameraAudioStream: true,
-    thresholdPauseDuration: 30,
-    volumeAdjustmentDb: -10.0
-});
-```
-
-### Audio Settings Reference
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `soundThreshold` | number | -20.0 | Sound threshold in dB that triggers alerts |
-| `averageSampleCount` | number | 10 | Number of samples for average calculation |
-| `filterEnabled` | boolean | false | Enable audio filtering |
-| `lowPassFrequency` | number | 4000 | Low-pass filter cutoff frequency (Hz) |
-| `highPassFrequency` | number | 300 | High-pass filter cutoff frequency (Hz) |
-| `cameraStreamUrl` | string | null | RTSP/HTTP URL for IP camera audio |
-| `useCameraAudioStream` | boolean | false | Use camera audio instead of local microphone |
-| `thresholdPauseDuration` | number | 30 | Seconds to pause alerts after threshold exceeded |
-| `volumeAdjustmentDb` | number | -15.0 | Volume adjustment in dB (-20 to 20) |
-
-## SignalR Hub Methods Summary
-
-### Client-to-Server (Invoke)
-
-| Method | Parameters | Returns | Description |
-|--------|------------|---------|-------------|
-| `StartWebRtcStream` | none | `string` (SDP offer) | Start WebRTC stream, returns SDP offer |
-| `SetRemoteDescription` | `type: string`, `sdp: string` | void | Set the client's SDP answer |
-| `AddIceCandidate` | `candidate: string`, `sdpMid: string`, `sdpMLineIndex: int?` | void | Add client ICE candidate |
-| `StopWebRtcStream` | none | void | Stop the WebRTC stream |
-| `GetAudioSettings` | none | `AudioSettings` | Get current audio settings |
-| `UpdateAudioSettings` | `settings: AudioSettings` | void | Update audio settings |
-
-### Server-to-Client (On)
-
-| Event | Parameters | Description |
-|-------|------------|-------------|
-| `ReceiveIceCandidate` | `candidate: string`, `sdpMid: string`, `sdpMLineIndex: int` | Server ICE candidate |
-
-## Audio Format
-
-- **Codec**: Opus (negotiated via WebRTC)
-- **Sample Rate**: 48kHz (resampled from 44.1kHz source)
-- **Channels**: Mono
-
-## Complete Example
-
-```javascript
-class BabyMonitorClient {
-    constructor(hubUrl) {
-        this.hubUrl = hubUrl;
-        this.connection = null;
-        this.peerConnection = null;
-        this.pendingIceCandidates = [];
-        this.audioElement = null;
-    }
-
-    async connect() {
-        // Create SignalR connection
-        this.connection = new signalR.HubConnectionBuilder()
-            .withUrl(this.hubUrl)
-            .withAutomaticReconnect()
-            .build();
-
-        // Handle ICE candidates from server
-        this.connection.on("ReceiveIceCandidate", async (candidate, sdpMid, sdpMLineIndex) => {
-            const candidateStr = candidate.startsWith('candidate:') ? candidate : `candidate:${candidate}`;
-            const iceCandidate = new RTCIceCandidate({
-                candidate: candidateStr,
-                sdpMid: sdpMid,
-                sdpMLineIndex: sdpMLineIndex
-            });
-
-            if (this.peerConnection && this.peerConnection.remoteDescription) {
-                try {
-                    await this.peerConnection.addIceCandidate(iceCandidate);
-                } catch (err) {
-                    console.warn("Could not add ICE candidate:", err.message);
-                }
-            } else {
-                this.pendingIceCandidates.push(iceCandidate);
-            }
-        });
-
-        await this.connection.start();
-        console.log("SignalR connected");
-    }
-
-    async startStream() {
-        // Get offer from server
-        const offerSdp = await this.connection.invoke("StartWebRtcStream");
-
-        // Create peer connection
-        this.peerConnection = new RTCPeerConnection({
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        });
-
-        // Handle ICE candidates
-        this.peerConnection.onicecandidate = async (event) => {
-            if (event.candidate) {
-                await this.connection.invoke("AddIceCandidate",
-                    event.candidate.candidate,
-                    event.candidate.sdpMid,
-                    event.candidate.sdpMLineIndex
-                );
-            }
-        };
-
-        // Handle audio track
-        this.peerConnection.ontrack = (event) => {
-            if (event.streams && event.streams[0]) {
-                this.audioElement = new Audio();
-                this.audioElement.srcObject = event.streams[0];
-                this.audioElement.play();
-            }
-        };
-
-        // Handle data channel
-        this.peerConnection.ondatachannel = (event) => {
-            event.channel.onmessage = (e) => {
-                const message = JSON.parse(e.data);
-                if (message.type === 'audioLevel') {
-                    this.onAudioLevel(message.level, message.timestamp);
-                } else if (message.type === 'soundAlert') {
-                    this.onSoundAlert(message.level, message.threshold, message.timestamp);
-                }
-            };
-        };
-
-        // Set remote description
-        await this.peerConnection.setRemoteDescription({ type: 'offer', sdp: offerSdp });
-
-        // Create and send answer
-        const answer = await this.peerConnection.createAnswer();
-        await this.peerConnection.setLocalDescription(answer);
-        await this.connection.invoke("SetRemoteDescription", answer.type, answer.sdp);
-
-        // Process queued ICE candidates
-        for (const candidate of this.pendingIceCandidates) {
-            try {
-                await this.peerConnection.addIceCandidate(candidate);
-            } catch (err) {
-                console.warn("Could not add queued ICE candidate:", err.message);
-            }
-        }
-        this.pendingIceCandidates = [];
-    }
-
-    async stopStream() {
-        this.pendingIceCandidates = [];
-        if (this.peerConnection) {
-            await this.connection.invoke("StopWebRtcStream");
-            this.peerConnection.close();
-            this.peerConnection = null;
-        }
-        if (this.audioElement) {
-            this.audioElement.srcObject = null;
-            this.audioElement = null;
-        }
-    }
-
-    // Override these methods to handle events
-    onAudioLevel(level, timestamp) {
-        console.log(`Audio level: ${level} dB`);
-    }
-
-    onSoundAlert(level, threshold, timestamp) {
-        console.log(`Sound alert: ${level} dB exceeded ${threshold} dB`);
-    }
-}
-
-// Usage
-const client = new BabyMonitorClient("/audioHub");
-await client.connect();
-await client.startStream();
-```
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
-MIT
+[MIT](LICENSE)
