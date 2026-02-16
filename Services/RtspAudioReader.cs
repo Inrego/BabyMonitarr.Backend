@@ -50,26 +50,39 @@ namespace BabyMonitarr.Backend.Services
         private void InitializeFFmpeg()
         {
             _logger.LogInformation("Initializing FFmpeg for RTSP stream processing");
-            
+
             try
             {
-                // Calculate FFmpeg path relative to the application
-                string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                string ffmpegPath = Path.Combine(appPath, "FFmpeg");
-                
-                if (!Directory.Exists(ffmpegPath))
+                string ffmpegPath;
+
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    _logger.LogError($"FFmpeg directory not found at {ffmpegPath}. Please ensure FFmpeg binaries are included with the application.");
-                    throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
+                    // Windows: use bundled FFmpeg directory
+                    string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
+                    ffmpegPath = Path.Combine(appPath, "FFmpeg");
+
+                    if (!Directory.Exists(ffmpegPath))
+                    {
+                        _logger.LogError($"FFmpeg directory not found at {ffmpegPath}. Please ensure FFmpeg binaries are included with the application.");
+                        throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
+                    }
                 }
-                
-                // Set FFmpeg library path to our bundled copy
+                else
+                {
+                    // Linux: check env var, then Jellyfin path, then system paths
+                    ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH")
+                        ?? new[] { "/usr/lib/jellyfin-ffmpeg/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu" }
+                            .FirstOrDefault(Directory.Exists)
+                        ?? "/usr/lib";
+                }
+
+                // Set FFmpeg library path
                 ffmpeg.RootPath = ffmpegPath;
                 DynamicallyLoadedBindings.Initialize();
 
                 // Configure FFmpeg logging
                 ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);  // Only show warnings and errors
-                
+
                 // Log FFmpeg version info
                 _logger.LogInformation($"FFmpeg version: {ffmpeg.av_version_info()}");
                 _logger.LogInformation($"Using FFmpeg binaries from: {ffmpegPath}");

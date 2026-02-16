@@ -50,12 +50,26 @@ namespace BabyMonitarr.Backend.Services
         {
             try
             {
-                string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                string ffmpegPath = Path.Combine(appPath, "FFmpeg");
+                string ffmpegPath;
 
-                if (!Directory.Exists(ffmpegPath))
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
+                    // Windows: use bundled FFmpeg directory
+                    string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
+                    ffmpegPath = Path.Combine(appPath, "FFmpeg");
+
+                    if (!Directory.Exists(ffmpegPath))
+                    {
+                        throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
+                    }
+                }
+                else
+                {
+                    // Linux: check env var, then Jellyfin path, then system paths
+                    ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH")
+                        ?? new[] { "/usr/lib/jellyfin-ffmpeg/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu" }
+                            .FirstOrDefault(Directory.Exists)
+                        ?? "/usr/lib";
                 }
 
                 ffmpeg.RootPath = ffmpegPath;

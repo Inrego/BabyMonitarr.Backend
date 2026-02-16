@@ -1,0 +1,26 @@
+# Windows FFmpeg binaries (~230MB) - Linux image installs its own
+FFmpeg/
+
+# Build outputs
+bin/
+obj/
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Design assets
+Design/
+
+# Database files
+*.db
+
+# Git
+.git/
+.gitignore
+
+# Claude
+.claude/
