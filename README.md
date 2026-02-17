@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="wwwroot/images/icon_transparent.svg" alt="BabyMonitarr" width="160" />
+  <img src="wwwroot/images/icon.svg" alt="BabyMonitarr" width="160" />
 </p>
 
 <h1 align="center">BabyMonitarr</h1>
@@ -7,7 +7,7 @@
 <p align="center">
   <strong>A self-hosted, real-time baby monitor for your IP cameras and microphones.</strong>
   <br />
-  Stream audio and video from any RTSP camera or Google Nest device straight to your browser — no cloud, no subscriptions, no latency.
+  Stream audio and video from any RTSP camera or Google Nest device straight to your browser — no cloud (except Google Nest if you use it), no subscriptions, no latency.
 </p>
 
 <p align="center">
