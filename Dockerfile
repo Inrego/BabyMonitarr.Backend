@@ -19,18 +19,19 @@ RUN dotnet publish -c Release -o /app/publish
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 
-# Install FFmpeg 7.x from Jellyfin repository (supports amd64 + arm64)
+# Install FFmpeg 8.x from Jellyfin repository (supports amd64 + arm64)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl gnupg gosu && \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg arch=$(dpkg --print-architecture)] https://repo.jellyfin.org/debian bookworm main" \
         > /etc/apt/sources.list.d/jellyfin.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends jellyfin-ffmpeg7 && \
+    apt-get install -y --no-install-recommends jellyfin-ffmpeg8 && \
     apt-get purge -y curl gnupg && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
+ENV FFMPEG_LIB_PATH=/usr/lib/jellyfin-ffmpeg/lib
 ENV LD_LIBRARY_PATH=/usr/lib/jellyfin-ffmpeg/lib
 
 # Create non-root user

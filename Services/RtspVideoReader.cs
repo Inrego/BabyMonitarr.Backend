@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.InteropServices;
-using System.Reflection;
 using Microsoft.Extensions.Logging;
 using BabyMonitarr.Backend.Models;
 using FFmpeg.AutoGen;
@@ -43,44 +42,7 @@ namespace BabyMonitarr.Backend.Services
             _username = room.CameraUsername ?? string.Empty;
             _password = room.CameraPassword ?? string.Empty;
 
-            InitializeFFmpeg();
-        }
-
-        private void InitializeFFmpeg()
-        {
-            try
-            {
-                string ffmpegPath;
-
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    // Windows: use bundled FFmpeg directory
-                    string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                    ffmpegPath = Path.Combine(appPath, "FFmpeg");
-
-                    if (!Directory.Exists(ffmpegPath))
-                    {
-                        throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
-                    }
-                }
-                else
-                {
-                    // Linux: check env var, then Jellyfin path, then system paths
-                    ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH")
-                        ?? new[] { "/usr/lib/jellyfin-ffmpeg/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu" }
-                            .FirstOrDefault(Directory.Exists)
-                        ?? "/usr/lib";
-                }
-
-                ffmpeg.RootPath = ffmpegPath;
-                DynamicallyLoadedBindings.Initialize();
-                ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to initialize FFmpeg for video reader");
-                throw;
-            }
+            FFmpegLibraryLoader.EnsureInitialized(_logger);
         }
 
         public Task StartAsync(CancellationToken cancellationToken)

@@ -2,7 +2,6 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
-using System.Reflection;
 using Microsoft.Extensions.Logging;
 using BabyMonitarr.Backend.Models;
 using FFmpeg.AutoGen;
@@ -44,54 +43,7 @@ namespace BabyMonitarr.Backend.Services
             _username = _settings.CameraUsername ?? string.Empty;
             _password = _settings.CameraPassword ?? string.Empty;
             
-            InitializeFFmpeg();
-        }
-        
-        private void InitializeFFmpeg()
-        {
-            _logger.LogInformation("Initializing FFmpeg for RTSP stream processing");
-
-            try
-            {
-                string ffmpegPath;
-
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    // Windows: use bundled FFmpeg directory
-                    string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
-                    ffmpegPath = Path.Combine(appPath, "FFmpeg");
-
-                    if (!Directory.Exists(ffmpegPath))
-                    {
-                        _logger.LogError($"FFmpeg directory not found at {ffmpegPath}. Please ensure FFmpeg binaries are included with the application.");
-                        throw new DirectoryNotFoundException($"FFmpeg directory not found at {ffmpegPath}");
-                    }
-                }
-                else
-                {
-                    // Linux: check env var, then Jellyfin path, then system paths
-                    ffmpegPath = Environment.GetEnvironmentVariable("FFMPEG_LIB_PATH")
-                        ?? new[] { "/usr/lib/jellyfin-ffmpeg/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu" }
-                            .FirstOrDefault(Directory.Exists)
-                        ?? "/usr/lib";
-                }
-
-                // Set FFmpeg library path
-                ffmpeg.RootPath = ffmpegPath;
-                DynamicallyLoadedBindings.Initialize();
-
-                // Configure FFmpeg logging
-                ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);  // Only show warnings and errors
-
-                // Log FFmpeg version info
-                _logger.LogInformation($"FFmpeg version: {ffmpeg.av_version_info()}");
-                _logger.LogInformation($"Using FFmpeg binaries from: {ffmpegPath}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to initialize FFmpeg. Make sure FFmpeg binaries are included with the application.");
-                throw;
-            }
+            FFmpegLibraryLoader.EnsureInitialized(_logger);
         }
         
         public Task StartAsync(CancellationToken cancellationToken)
