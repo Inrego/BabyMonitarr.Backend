@@ -189,6 +189,20 @@ namespace BabyMonitarr.Backend.Services
                 int srcHeight = codecContext->height;
                 AVPixelFormat srcPixFmt = codecContext->pix_fmt;
 
+                // Fallback: some FFmpeg builds (e.g. Jellyfin) may not populate
+                // codec context dimensions for certain codecs. Read from codecpar instead.
+                if (srcWidth <= 0 || srcHeight <= 0)
+                {
+                    srcWidth = codecParams->width;
+                    srcHeight = codecParams->height;
+                }
+
+                if (srcWidth <= 0 || srcHeight <= 0)
+                {
+                    throw new Exception(
+                        $"Invalid video dimensions: {srcWidth}x{srcHeight} (codec={codec->id}, format={srcPixFmt})");
+                }
+
                 // Calculate output dimensions maintaining aspect ratio, capped at MaxWidth x MaxHeight
                 int dstWidth, dstHeight;
                 CalculateScaledDimensions(srcWidth, srcHeight, out dstWidth, out dstHeight);
