@@ -19,20 +19,26 @@ RUN dotnet publish -c Release -o /app/publish
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
 
-# Install FFmpeg 8.x from Jellyfin repository (supports amd64 + arm64)
+# Install Jellyfin FFmpeg (prefer 8.x, fallback to 7.x for repo variants)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl gnupg gosu && \
     curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg arch=$(dpkg --print-architecture)] https://repo.jellyfin.org/debian bookworm main" \
         > /etc/apt/sources.list.d/jellyfin.list && \
     apt-get update && \
-    apt-get install -y --no-install-recommends jellyfin-ffmpeg8 && \
+    if apt-cache show jellyfin-ffmpeg8 > /dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends jellyfin-ffmpeg8; \
+    elif apt-cache show jellyfin-ffmpeg7 > /dev/null 2>&1; then \
+        apt-get install -y --no-install-recommends jellyfin-ffmpeg7; \
+    else \
+        echo "No compatible Jellyfin FFmpeg package found (jellyfin-ffmpeg8/jellyfin-ffmpeg7)." >&2; \
+        exit 1; \
+    fi && \
     apt-get purge -y curl gnupg && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
-ENV FFMPEG_LIB_PATH=/usr/lib/jellyfin-ffmpeg/lib
-ENV LD_LIBRARY_PATH=/usr/lib/jellyfin-ffmpeg/lib
+ENV LD_LIBRARY_PATH=/usr/lib/jellyfin-ffmpeg/lib:/usr/lib/jellyfin-ffmpeg8/lib:/usr/lib/jellyfin-ffmpeg7/lib
 
 # Create non-root user
 RUN groupadd -r babymonitarr && useradd -r -g babymonitarr -m babymonitarr

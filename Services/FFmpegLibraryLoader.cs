@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using FFmpeg.AutoGen;
 using Microsoft.Extensions.Logging;
 
@@ -48,6 +49,7 @@ namespace BabyMonitarr.Backend.Services
                 try
                 {
                     ffmpeg.RootPath = ffmpegPath;
+                    ConfigureLinuxLibraryVersionMap(ffmpegPath, logger);
                     DynamicallyLoadedBindings.Initialize();
 
                     string ffmpegVersion;
@@ -148,9 +150,83 @@ namespace BabyMonitarr.Backend.Services
                 $"FFmpeg bindings could not be initialized from '{ffmpegPath}'. " +
                 $"FFmpeg.AutoGen {bindingsVersion} requires matching FFmpeg major versions. " +
                 $"Discovered libraries: {discoveredLibraries}. " +
-                "For Docker, install FFmpeg 8 (for example jellyfin-ffmpeg8) and set FFMPEG_LIB_PATH/LD_LIBRARY_PATH to its lib directory.";
+                "For Docker, install a compatible Jellyfin package (jellyfin-ffmpeg8 or jellyfin-ffmpeg7) and set FFMPEG_LIB_PATH/LD_LIBRARY_PATH to its lib directory.";
 
             return new InvalidOperationException(message, innerException);
+        }
+
+        private static void ConfigureLinuxLibraryVersionMap(string ffmpegPath, ILogger logger)
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return;
+            }
+
+            if (!Directory.Exists(ffmpegPath))
+            {
+                return;
+            }
+
+            List<string> configuredMappings = new();
+
+            SetVersionIfDetected(ffmpegPath, "libavcodec.so", "avcodec", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libavdevice.so", "avdevice", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libavfilter.so", "avfilter", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libavformat.so", "avformat", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libavutil.so", "avutil", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libswresample.so", "swresample", configuredMappings);
+            SetVersionIfDetected(ffmpegPath, "libswscale.so", "swscale", configuredMappings);
+
+            if (configuredMappings.Count > 0)
+            {
+                logger.LogInformation(
+                    "Configured FFmpeg Linux library map: {LibraryMap}",
+                    string.Join(", ", configuredMappings.OrderBy(mapping => mapping)));
+            }
+        }
+
+        private static void SetVersionIfDetected(
+            string ffmpegPath,
+            string libraryPrefix,
+            string mapKey,
+            List<string> configuredMappings)
+        {
+            int? detectedMajorVersion = DetectLibraryMajorVersion(ffmpegPath, libraryPrefix);
+            if (!detectedMajorVersion.HasValue)
+            {
+                return;
+            }
+
+            ffmpeg.LibraryVersionMap[mapKey] = detectedMajorVersion.Value;
+            configuredMappings.Add($"{mapKey}={detectedMajorVersion.Value}");
+        }
+
+        private static int? DetectLibraryMajorVersion(string ffmpegPath, string libraryPrefix)
+        {
+            Regex versionedSoRegex = new(
+                $"^{Regex.Escape(libraryPrefix)}\\.(\\d+)(?:\\..+)?$",
+                RegexOptions.CultureInvariant);
+
+            int? maxMajorVersion = null;
+
+            foreach (string libraryPath in Directory.EnumerateFiles(ffmpegPath, $"{libraryPrefix}*"))
+            {
+                string fileName = Path.GetFileName(libraryPath);
+                Match match = versionedSoRegex.Match(fileName);
+                if (!match.Success)
+                {
+                    continue;
+                }
+
+                if (int.TryParse(match.Groups[1].Value, out int majorVersion))
+                {
+                    maxMajorVersion = maxMajorVersion.HasValue
+                        ? Math.Max(maxMajorVersion.Value, majorVersion)
+                        : majorVersion;
+                }
+            }
+
+            return maxMajorVersion;
         }
     }
 }
