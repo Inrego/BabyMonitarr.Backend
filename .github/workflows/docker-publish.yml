@@ -2,7 +2,7 @@ name: Docker Build & Publish
 
 on:
   push:
-    branches: [master]
+    branches: [master, "docker-tag/*"]
     tags: ["v*"]
   pull_request:
     branches: [master]
@@ -36,6 +36,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve branch-based Docker tag
+        id: branch_tag
+        if: startsWith(github.ref, 'refs/heads/docker-tag/')
+        run: echo "value=${GITHUB_REF#refs/heads/docker-tag/}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -43,6 +48,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.branch_tag.outputs.value }},enable=${{ steps.branch_tag.outputs.value != '' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
