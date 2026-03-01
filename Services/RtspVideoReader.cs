@@ -109,7 +109,6 @@ namespace BabyMonitarr.Backend.Services
 
             try
             {
-                byte* errorBuf = stackalloc byte[1024];
                 formatContext = ffmpeg.avformat_alloc_context();
 
                 // Suppress noisy log messages
@@ -137,6 +136,7 @@ namespace BabyMonitarr.Backend.Services
                 int ret = ffmpeg.avformat_open_input(&formatContext, _rtspUrl, null, &options);
                 if (ret < 0)
                 {
+                    byte* errorBuf = stackalloc byte[1024];
                     ffmpeg.av_strerror(ret, errorBuf, 1024);
                     throw new Exception($"Could not open RTSP stream: {Marshal.PtrToStringAnsi((IntPtr)errorBuf)}");
                 }
@@ -185,29 +185,60 @@ namespace BabyMonitarr.Backend.Services
                     throw new Exception("Failed to open video codec");
                 }
 
-                _logger.LogInformation(
-                    "Opened video decoder for room {RoomId}: codec={CodecName} (id={CodecId})",
-                    _room.Id,
-                    Marshal.PtrToStringAnsi((IntPtr)codec->name) ?? "unknown",
-                    codec->id);
+                int srcWidth = codecContext->width;
+                int srcHeight = codecContext->height;
+                AVPixelFormat srcPixFmt = codecContext->pix_fmt;
+
+                // Fallback: some FFmpeg builds (e.g. Jellyfin) may not populate
+                // codec context dimensions for certain codecs. Read from codecpar instead.
+                if (srcWidth <= 0 || srcHeight <= 0)
+                {
+                    srcWidth = codecParams->width;
+                    srcHeight = codecParams->height;
+                }
+
+                if (srcWidth <= 0 || srcHeight <= 0)
+                {
+                    throw new Exception(
+                        $"Invalid video dimensions: {srcWidth}x{srcHeight} (codec={codec->id}, format={srcPixFmt})");
+                }
+
+                // Calculate output dimensions maintaining aspect ratio, capped at MaxWidth x MaxHeight
+                int dstWidth, dstHeight;
+                CalculateScaledDimensions(srcWidth, srcHeight, out dstWidth, out dstHeight);
+
+                _logger.LogInformation("Video stream found for room {RoomId}: {SrcW}x{SrcH} -> {DstW}x{DstH}, format={Fmt}",
+                    _room.Id, srcWidth, srcHeight, dstWidth, dstHeight, srcPixFmt);
+
+                // Create scaler context to convert to I420 (YUV420P) at target resolution
+                swsContext = ffmpeg.sws_getContext(
+                    srcWidth, srcHeight, srcPixFmt,
+                    dstWidth, dstHeight, AVPixelFormat.AV_PIX_FMT_YUV420P,
+                    (int)SwsFlags.SWS_BILINEAR, null, null, null);
+
+                if (swsContext == null)
+                {
+                    throw new Exception("Could not create sws scaling context");
+                }
 
                 AVPacket* packet = ffmpeg.av_packet_alloc();
                 AVFrame* frame = ffmpeg.av_frame_alloc();
                 AVFrame* i420Frame = ffmpeg.av_frame_alloc();
 
-                // Scaler and output frame are initialized lazily on the first
-                // decoded frame so we use the actual pixel format and dimensions
-                // reported by the decoder (which may differ from codec context
-                // values before any frames have been decoded, e.g. HEVC).
-                int dstWidth = 0, dstHeight = 0;
-                bool scalerInitialized = false;
+                // Allocate I420 output frame buffer
+                i420Frame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
+                i420Frame->width = dstWidth;
+                i420Frame->height = dstHeight;
+                ret = ffmpeg.av_frame_get_buffer(i420Frame, 32);
+                if (ret < 0)
+                {
+                    throw new Exception("Could not allocate I420 frame buffer");
+                }
 
                 // Frame rate limiting
                 AVRational timeBase = formatContext->streams[videoStreamIndex]->time_base;
                 long minPtsInterval = (long)(timeBase.den / (timeBase.num * TargetFps));
                 long lastEmittedPts = long.MinValue;
-
-                bool keyframeReceived = false;
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -220,6 +251,7 @@ namespace BabyMonitarr.Backend.Services
                         }
                         else
                         {
+                            byte* errorBuf = stackalloc byte[1024];
                             ffmpeg.av_strerror(ret, errorBuf, 1024);
                             _logger.LogWarning("Error reading video frame for room {RoomId}: {Error}",
                                 _room.Id, Marshal.PtrToStringAnsi((IntPtr)errorBuf));
@@ -233,41 +265,10 @@ namespace BabyMonitarr.Backend.Services
                         continue;
                     }
 
-                    // Wait for first keyframe before feeding packets to decoder.
-                    // HEVC decoders cannot decode P/B-frames without an IDR
-                    // reference, causing "Could not find ref with POC" errors
-                    // when connecting to a live stream mid-GOP.
-                    if (!keyframeReceived)
-                    {
-                        if ((packet->flags & ffmpeg.AV_PKT_FLAG_KEY) != 0)
-                        {
-                            keyframeReceived = true;
-                            _logger.LogInformation(
-                                "First keyframe received for room {RoomId}, starting decode",
-                                _room.Id);
-                        }
-                        else
-                        {
-                            ffmpeg.av_packet_unref(packet);
-                            continue;
-                        }
-                    }
-
                     ret = ffmpeg.avcodec_send_packet(codecContext, packet);
                     ffmpeg.av_packet_unref(packet);
 
-                    if (ret < 0)
-                    {
-                        if (_logger.IsEnabled(LogLevel.Debug))
-                        {
-                            ffmpeg.av_strerror(ret, errorBuf, 1024);
-                            _logger.LogDebug(
-                                "avcodec_send_packet error for room {RoomId}: {Error}",
-                                _room.Id,
-                                Marshal.PtrToStringAnsi((IntPtr)errorBuf));
-                        }
-                        continue;
-                    }
+                    if (ret < 0) continue;
 
                     while (true)
                     {
@@ -280,54 +281,6 @@ namespace BabyMonitarr.Backend.Services
                         {
                             _logger.LogWarning("Error receiving video frame for room {RoomId}", _room.Id);
                             break;
-                        }
-
-                        // Lazy-initialize the scaler on first decoded frame.
-                        // This uses the actual pixel format and dimensions from the
-                        // decoder output rather than codec context values which may
-                        // be unset (e.g. AV_PIX_FMT_NONE for HEVC before first frame).
-                        if (!scalerInitialized)
-                        {
-                            int srcWidth = frame->width;
-                            int srcHeight = frame->height;
-                            AVPixelFormat srcPixFmt = (AVPixelFormat)frame->format;
-
-                            if (srcWidth <= 0 || srcHeight <= 0)
-                            {
-                                _logger.LogWarning(
-                                    "Decoded frame has invalid dimensions {W}x{H} for room {RoomId}, skipping",
-                                    srcWidth, srcHeight, _room.Id);
-                                ffmpeg.av_frame_unref(frame);
-                                continue;
-                            }
-
-                            CalculateScaledDimensions(srcWidth, srcHeight, out dstWidth, out dstHeight);
-
-                            _logger.LogInformation(
-                                "Video stream initialized for room {RoomId}: {SrcW}x{SrcH} -> {DstW}x{DstH}, format={Fmt}",
-                                _room.Id, srcWidth, srcHeight, dstWidth, dstHeight, srcPixFmt);
-
-                            swsContext = ffmpeg.sws_getContext(
-                                srcWidth, srcHeight, srcPixFmt,
-                                dstWidth, dstHeight, AVPixelFormat.AV_PIX_FMT_YUV420P,
-                                (int)SwsFlags.SWS_BILINEAR, null, null, null);
-
-                            if (swsContext == null)
-                            {
-                                throw new Exception(
-                                    $"Could not create sws scaling context for {srcPixFmt} {srcWidth}x{srcHeight}");
-                            }
-
-                            i420Frame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
-                            i420Frame->width = dstWidth;
-                            i420Frame->height = dstHeight;
-                            int bufRet = ffmpeg.av_frame_get_buffer(i420Frame, 32);
-                            if (bufRet < 0)
-                            {
-                                throw new Exception("Could not allocate I420 frame buffer");
-                            }
-
-                            scalerInitialized = true;
                         }
 
                         // Frame rate limiting: skip frames to maintain target FPS
