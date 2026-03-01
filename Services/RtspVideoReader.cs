@@ -23,6 +23,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly string _rtspUrl;
         private readonly string _username;
         private readonly string _password;
+        private readonly bool _transcodeToH264;
         private bool _isDisposed;
         private Task? _processingTask;
         private CancellationTokenSource? _cts;
@@ -31,6 +32,7 @@ namespace BabyMonitarr.Backend.Services
         private const int TargetFps = 10;
         private const int MaxWidth = 640;
         private const int MaxHeight = 480;
+        private const int RtpVideoClockRate = 90000;
 
         public event EventHandler<VideoFrameEventArgs>? VideoFrameReceived;
 
@@ -41,6 +43,7 @@ namespace BabyMonitarr.Backend.Services
             _rtspUrl = room.CameraStreamUrl ?? string.Empty;
             _username = room.CameraUsername ?? string.Empty;
             _password = room.CameraPassword ?? string.Empty;
+            _transcodeToH264 = !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
             FFmpegLibraryLoader.EnsureInitialized(_logger);
         }
@@ -104,7 +107,9 @@ namespace BabyMonitarr.Backend.Services
 
             AVFormatContext* formatContext = null;
             AVCodecContext* codecContext = null;
+            AVCodecContext* h264EncoderContext = null;
             SwsContext* swsContext = null;
+            AVPacket* h264Packet = null;
             int videoStreamIndex = -1;
 
             try
@@ -121,11 +126,11 @@ namespace BabyMonitarr.Backend.Services
 
                 AVDictionary* options = null;
                 ffmpeg.av_dict_set(&options, "rtsp_transport", "tcp", 0);
-                ffmpeg.av_dict_set(&options, "fflags", "nobuffer", 0);
-                ffmpeg.av_dict_set(&options, "flags", "low_delay", 0);
-                ffmpeg.av_dict_set(&options, "max_delay", "100000", 0);
-                ffmpeg.av_dict_set(&options, "analyzeduration", "1000000", 0);
-                ffmpeg.av_dict_set(&options, "probesize", "100000", 0);
+                ffmpeg.av_dict_set(&options, "rtsp_flags", "prefer_tcp", 0);
+                ffmpeg.av_dict_set(&options, "max_delay", "500000", 0); // 500ms
+                ffmpeg.av_dict_set(&options, "analyzeduration", "5000000", 0);
+                ffmpeg.av_dict_set(&options, "probesize", "1000000", 0);
+                ffmpeg.av_dict_set(&options, "fflags", "discardcorrupt", 0);
 
                 if (!string.IsNullOrEmpty(_username) && !string.IsNullOrEmpty(_password))
                 {
@@ -134,6 +139,7 @@ namespace BabyMonitarr.Backend.Services
                 }
 
                 int ret = ffmpeg.avformat_open_input(&formatContext, _rtspUrl, null, &options);
+                ffmpeg.av_dict_free(&options);
                 if (ret < 0)
                 {
                     byte* errorBuf = stackalloc byte[1024];
@@ -235,6 +241,19 @@ namespace BabyMonitarr.Backend.Services
                     throw new Exception("Could not allocate I420 frame buffer");
                 }
 
+                uint durationRtpUnits = (uint)(RtpVideoClockRate / TargetFps);
+                long h264Pts = 0;
+
+                if (_transcodeToH264)
+                {
+                    h264EncoderContext = CreateH264Encoder(dstWidth, dstHeight);
+                    h264Packet = ffmpeg.av_packet_alloc();
+                    if (h264Packet == null)
+                    {
+                        throw new Exception("Could not allocate H264 packet buffer");
+                    }
+                }
+
                 // Frame rate limiting
                 AVRational timeBase = formatContext->streams[videoStreamIndex]->time_base;
                 long minPtsInterval = (long)(timeBase.den / (timeBase.num * TargetFps));
@@ -296,12 +315,28 @@ namespace BabyMonitarr.Backend.Services
                         }
                         lastEmittedPts = pts;
 
+                        ret = ffmpeg.av_frame_make_writable(i420Frame);
+                        if (ret < 0)
+                        {
+                            _logger.LogWarning("I420 frame buffer is not writable for room {RoomId}: {Error}",
+                                _room.Id, GetFfmpegError(ret));
+                            ffmpeg.av_frame_unref(frame);
+                            continue;
+                        }
+
                         // Convert to I420 at target resolution
                         ffmpeg.sws_scale(swsContext,
                             frame->data, frame->linesize, 0, frame->height,
                             i420Frame->data, i420Frame->linesize);
 
-                        EmitVideoFrame(i420Frame, dstWidth, dstHeight, pts, timeBase);
+                        if (_transcodeToH264 && h264EncoderContext != null && h264Packet != null)
+                        {
+                            EncodeAndEmitH264Frame(h264EncoderContext, h264Packet, i420Frame, durationRtpUnits, ref h264Pts);
+                        }
+                        else
+                        {
+                            EmitVideoFrame(i420Frame, dstWidth, dstHeight, pts, timeBase);
+                        }
 
                         ffmpeg.av_frame_unref(frame);
                     }
@@ -316,12 +351,44 @@ namespace BabyMonitarr.Backend.Services
                     ffmpeg.av_frame_unref(frame);
                 }
 
+                if (_transcodeToH264 && h264EncoderContext != null && h264Packet != null)
+                {
+                    ffmpeg.avcodec_send_frame(h264EncoderContext, null);
+                    while (true)
+                    {
+                        ret = ffmpeg.avcodec_receive_packet(h264EncoderContext, h264Packet);
+                        if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                        {
+                            break;
+                        }
+
+                        if (ret < 0)
+                        {
+                            _logger.LogWarning("Error flushing H264 encoder for room {RoomId}", _room.Id);
+                            break;
+                        }
+
+                        EmitRawH264Frame(h264Packet, durationRtpUnits);
+                        ffmpeg.av_packet_unref(h264Packet);
+                    }
+                }
+
                 ffmpeg.av_frame_free(&i420Frame);
                 ffmpeg.av_frame_free(&frame);
                 ffmpeg.av_packet_free(&packet);
             }
             finally
             {
+                if (h264Packet != null)
+                {
+                    ffmpeg.av_packet_free(&h264Packet);
+                }
+
+                if (h264EncoderContext != null)
+                {
+                    ffmpeg.avcodec_free_context(&h264EncoderContext);
+                }
+
                 if (swsContext != null)
                 {
                     ffmpeg.sws_freeContext(swsContext);
@@ -353,6 +420,110 @@ namespace BabyMonitarr.Backend.Services
             double scale = Math.Min((double)MaxWidth / srcWidth, (double)MaxHeight / srcHeight);
             dstWidth = ((int)(srcWidth * scale)) & ~1;  // Round down to even
             dstHeight = ((int)(srcHeight * scale)) & ~1;
+        }
+
+        private unsafe AVCodecContext* CreateH264Encoder(int width, int height)
+        {
+            AVCodec* encoder = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
+            if (encoder == null)
+            {
+                throw new Exception("FFmpeg H264 encoder not available");
+            }
+
+            AVCodecContext* encoderContext = ffmpeg.avcodec_alloc_context3(encoder);
+            if (encoderContext == null)
+            {
+                throw new Exception("Could not allocate H264 encoder context");
+            }
+
+            encoderContext->width = width;
+            encoderContext->height = height;
+            encoderContext->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
+            encoderContext->time_base = new AVRational { num = 1, den = TargetFps };
+            encoderContext->framerate = new AVRational { num = TargetFps, den = 1 };
+            encoderContext->gop_size = TargetFps;
+            encoderContext->max_b_frames = 0;
+            encoderContext->thread_count = 0;
+            encoderContext->bit_rate = Math.Max(300_000, width * height * 2);
+
+            AVDictionary* encoderOptions = null;
+            ffmpeg.av_dict_set(&encoderOptions, "preset", "ultrafast", 0);
+            ffmpeg.av_dict_set(&encoderOptions, "tune", "zerolatency", 0);
+            ffmpeg.av_dict_set(&encoderOptions, "profile", "baseline", 0);
+            ffmpeg.av_dict_set(&encoderOptions, "x264-params", "keyint=10:min-keyint=10:scenecut=0:repeat-headers=1:annexb=1", 0);
+
+            int ret = ffmpeg.avcodec_open2(encoderContext, encoder, &encoderOptions);
+            ffmpeg.av_dict_free(&encoderOptions);
+
+            if (ret < 0)
+            {
+                ffmpeg.avcodec_free_context(&encoderContext);
+                throw new Exception($"Could not open H264 encoder: {GetFfmpegError(ret)}");
+            }
+
+            _logger.LogInformation("Using FFmpeg H264 transcoding for RTSP room {RoomId}", _room.Id);
+            return encoderContext;
+        }
+
+        private unsafe void EncodeAndEmitH264Frame(
+            AVCodecContext* encoderContext,
+            AVPacket* packet,
+            AVFrame* i420Frame,
+            uint durationRtpUnits,
+            ref long pts)
+        {
+            i420Frame->pts = pts++;
+            int ret = ffmpeg.avcodec_send_frame(encoderContext, i420Frame);
+            if (ret < 0)
+            {
+                _logger.LogWarning("Failed to send frame to H264 encoder for room {RoomId}: {Error}",
+                    _room.Id, GetFfmpegError(ret));
+                return;
+            }
+
+            while (true)
+            {
+                ret = ffmpeg.avcodec_receive_packet(encoderContext, packet);
+                if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                {
+                    break;
+                }
+
+                if (ret < 0)
+                {
+                    _logger.LogWarning("Failed receiving H264 packet for room {RoomId}: {Error}",
+                        _room.Id, GetFfmpegError(ret));
+                    break;
+                }
+
+                EmitRawH264Frame(packet, durationRtpUnits);
+                ffmpeg.av_packet_unref(packet);
+            }
+        }
+
+        private unsafe void EmitRawH264Frame(AVPacket* packet, uint durationRtpUnits)
+        {
+            if (packet == null || packet->data == null || packet->size <= 0)
+            {
+                return;
+            }
+
+            byte[] rawH264Data = new byte[packet->size];
+            Marshal.Copy((IntPtr)packet->data, rawH264Data, 0, packet->size);
+
+            VideoFrameReceived?.Invoke(this, new VideoFrameEventArgs
+            {
+                RawH264Data = rawH264Data,
+                DurationRtpUnits = durationRtpUnits,
+                TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+        }
+
+        private static unsafe string GetFfmpegError(int errorCode)
+        {
+            byte* errorBuf = stackalloc byte[1024];
+            ffmpeg.av_strerror(errorCode, errorBuf, 1024);
+            return Marshal.PtrToStringAnsi((IntPtr)errorBuf) ?? $"FFmpeg error {errorCode}";
         }
 
         private unsafe void EmitVideoFrame(AVFrame* i420Frame, int width, int height, long pts, AVRational timeBase)

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.Net;
@@ -29,7 +30,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly ConcurrentDictionary<string, VpxVideoEncoder> _videoEncoders = new();
         private readonly ConcurrentDictionary<string, List<RTCIceCandidateInit>> _pendingIceCandidates = new();
 
-        // Track which connections use H.264 passthrough (Nest) vs VP8 encoding (RTSP)
+        // Track which connections use H.264 payloads (Nest passthrough or RTSP transcode) vs VP8 encoding.
         private readonly ConcurrentDictionary<string, bool> _isPassthrough = new();
 
         // Track which rooms each peer is subscribed to, and the handler reference for unsubscription
@@ -100,22 +101,46 @@ namespace BabyMonitarr.Backend.Services
 
             // Determine codec based on room type
             bool isNest = _videoStreamingService.IsNestRoom(roomId);
-            _isPassthrough.TryAdd(key, isNest);
+            bool useRtspH264 = !isNest && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            _isPassthrough.TryAdd(key, isNest || useRtspH264);
 
-            if (isNest)
+            if (isNest || useRtspH264)
             {
-                // H.264 passthrough for Nest rooms - no encoder needed
+                // H.264 passthrough for Nest rooms and Linux RTSP transcode path.
                 var videoFormats = new List<VideoFormat>
                 {
                     new VideoFormat(VideoCodecsEnum.H264, 96, 90000, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
                 };
                 var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.SendOnly);
                 pc.addTrack(videoTrack);
+
+                if (useRtspH264)
+                {
+                    _logger.LogInformation("Using H264 video track for RTSP room {RoomId} on non-Windows platform", roomId);
+                }
             }
             else
             {
                 // VP8 encoding for RTSP rooms
-                var videoEncoder = new VpxVideoEncoder();
+                VpxVideoEncoder videoEncoder;
+                try
+                {
+                    videoEncoder = new VpxVideoEncoder();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to initialize VP8 encoder for room {RoomId}", roomId);
+                    try
+                    {
+                        pc.Close("VP8 encoder initialization failed");
+                    }
+                    catch (Exception closeEx)
+                    {
+                        _logger.LogDebug(closeEx, "Error closing video peer connection after VP8 initialization failure");
+                    }
+                    return string.Empty;
+                }
+
                 var videoFormats = new List<VideoFormat>
                 {
                     new VideoFormat(VideoCodecsEnum.VP8, VpxVideoEncoder.VP8_FORMATID)
@@ -282,7 +307,7 @@ namespace BabyMonitarr.Backend.Services
             }
             catch (Exception ex)
             {
-                _logger.LogDebug("Error encoding/sending video to peer {Key}: {Error}", key, ex.Message);
+                _logger.LogWarning(ex, "Error encoding/sending video to peer {Key}", key);
             }
         }
 
