@@ -17,6 +17,13 @@ let monitoringRooms = new Set();  // roomIds this client is actively monitoring
 const DEFAULT_ICE_SERVERS = Object.freeze([{ urls: "stun:stun.l.google.com:19302" }]);
 let webrtcIceServers = DEFAULT_ICE_SERVERS.map((server) => ({ ...server }));
 
+// PWA state
+const PWA_STORAGE_KEY = "babymonitarr.monitoringRoomIds";
+const PWA_ALERT_COOLDOWN_MS = 30000; // 30 seconds, matching Flutter thresholdPauseDuration
+const pwaLastAlertTime = {};         // { roomId: timestamp } — per-room cooldown tracking
+let pwaWakeLock = null;              // Screen Wake Lock sentinel
+let pwaInstallPrompt = null;         // Deferred beforeinstallprompt event
+
 // Diagnostics state
 const DIAG_PREFIX = "[BM-DIAG]";
 const DIAG_STORAGE_KEY = "babymonitarr.webrtcDebug";
@@ -887,6 +894,7 @@ async function loadRooms() {
         }
 
         renderDashboard();
+        pwaAutoResumeMonitoring();
     } catch (err) {
         diagError("rooms.load.failed", err);
         console.error("Error loading rooms:", err);
@@ -1072,6 +1080,9 @@ async function startMonitoring(roomId) {
     }
 
     monitoringRooms.add(roomId);
+    pwaRequestNotificationPermission();
+    pwaSaveMonitoringState();
+    pwaAcquireWakeLock();
     updateRoomCard(roomId);
 
     const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
@@ -1093,6 +1104,8 @@ async function startMonitoring(roomId) {
     if (hasVideo) {
         await startVideoStream(roomId);
     }
+
+    pwaUpdateMediaSession();
 }
 
 async function stopMonitoring(roomId, skipRender) {
@@ -1107,6 +1120,12 @@ async function stopMonitoring(roomId, skipRender) {
     }
 
     monitoringRooms.delete(roomId);
+    pwaSaveMonitoringState();
+    pwaUpdateMediaSession();
+
+    if (monitoringRooms.size === 0) {
+        pwaReleaseWakeLock();
+    }
 
     if (!skipRender) {
         updateRoomCard(roomId);
@@ -1519,6 +1538,7 @@ async function startAudioStream(roomId) {
                             threshold: message.threshold
                         });
                         console.log(`Sound alert for room ${roomId}: ${message.level.toFixed(1)} dB (threshold: ${message.threshold.toFixed(1)} dB)`);
+                        handleSoundAlert(roomId, message.level, message.threshold);
                     } else {
                         diagInfo("webrtc.dataChannel.unknownMessage", {
                             roomId,
@@ -1625,6 +1645,16 @@ async function startAudioStream(roomId) {
                 setStreamFlag(roomId, streamType, "connectionFailed");
                 void capturePeerStats(roomId, streamType, pc, "connection-failed");
                 finalizeStreamAttempt(roomId, streamType, "failed", { reason: "connection-failed" });
+            }
+
+            if ((state === 'disconnected' || state === 'failed') && !isStreamStopRequested(roomId, streamType)) {
+                const room = currentRooms.find(r => r.id === roomId);
+                const roomName = room ? room.name : `Room ${roomId}`;
+                pwaShowNotification(
+                    `Connection lost \u2014 ${roomName}`,
+                    'Attempting to reconnect...',
+                    `disconnect-${roomId}`
+                );
             }
 
             if (state === 'disconnected' || state === 'failed' || state === 'closed') {
@@ -1786,4 +1816,289 @@ function showMessage(message, isError = false) {
     setTimeout(() => {
         messageElement.style.display = 'none';
     }, 3000);
+}
+
+// ===== PWA: Notification Permission =====
+function pwaRequestNotificationPermission() {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') {
+        Notification.requestPermission().then((result) => {
+            diagInfo("pwa.notification.permission", { result });
+        });
+    }
+}
+
+// ===== PWA: Sound Alert Handler =====
+function handleSoundAlert(roomId, level, threshold) {
+    const now = Date.now();
+    if (pwaLastAlertTime[roomId] && (now - pwaLastAlertTime[roomId]) < PWA_ALERT_COOLDOWN_MS) {
+        return; // Still in cooldown
+    }
+    pwaLastAlertTime[roomId] = now;
+
+    const room = currentRooms.find(r => r.id === roomId);
+    const roomName = room ? room.name : `Room ${roomId}`;
+
+    // Visual alert — flash card
+    const card = document.querySelector(`.dash-card[data-room-id="${roomId}"]`);
+    if (card) {
+        card.classList.add('alerting');
+        setTimeout(() => card.classList.remove('alerting'), 2000);
+    }
+
+    // Vibrate (Android Chrome)
+    if (navigator.vibrate) {
+        navigator.vibrate([0, 200, 100, 200, 100, 400]);
+    }
+
+    // System notification via service worker
+    pwaShowNotification(
+        `Sound Alert \u2014 ${roomName}`,
+        `Sound level at ${level.toFixed(1)} dB exceeds threshold (${threshold.toFixed(1)} dB)`,
+        `sound-alert-${roomId}`
+    );
+}
+
+// ===== PWA: Show Notification =====
+function pwaShowNotification(title, body, tag) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+            type: 'SHOW_NOTIFICATION',
+            title: title,
+            body: body,
+            tag: tag,
+            icon: '/images/icon-192.png'
+        });
+    } else {
+        // Fallback: direct notification (no service worker)
+        try {
+            new Notification(title, {
+                body: body,
+                icon: '/images/icon-192.png',
+                tag: tag,
+                silent: false
+            });
+        } catch (e) {
+            console.warn('Notification failed:', e);
+        }
+    }
+}
+
+// ===== PWA: Persistent Monitoring State =====
+function pwaSaveMonitoringState() {
+    try {
+        const ids = Array.from(monitoringRooms);
+        localStorage.setItem(PWA_STORAGE_KEY, JSON.stringify(ids));
+        diagInfo("pwa.state.saved", { roomIds: ids });
+    } catch (e) {
+        console.warn('Failed to save monitoring state:', e);
+    }
+}
+
+function pwaLoadMonitoringState() {
+    try {
+        const stored = localStorage.getItem(PWA_STORAGE_KEY);
+        if (!stored) return [];
+        const ids = JSON.parse(stored);
+        return Array.isArray(ids) ? ids : [];
+    } catch (e) {
+        console.warn('Failed to load monitoring state:', e);
+        return [];
+    }
+}
+
+let pwaAutoResumeExecuted = false;
+function pwaAutoResumeMonitoring() {
+    if (pwaAutoResumeExecuted) return;
+    pwaAutoResumeExecuted = true;
+
+    const savedIds = pwaLoadMonitoringState();
+    if (savedIds.length === 0) return;
+
+    const validRoomIds = new Set(currentRooms.map(r => r.id));
+    const toResume = savedIds.filter(id => validRoomIds.has(id) && !monitoringRooms.has(id));
+
+    if (toResume.length === 0) return;
+
+    diagInfo("pwa.autoResume", { roomIds: toResume });
+    for (const roomId of toResume) {
+        startMonitoring(roomId);
+    }
+}
+
+// ===== PWA: Screen Wake Lock =====
+async function pwaAcquireWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    if (pwaWakeLock) return; // Already held
+
+    try {
+        pwaWakeLock = await navigator.wakeLock.request('screen');
+        diagInfo("pwa.wakeLock.acquired");
+
+        pwaWakeLock.addEventListener('release', () => {
+            diagInfo("pwa.wakeLock.released");
+            pwaWakeLock = null;
+        });
+    } catch (e) {
+        diagWarn("pwa.wakeLock.failed", { error: normalizeError(e) });
+    }
+}
+
+function pwaReleaseWakeLock() {
+    if (pwaWakeLock) {
+        pwaWakeLock.release();
+        pwaWakeLock = null;
+    }
+}
+
+// Re-acquire wake lock when tab becomes visible (required by API)
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && monitoringRooms.size > 0) {
+        pwaAcquireWakeLock();
+    }
+});
+
+// ===== PWA: Media Session API =====
+function pwaUpdateMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+
+    if (monitoringRooms.size === 0) {
+        navigator.mediaSession.metadata = null;
+        navigator.mediaSession.playbackState = 'none';
+        return;
+    }
+
+    const roomNames = Array.from(monitoringRooms)
+        .map(id => currentRooms.find(r => r.id === id))
+        .filter(Boolean)
+        .map(r => r.name);
+
+    navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'BabyMonitarr',
+        artist: `Monitoring: ${roomNames.join(', ')}`,
+        artwork: [
+            { src: '/images/icon-192.png', sizes: '192x192', type: 'image/png' },
+            { src: '/images/icon-512.png', sizes: '512x512', type: 'image/png' }
+        ]
+    });
+
+    navigator.mediaSession.playbackState = 'playing';
+}
+
+// ===== PWA: Platform Detection =====
+function pwaDetectPlatform() {
+    const ua = navigator.userAgent || '';
+    // iPadOS 13+ reports as MacIntel but has touch
+    const isIOS = /iPhone|iPad|iPod/.test(ua) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS) return 'ios';
+    if (/Android/.test(ua)) return 'android';
+    return 'desktop';
+}
+
+function pwaIsStandalone() {
+    return window.matchMedia('(display-mode: standalone)').matches ||
+           window.navigator.standalone === true;
+}
+
+// ===== PWA: Install Prompt =====
+let pwaAndroidFallbackTimer = null;
+
+window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    pwaInstallPrompt = e;
+    // Cancel Android fallback timer since native prompt is available
+    if (pwaAndroidFallbackTimer) {
+        clearTimeout(pwaAndroidFallbackTimer);
+        pwaAndroidFallbackTimer = null;
+    }
+    // Only show install banner on mobile/tablet, not desktop
+    if (!pwaIsStandalone() && pwaDetectPlatform() !== 'desktop') {
+        pwaShowInstallBanner('chromium');
+    }
+    diagInfo("pwa.installPrompt.captured");
+});
+
+window.addEventListener('appinstalled', () => {
+    pwaInstallPrompt = null;
+    pwaHideInstallBanner();
+    diagInfo("pwa.installed");
+});
+
+// Show platform-appropriate install banner on page load
+document.addEventListener('DOMContentLoaded', () => {
+    if (pwaIsStandalone()) return;
+
+    const platform = pwaDetectPlatform();
+    diagInfo("pwa.platform.detected", { platform });
+
+    if (platform === 'ios') {
+        pwaShowInstallBanner('ios');
+    } else if (platform === 'android') {
+        // Wait briefly for beforeinstallprompt; show fallback if it doesn't fire
+        pwaAndroidFallbackTimer = setTimeout(() => {
+            if (!pwaInstallPrompt) {
+                pwaShowInstallBanner('android-manual');
+                diagInfo("pwa.installBanner.androidFallback");
+            }
+        }, 3000);
+    }
+    // Desktop: handled entirely by beforeinstallprompt event above
+});
+
+function pwaShowInstallBanner(variant) {
+    const banner = document.getElementById('pwaInstallBanner');
+    if (!banner) return;
+
+    let html = '';
+    if (variant === 'ios') {
+        html = `
+            <i class="fas fa-arrow-up-from-bracket" style="color: var(--accent-teal); font-size: 1.2rem;"></i>
+            <div class="pwa-install-banner-text">
+                <strong>Install BabyMonitarr</strong> for background audio, notifications, and a native app experience.
+                <div class="pwa-install-steps">Tap <i class="fas fa-arrow-up-from-bracket"></i> Share, then <strong>Add to Home Screen</strong></div>
+            </div>
+            <button class="btn-pwa-dismiss" onclick="pwaHideInstallBanner()">&times;</button>
+        `;
+    } else if (variant === 'android-manual') {
+        html = `
+            <i class="fas fa-download" style="color: var(--accent-teal); font-size: 1.2rem;"></i>
+            <div class="pwa-install-banner-text">
+                <strong>Install BabyMonitarr</strong> for background audio, notifications, and a native app experience.
+                <div class="pwa-install-steps">Tap <i class="fas fa-ellipsis-vertical"></i> menu, then <strong>Install app</strong> or <strong>Add to Home Screen</strong></div>
+            </div>
+            <button class="btn-pwa-dismiss" onclick="pwaHideInstallBanner()">&times;</button>
+        `;
+    } else {
+        // chromium / desktop — has native install prompt
+        html = `
+            <i class="fas fa-download" style="color: var(--accent-teal); font-size: 1.2rem;"></i>
+            <div class="pwa-install-banner-text">
+                <strong>Install BabyMonitarr</strong> for background audio, notifications, and a native app experience.
+            </div>
+            <button class="btn-pwa-install" onclick="pwaInstallApp()">Install</button>
+            <button class="btn-pwa-dismiss" onclick="pwaHideInstallBanner()">&times;</button>
+        `;
+    }
+
+    banner.innerHTML = html;
+    banner.style.display = '';
+    diagInfo("pwa.installBanner.shown", { variant });
+}
+
+function pwaHideInstallBanner() {
+    const banner = document.getElementById('pwaInstallBanner');
+    if (banner) banner.style.display = 'none';
+}
+
+function pwaInstallApp() {
+    if (!pwaInstallPrompt) return;
+    pwaInstallPrompt.prompt();
+    pwaInstallPrompt.userChoice.then((result) => {
+        diagInfo("pwa.installPrompt.result", { outcome: result.outcome });
+        pwaInstallPrompt = null;
+        pwaHideInstallBanner();
+    });
 }

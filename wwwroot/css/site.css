@@ -1105,3 +1105,75 @@ a:hover {
 .row {
     --bs-gutter-x: 1.5rem;
 }
+
+/* ===== PWA: Sound Alert Animation ===== */
+@keyframes alertPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 139, 148, 0); }
+    50% { box-shadow: 0 0 0 6px rgba(255, 139, 148, 0.35); }
+}
+
+.dash-card.alerting {
+    animation: alertPulse 0.5s ease 4;
+    border: 2px solid var(--accent-pink);
+}
+
+/* ===== PWA: Install Banner ===== */
+.pwa-install-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background-color: rgba(136, 213, 195, 0.1);
+    border: 1px solid rgba(136, 213, 195, 0.2);
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 20px;
+}
+
+.pwa-install-banner-text {
+    flex: 1;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.pwa-install-banner-text strong {
+    color: var(--text-primary);
+}
+
+.btn-pwa-install {
+    background-color: var(--accent-teal);
+    color: #1a1a1a;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 10px;
+    font-weight: 600;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+    white-space: nowrap;
+    transition: background-color 0.15s ease;
+}
+
+.btn-pwa-install:hover {
+    background-color: #9ce0d0;
+}
+
+.btn-pwa-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px 8px;
+    font-size: 1rem;
+    line-height: 1;
+}
+
+.pwa-install-steps {
+    margin-top: 4px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.pwa-install-steps i {
+    font-size: 0.75rem;
+    vertical-align: middle;
+}
