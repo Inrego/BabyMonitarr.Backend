@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using BabyMonitarr.Backend.Models;
 using FFmpeg.AutoGen;
 
@@ -19,8 +20,11 @@ namespace BabyMonitarr.Backend.Services
     internal class RtspVideoReader : IDisposable
     {
         private readonly Room _room;
-        private readonly ILogger _logger;
+        private readonly ILogger<RtspVideoReader> _logger;
+        private readonly IOptionsMonitor<FfmpegDiagnosticsOptions> _diagnosticsOptions;
+        private readonly FfprobeSnapshotService _ffprobeSnapshotService;
         private readonly string _rtspUrl;
+        private readonly string _redactedRtspUrl;
         private readonly string _username;
         private readonly string _password;
         private bool _isDisposed;
@@ -34,20 +38,30 @@ namespace BabyMonitarr.Backend.Services
 
         public event EventHandler<VideoFrameEventArgs>? VideoFrameReceived;
 
-        public RtspVideoReader(Room room, ILogger logger)
+        public RtspVideoReader(
+            Room room,
+            ILogger<RtspVideoReader> logger,
+            IOptionsMonitor<FfmpegDiagnosticsOptions> diagnosticsOptions,
+            FfprobeSnapshotService ffprobeSnapshotService)
         {
             _room = room;
             _logger = logger;
+            _diagnosticsOptions = diagnosticsOptions;
+            _ffprobeSnapshotService = ffprobeSnapshotService;
             _rtspUrl = room.CameraStreamUrl ?? string.Empty;
+            _redactedRtspUrl = RtspDiagnostics.RedactRtspUrl(_rtspUrl);
             _username = room.CameraUsername ?? string.Empty;
             _password = room.CameraPassword ?? string.Empty;
 
-            FFmpegLibraryLoader.EnsureInitialized(_logger);
+            FFmpegLibraryLoader.EnsureInitialized(_logger, _diagnosticsOptions.CurrentValue);
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Starting RTSP video reader for room {RoomId}: {Url}", _room.Id, _rtspUrl);
+            _logger.LogInformation(
+                "Starting RTSP video reader for room {RoomId}: {Url}",
+                _room.Id,
+                _redactedRtspUrl);
 
             if (string.IsNullOrEmpty(_rtspUrl))
             {
@@ -100,26 +114,35 @@ namespace BabyMonitarr.Backend.Services
 
         private unsafe void ProcessRtspStream(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Connecting to RTSP video stream for room {RoomId}: {Url}", _room.Id, _rtspUrl);
+            FfmpegDiagnosticsOptions diagnostics = _diagnosticsOptions.CurrentValue;
+
+            _logger.LogInformation(
+                "Connecting to RTSP video stream for room {RoomId}: {Url}. Diagnostics enabled: {DiagnosticsEnabled}",
+                _room.Id,
+                _redactedRtspUrl,
+                diagnostics.Enabled);
 
             AVFormatContext* formatContext = null;
             AVCodecContext* codecContext = null;
             SwsContext* swsContext = null;
+            AVDictionary* options = null;
+            AVPacket* packet = null;
+            AVFrame* frame = null;
+            AVFrame* i420Frame = null;
             int videoStreamIndex = -1;
+
+            RtspStatsAccumulator? stats = diagnostics.Enabled && diagnostics.LogFrameStats
+                ? new RtspStatsAccumulator(diagnostics.FrameStatsInterval)
+                : null;
 
             try
             {
                 formatContext = ffmpeg.avformat_alloc_context();
-
-                // Suppress noisy log messages
-                av_log_set_callback_callback logCallback = (p1, level, format, vl) =>
+                if (formatContext == null)
                 {
-                    if (level > ffmpeg.AV_LOG_ERROR) return;
-                    ffmpeg.av_log_default_callback(p1, level, format, vl);
-                };
-                ffmpeg.av_log_set_callback(logCallback);
+                    throw new InvalidOperationException("Could not allocate FFmpeg format context for RTSP video stream");
+                }
 
-                AVDictionary* options = null;
                 ffmpeg.av_dict_set(&options, "rtsp_transport", "tcp", 0);
                 ffmpeg.av_dict_set(&options, "fflags", "nobuffer", 0);
                 ffmpeg.av_dict_set(&options, "flags", "low_delay", 0);
@@ -133,18 +156,73 @@ namespace BabyMonitarr.Backend.Services
                     ffmpeg.av_dict_set(&options, "password", _password, 0);
                 }
 
+                if (diagnostics.Enabled && diagnostics.LogRtspOptions)
+                {
+                    _logger.LogDebug(
+                        "RTSP video options for room {RoomId}: {Options}",
+                        _room.Id,
+                        RtspDiagnostics.FormatDictionary(options));
+                }
+
                 int ret = ffmpeg.avformat_open_input(&formatContext, _rtspUrl, null, &options);
+
+                if (diagnostics.Enabled && diagnostics.LogRtspOptions)
+                {
+                    _logger.LogDebug(
+                        "Remaining FFmpeg options after avformat_open_input for room {RoomId}: {Options}",
+                        _room.Id,
+                        RtspDiagnostics.FormatDictionary(options));
+                }
+
                 if (ret < 0)
                 {
-                    byte* errorBuf = stackalloc byte[1024];
-                    ffmpeg.av_strerror(ret, errorBuf, 1024);
-                    throw new Exception($"Could not open RTSP stream: {Marshal.PtrToStringAnsi((IntPtr)errorBuf)}");
+                    string ffmpegError = RtspDiagnostics.GetFfmpegError(ret);
+                    _logger.LogError(
+                        "avformat_open_input failed for RTSP video in room {RoomId}. URL={Url}, Error={Error}, Code={ErrorCode}",
+                        _room.Id,
+                        _redactedRtspUrl,
+                        ffmpegError,
+                        ret);
+
+                    _ffprobeSnapshotService.CaptureIfEnabled(
+                        _room.Id,
+                        "video",
+                        _rtspUrl,
+                        "avformat_open_input",
+                        cancellationToken);
+
+                    throw new Exception($"Could not open RTSP stream: {ffmpegError}");
                 }
 
                 ret = ffmpeg.avformat_find_stream_info(formatContext, null);
                 if (ret < 0)
                 {
-                    throw new Exception("Could not find stream information");
+                    string ffmpegError = RtspDiagnostics.GetFfmpegError(ret);
+                    _logger.LogError(
+                        "avformat_find_stream_info failed for RTSP video in room {RoomId}. Error={Error}, Code={ErrorCode}",
+                        _room.Id,
+                        ffmpegError,
+                        ret);
+
+                    _ffprobeSnapshotService.CaptureIfEnabled(
+                        _room.Id,
+                        "video",
+                        _rtspUrl,
+                        "avformat_find_stream_info",
+                        cancellationToken);
+
+                    throw new Exception($"Could not find stream information: {ffmpegError}");
+                }
+
+                if (diagnostics.Enabled && diagnostics.LogStreamMetadata)
+                {
+                    for (int i = 0; i < formatContext->nb_streams; i++)
+                    {
+                        _logger.LogDebug(
+                            "FFmpeg stream metadata for room {RoomId}: {Metadata}",
+                            _room.Id,
+                            RtspDiagnostics.FormatStreamMetadata(formatContext, i));
+                    }
                 }
 
                 // Find video stream
@@ -159,6 +237,12 @@ namespace BabyMonitarr.Backend.Services
 
                 if (videoStreamIndex == -1)
                 {
+                    _ffprobeSnapshotService.CaptureIfEnabled(
+                        _room.Id,
+                        "video",
+                        _rtspUrl,
+                        "find_video_stream",
+                        cancellationToken);
                     throw new Exception("Could not find video stream in RTSP feed");
                 }
 
@@ -170,10 +254,15 @@ namespace BabyMonitarr.Backend.Services
                 }
 
                 codecContext = ffmpeg.avcodec_alloc_context3(codec);
+                if (codecContext == null)
+                {
+                    throw new InvalidOperationException("Could not allocate FFmpeg codec context for RTSP video stream");
+                }
+
                 ret = ffmpeg.avcodec_parameters_to_context(codecContext, codecParams);
                 if (ret < 0)
                 {
-                    throw new Exception("Failed to copy codec parameters to context");
+                    throw new Exception($"Failed to copy codec parameters to context: {RtspDiagnostics.GetFfmpegError(ret)}");
                 }
 
                 codecContext->err_recognition = 0;
@@ -182,15 +271,13 @@ namespace BabyMonitarr.Backend.Services
                 ret = ffmpeg.avcodec_open2(codecContext, codec, null);
                 if (ret < 0)
                 {
-                    throw new Exception("Failed to open video codec");
+                    throw new Exception($"Failed to open video codec: {RtspDiagnostics.GetFfmpegError(ret)}");
                 }
 
                 int srcWidth = codecContext->width;
                 int srcHeight = codecContext->height;
                 AVPixelFormat srcPixFmt = codecContext->pix_fmt;
 
-                // Fallback: some FFmpeg builds (e.g. Jellyfin) may not populate
-                // codec context dimensions for certain codecs. Read from codecpar instead.
                 if (srcWidth <= 0 || srcHeight <= 0)
                 {
                     srcWidth = codecParams->width;
@@ -203,14 +290,12 @@ namespace BabyMonitarr.Backend.Services
                         $"Invalid video dimensions: {srcWidth}x{srcHeight} (codec={codec->id}, format={srcPixFmt})");
                 }
 
-                // Calculate output dimensions maintaining aspect ratio, capped at MaxWidth x MaxHeight
                 int dstWidth, dstHeight;
                 CalculateScaledDimensions(srcWidth, srcHeight, out dstWidth, out dstHeight);
 
                 _logger.LogInformation("Video stream found for room {RoomId}: {SrcW}x{SrcH} -> {DstW}x{DstH}, format={Fmt}",
                     _room.Id, srcWidth, srcHeight, dstWidth, dstHeight, srcPixFmt);
 
-                // Create scaler context to convert to I420 (YUV420P) at target resolution
                 swsContext = ffmpeg.sws_getContext(
                     srcWidth, srcHeight, srcPixFmt,
                     dstWidth, dstHeight, AVPixelFormat.AV_PIX_FMT_YUV420P,
@@ -221,21 +306,23 @@ namespace BabyMonitarr.Backend.Services
                     throw new Exception("Could not create sws scaling context");
                 }
 
-                AVPacket* packet = ffmpeg.av_packet_alloc();
-                AVFrame* frame = ffmpeg.av_frame_alloc();
-                AVFrame* i420Frame = ffmpeg.av_frame_alloc();
+                packet = ffmpeg.av_packet_alloc();
+                frame = ffmpeg.av_frame_alloc();
+                i420Frame = ffmpeg.av_frame_alloc();
+                if (packet == null || frame == null || i420Frame == null)
+                {
+                    throw new InvalidOperationException("Could not allocate FFmpeg packet/frame buffers for RTSP video stream");
+                }
 
-                // Allocate I420 output frame buffer
                 i420Frame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
                 i420Frame->width = dstWidth;
                 i420Frame->height = dstHeight;
                 ret = ffmpeg.av_frame_get_buffer(i420Frame, 32);
                 if (ret < 0)
                 {
-                    throw new Exception("Could not allocate I420 frame buffer");
+                    throw new Exception($"Could not allocate I420 frame buffer: {RtspDiagnostics.GetFfmpegError(ret)}");
                 }
 
-                // Frame rate limiting
                 AVRational timeBase = formatContext->streams[videoStreamIndex]->time_base;
                 long minPtsInterval = (long)(timeBase.den / (timeBase.num * TargetFps));
                 long lastEmittedPts = long.MinValue;
@@ -251,15 +338,17 @@ namespace BabyMonitarr.Backend.Services
                         }
                         else
                         {
-                            byte* errorBuf = stackalloc byte[1024];
-                            ffmpeg.av_strerror(ret, errorBuf, 1024);
+                            stats?.RecordReadError();
                             _logger.LogWarning("Error reading video frame for room {RoomId}: {Error}",
-                                _room.Id, Marshal.PtrToStringAnsi((IntPtr)errorBuf));
+                                _room.Id, RtspDiagnostics.GetFfmpegError(ret));
                         }
                         break;
                     }
 
-                    if (packet->stream_index != videoStreamIndex)
+                    bool isVideoPacket = packet->stream_index == videoStreamIndex;
+                    stats?.RecordPacket(isVideoPacket);
+
+                    if (!isVideoPacket)
                     {
                         ffmpeg.av_packet_unref(packet);
                         continue;
@@ -268,7 +357,20 @@ namespace BabyMonitarr.Backend.Services
                     ret = ffmpeg.avcodec_send_packet(codecContext, packet);
                     ffmpeg.av_packet_unref(packet);
 
-                    if (ret < 0) continue;
+                    if (ret < 0)
+                    {
+                        stats?.RecordSendPacketError();
+
+                        if (diagnostics.Enabled)
+                        {
+                            _logger.LogDebug(
+                                "avcodec_send_packet failed for RTSP video room {RoomId}: {Error}",
+                                _room.Id,
+                                RtspDiagnostics.GetFfmpegError(ret));
+                        }
+
+                        continue;
+                    }
 
                     while (true)
                     {
@@ -279,11 +381,14 @@ namespace BabyMonitarr.Backend.Services
                         }
                         else if (ret < 0)
                         {
-                            _logger.LogWarning("Error receiving video frame for room {RoomId}", _room.Id);
+                            stats?.RecordReceiveFrameError();
+                            _logger.LogWarning(
+                                "avcodec_receive_frame failed for RTSP video room {RoomId}: {Error}",
+                                _room.Id,
+                                RtspDiagnostics.GetFfmpegError(ret));
                             break;
                         }
 
-                        // Frame rate limiting: skip frames to maintain target FPS
                         long pts = frame->best_effort_timestamp;
                         if (pts != ffmpeg.AV_NOPTS_VALUE && lastEmittedPts != long.MinValue)
                         {
@@ -296,7 +401,6 @@ namespace BabyMonitarr.Backend.Services
                         }
                         lastEmittedPts = pts;
 
-                        // Convert to I420 at target resolution
                         ffmpeg.sws_scale(swsContext,
                             frame->data, frame->linesize, 0, frame->height,
                             i420Frame->data, i420Frame->linesize);
@@ -304,10 +408,17 @@ namespace BabyMonitarr.Backend.Services
                         EmitVideoFrame(i420Frame, dstWidth, dstHeight, pts, timeBase);
 
                         ffmpeg.av_frame_unref(frame);
+
+                        if (stats != null && diagnostics.Enabled && diagnostics.LogFrameStats && stats.ShouldLog())
+                        {
+                            _logger.LogDebug(
+                                "RTSP video decode stats for room {RoomId}: {Stats}",
+                                _room.Id,
+                                stats.BuildSummary());
+                        }
                     }
                 }
 
-                // Flush decoder
                 ffmpeg.avcodec_send_packet(codecContext, null);
                 while (true)
                 {
@@ -315,13 +426,29 @@ namespace BabyMonitarr.Backend.Services
                     if (ret < 0) break;
                     ffmpeg.av_frame_unref(frame);
                 }
-
-                ffmpeg.av_frame_free(&i420Frame);
-                ffmpeg.av_frame_free(&frame);
-                ffmpeg.av_packet_free(&packet);
             }
             finally
             {
+                if (options != null)
+                {
+                    ffmpeg.av_dict_free(&options);
+                }
+
+                if (i420Frame != null)
+                {
+                    ffmpeg.av_frame_free(&i420Frame);
+                }
+
+                if (frame != null)
+                {
+                    ffmpeg.av_frame_free(&frame);
+                }
+
+                if (packet != null)
+                {
+                    ffmpeg.av_packet_free(&packet);
+                }
+
                 if (swsContext != null)
                 {
                     ffmpeg.sws_freeContext(swsContext);

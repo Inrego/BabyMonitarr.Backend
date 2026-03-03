@@ -94,6 +94,31 @@ dotnet run
 
 All settings are managed through the web UI — no config files to edit.
 
+### Docker RTSP/FFmpeg Debug Mode
+
+If RTSP streams fail in Docker, you can enable deep FFmpeg diagnostics without rebuilding:
+
+```bash
+docker run -d \
+  --name babymonitarr \
+  -p 8080:8080 \
+  -v babymonitarr-data:/app/data \
+  -e FFmpegDiagnostics__Enabled=true \
+  -e FFmpegDiagnostics__NativeLogLevel=trace \
+  -e Logging__LogLevel__BabyMonitarr.Backend.Services.RtspAudioReader=Debug \
+  -e Logging__LogLevel__BabyMonitarr.Backend.Services.RtspVideoReader=Debug \
+  -e Logging__LogLevel__BabyMonitarr.Backend.Services.FFmpegLibraryLoader=Debug \
+  ghcr.io/inrego/babymonitarr:latest
+```
+
+Optional overrides:
+
+- `FFmpegDiagnostics__RunFfprobeOnOpenFailure=true` (default) to capture `ffprobe` output when stream open fails.
+- `FFmpegDiagnostics__FfprobePath=/usr/lib/jellyfin-ffmpeg/ffprobe` if `ffprobe` is not found on `PATH`.
+- `FFmpegDiagnostics__FfprobeTimeoutSeconds=8` to adjust probe timeout.
+
+Credentials in RTSP URLs are automatically redacted in application logs.
+
 ### Adding a Monitor
 
 1. Open the **Monitors** page

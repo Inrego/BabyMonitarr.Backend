@@ -32,11 +32,15 @@ builder.Services.AddCors(options =>
 builder.Services.AddDbContext<BabyMonitarrDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
 
+builder.Services.Configure<FfmpegDiagnosticsOptions>(
+    builder.Configuration.GetSection("FFmpegDiagnostics"));
+
 // Register services
 builder.Services.AddHttpClient();
 builder.Services.AddScoped<IRoomService, RoomService>();
 builder.Services.AddScoped<IGoogleNestAuthService, GoogleNestAuthService>();
 builder.Services.AddScoped<IGoogleNestDeviceService, GoogleNestDeviceService>();
+builder.Services.AddSingleton<FfprobeSnapshotService>();
 builder.Services.AddSingleton<NestStreamReaderManager>();
 builder.Services.AddSingleton<IAudioStreamingService, AudioStreamingService>();
 builder.Services.AddHostedService(sp => (AudioStreamingService)sp.GetRequiredService<IAudioStreamingService>());

@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using BabyMonitarr.Backend.Models;
 using FFmpeg.AutoGen;
 using Microsoft.Extensions.Logging;
 
@@ -11,6 +12,7 @@ namespace BabyMonitarr.Backend.Services
         private static readonly object Sync = new();
         private static bool _isInitialized;
         private static Exception? _initializationException;
+        private static int _nativeLogLevel = ffmpeg.AV_LOG_WARNING;
 
         private static readonly string[] LinuxLibraryPaths =
         {
@@ -22,10 +24,13 @@ namespace BabyMonitarr.Backend.Services
             "/usr/lib"
         };
 
-        public static void EnsureInitialized(ILogger logger)
+        public static void EnsureInitialized(ILogger logger, FfmpegDiagnosticsOptions? diagnosticsOptions = null)
         {
+            diagnosticsOptions ??= new FfmpegDiagnosticsOptions();
+
             if (_isInitialized)
             {
+                ApplyNativeLogLevel(logger, diagnosticsOptions);
                 return;
             }
 
@@ -33,6 +38,7 @@ namespace BabyMonitarr.Backend.Services
             {
                 if (_isInitialized)
                 {
+                    ApplyNativeLogLevel(logger, diagnosticsOptions);
                     return;
                 }
 
@@ -56,7 +62,7 @@ namespace BabyMonitarr.Backend.Services
                     try
                     {
                         ffmpegVersion = ffmpeg.av_version_info();
-                        ffmpeg.av_log_set_level(ffmpeg.AV_LOG_WARNING);
+                        ApplyNativeLogLevel(logger, diagnosticsOptions);
                     }
                     catch (NotSupportedException ex)
                     {
@@ -65,9 +71,10 @@ namespace BabyMonitarr.Backend.Services
 
                     _isInitialized = true;
                     logger.LogInformation(
-                        "FFmpeg initialized. Version: {FFmpegVersion}. Root path: {FFmpegPath}",
+                        "FFmpeg initialized. Version: {FFmpegVersion}. Root path: {FFmpegPath}. Native log level: {NativeLogLevel}",
                         ffmpegVersion,
-                        ffmpegPath);
+                        ffmpegPath,
+                        NativeLogLevelToName(_nativeLogLevel));
                 }
                 catch (Exception ex)
                 {
@@ -81,12 +88,71 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
+        private static void ApplyNativeLogLevel(ILogger logger, FfmpegDiagnosticsOptions diagnosticsOptions)
+        {
+            int desiredLevel = diagnosticsOptions.Enabled
+                ? ParseNativeLogLevel(diagnosticsOptions.NativeLogLevel, logger)
+                : ffmpeg.AV_LOG_WARNING;
+
+            if (_nativeLogLevel == desiredLevel)
+            {
+                return;
+            }
+
+            ffmpeg.av_log_set_level(desiredLevel);
+            _nativeLogLevel = desiredLevel;
+
+            logger.LogInformation(
+                "Configured FFmpeg native log level to {NativeLogLevel} (diagnostics enabled: {DiagnosticsEnabled})",
+                NativeLogLevelToName(desiredLevel),
+                diagnosticsOptions.Enabled);
+        }
+
+        private static int ParseNativeLogLevel(string? configuredLevel, ILogger logger)
+        {
+            if (string.IsNullOrWhiteSpace(configuredLevel))
+            {
+                return ffmpeg.AV_LOG_WARNING;
+            }
+
+            if (configuredLevel.Equals("quiet", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_QUIET;
+            if (configuredLevel.Equals("panic", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_PANIC;
+            if (configuredLevel.Equals("fatal", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_FATAL;
+            if (configuredLevel.Equals("error", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_ERROR;
+            if (configuredLevel.Equals("warning", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_WARNING;
+            if (configuredLevel.Equals("info", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_INFO;
+            if (configuredLevel.Equals("verbose", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_VERBOSE;
+            if (configuredLevel.Equals("debug", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_DEBUG;
+            if (configuredLevel.Equals("trace", StringComparison.OrdinalIgnoreCase)) return ffmpeg.AV_LOG_TRACE;
+
+            logger.LogWarning(
+                "Unsupported FFmpegDiagnostics.NativeLogLevel value '{ConfiguredLevel}'. Falling back to 'warning'.",
+                configuredLevel);
+            return ffmpeg.AV_LOG_WARNING;
+        }
+
+        private static string NativeLogLevelToName(int nativeLogLevel)
+        {
+            if (nativeLogLevel == ffmpeg.AV_LOG_QUIET) return "quiet";
+            if (nativeLogLevel == ffmpeg.AV_LOG_PANIC) return "panic";
+            if (nativeLogLevel == ffmpeg.AV_LOG_FATAL) return "fatal";
+            if (nativeLogLevel == ffmpeg.AV_LOG_ERROR) return "error";
+            if (nativeLogLevel == ffmpeg.AV_LOG_WARNING) return "warning";
+            if (nativeLogLevel == ffmpeg.AV_LOG_INFO) return "info";
+            if (nativeLogLevel == ffmpeg.AV_LOG_VERBOSE) return "verbose";
+            if (nativeLogLevel == ffmpeg.AV_LOG_DEBUG) return "debug";
+            if (nativeLogLevel == ffmpeg.AV_LOG_TRACE) return "trace";
+
+            return nativeLogLevel.ToString();
+        }
+
         private static string ResolveRootPath(ILogger logger)
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 string appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? string.Empty;
                 string ffmpegPath = Path.Combine(appPath, "FFmpeg");
+                logger.LogDebug("Resolving FFmpeg path on Windows from '{AppPath}'", appPath);
 
                 if (!Directory.Exists(ffmpegPath))
                 {
@@ -102,6 +168,7 @@ namespace BabyMonitarr.Backend.Services
             {
                 if (Directory.Exists(envPath))
                 {
+                    logger.LogDebug("Resolved FFmpeg path from FFMPEG_LIB_PATH: {FfmpegPath}", envPath);
                     return envPath;
                 }
 
@@ -113,6 +180,7 @@ namespace BabyMonitarr.Backend.Services
             string? detectedPath = LinuxLibraryPaths.FirstOrDefault(Directory.Exists);
             if (detectedPath != null)
             {
+                logger.LogDebug("Resolved FFmpeg path from known Linux paths: {FfmpegPath}", detectedPath);
                 return detectedPath;
             }
 

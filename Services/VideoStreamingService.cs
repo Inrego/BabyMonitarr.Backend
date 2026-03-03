@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using BabyMonitarr.Backend.Models;
 
 namespace BabyMonitarr.Backend.Services
@@ -21,6 +22,9 @@ namespace BabyMonitarr.Backend.Services
         private readonly ILogger<VideoStreamingService> _logger;
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly NestStreamReaderManager _nestReaderManager;
+        private readonly ILoggerFactory _loggerFactory;
+        private readonly IOptionsMonitor<FfmpegDiagnosticsOptions> _diagnosticsOptions;
+        private readonly FfprobeSnapshotService _ffprobeSnapshotService;
         private readonly ConcurrentDictionary<int, IDisposable> _readers = new();
         private readonly ConcurrentDictionary<int, ConcurrentBag<Action<VideoFrameEventArgs>>> _subscribers = new();
         private readonly ConcurrentDictionary<int, Room> _roomCache = new();
@@ -30,11 +34,17 @@ namespace BabyMonitarr.Backend.Services
         public VideoStreamingService(
             ILogger<VideoStreamingService> logger,
             IServiceScopeFactory scopeFactory,
-            NestStreamReaderManager nestReaderManager)
+            NestStreamReaderManager nestReaderManager,
+            ILoggerFactory loggerFactory,
+            IOptionsMonitor<FfmpegDiagnosticsOptions> diagnosticsOptions,
+            FfprobeSnapshotService ffprobeSnapshotService)
         {
             _logger = logger;
             _scopeFactory = scopeFactory;
             _nestReaderManager = nestReaderManager;
+            _loggerFactory = loggerFactory;
+            _diagnosticsOptions = diagnosticsOptions;
+            _ffprobeSnapshotService = ffprobeSnapshotService;
         }
 
         public async Task StartAsync(CancellationToken ct)
@@ -217,7 +227,12 @@ namespace BabyMonitarr.Backend.Services
                 else
                 {
                     // RTSP: existing behavior
-                    var reader = new RtspVideoReader(room, _logger);
+                    var readerLogger = _loggerFactory.CreateLogger<RtspVideoReader>();
+                    var reader = new RtspVideoReader(
+                        room,
+                        readerLogger,
+                        _diagnosticsOptions,
+                        _ffprobeSnapshotService);
                     reader.VideoFrameReceived += OnVideoFrameReceived;
 
                     if (_readers.TryAdd(room.Id, reader))
