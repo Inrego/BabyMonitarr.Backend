@@ -119,6 +119,27 @@ Optional overrides:
 
 Credentials in RTSP URLs are automatically redacted in application logs.
 
+### Frontend WebRTC Playback Diagnostics (Dashboard)
+
+If playback fails in Docker but works locally, you can enable detailed browser-side WebRTC diagnostics on the Dashboard:
+
+1. Open Dashboard with `?webrtcDebug=1` (for example, `http://localhost:8080/Home/Dashboard?webrtcDebug=1`)
+2. Reproduce the playback issue
+3. Open browser DevTools Console and collect log lines prefixed with `[BM-DIAG]`
+
+What this enables:
+
+- Detailed SignalR signaling logs (`StartAudioStream`, `StartVideoStream`, SDP/ICE exchange timings)
+- WebRTC state transitions (`connectionState`, `iceConnectionState`, `iceGatheringState`, `signalingState`)
+- Media element lifecycle events (`playing`, `waiting`, `stalled`, `error`, etc.)
+- Failure snapshots from `RTCPeerConnection.getStats()` (candidate pair info, RTP counters, bitrate/RTT where available)
+
+Notes:
+
+- This diagnostics mode is currently implemented for the **Dashboard** playback flow.
+- The toggle is persisted in `localStorage` (`babymonitarr.webrtcDebug=1`) until you disable it.
+- Disable again with `?webrtcDebug=0` (or clear that `localStorage` key).
+
 ### Adding a Monitor
 
 1. Open the **Monitors** page
