@@ -79,6 +79,40 @@ volumes:
   babymonitarr-data:
 ```
 
+### Docker Compose Behind Reverse Proxy (Caddy/Nginx/Traefik)
+
+SignalR/WebSocket signaling can run through your reverse proxy, but WebRTC media still needs direct UDP reachability.
+Even on LAN, audio/video packets are negotiated over ICE and will fail if no UDP media ports are reachable.
+
+Example (keep proxy networking, add only UDP media port mapping):
+
+```yaml
+services:
+  babymonitarr:
+    image: ghcr.io/inrego/babymonitarr:latest
+    container_name: babymonitarr
+    networks:
+      - web
+    ports:
+      - "40000-40099:40000-40099/udp"
+    environment:
+      - WebRtc__InferAdvertisedAddressFromForwardedHost=true
+      - WebRtc__RtpPortRange__Start=40000
+      - WebRtc__RtpPortRange__End=40099
+      - WebRtc__RtpPortRange__Shuffle=true
+    volumes:
+      - /docker-volumes/babymonitarr:/app/data
+    restart: unless-stopped
+
+networks:
+  web:
+    external: true
+```
+
+Optional override when forwarded-host inference resolves to the wrong address:
+
+- `WebRtc__AdvertisedAddress=192.168.x.x` (LAN IP) or your public IP/FQDN target.
+
 ### Build from Source
 
 Requires [.NET 9 SDK](https://dotnet.microsoft.com/download/dotnet/9.0) and FFmpeg.
@@ -116,6 +150,9 @@ Optional overrides:
 - `FFmpegDiagnostics__RunFfprobeOnOpenFailure=true` (default) to capture `ffprobe` output when stream open fails.
 - `FFmpegDiagnostics__FfprobePath=/usr/lib/jellyfin-ffmpeg/ffprobe` if `ffprobe` is not found on `PATH`.
 - `FFmpegDiagnostics__FfprobeTimeoutSeconds=8` to adjust probe timeout.
+- `WebRtc__AdvertisedAddress=<host-or-ip>` to force the ICE host candidate address.
+- `WebRtc__InferAdvertisedAddressFromForwardedHost=true|false` to infer from reverse-proxy host headers.
+- `WebRtc__RtpPortRange__Start=40000` and `WebRtc__RtpPortRange__End=40099` for deterministic UDP media ports.
 
 Credentials in RTSP URLs are automatically redacted in application logs.
 

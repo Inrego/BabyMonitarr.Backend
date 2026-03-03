@@ -34,6 +34,8 @@ builder.Services.AddDbContext<BabyMonitarrDbContext>(options =>
 
 builder.Services.Configure<FfmpegDiagnosticsOptions>(
     builder.Configuration.GetSection("FFmpegDiagnostics"));
+builder.Services.Configure<WebRtcOptions>(
+    builder.Configuration.GetSection("WebRtc"));
 
 // Register services
 builder.Services.AddHttpClient();
@@ -42,6 +44,7 @@ builder.Services.AddScoped<IGoogleNestAuthService, GoogleNestAuthService>();
 builder.Services.AddScoped<IGoogleNestDeviceService, GoogleNestDeviceService>();
 builder.Services.AddSingleton<FfprobeSnapshotService>();
 builder.Services.AddSingleton<NestStreamReaderManager>();
+builder.Services.AddSingleton<IWebRtcConfigService, WebRtcConfigService>();
 builder.Services.AddSingleton<IAudioStreamingService, AudioStreamingService>();
 builder.Services.AddHostedService(sp => (AudioStreamingService)sp.GetRequiredService<IAudioStreamingService>());
 builder.Services.AddSingleton<IAudioWebRtcService, AudioWebRtcService>();

@@ -11,7 +11,7 @@ namespace BabyMonitarr.Backend.Services
 {
     public interface IVideoWebRtcService
     {
-        Task<string> CreateVideoPeerConnection(string peerId, int roomId);
+        Task<string> CreateVideoPeerConnection(string peerId, int roomId, string? hostHint);
         Task SetVideoRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc);
         Task AddVideoIceCandidate(string peerId, int roomId, RTCIceCandidateInit candidate);
         Task CloseVideoPeerConnection(string peerId, int roomId);
@@ -23,6 +23,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly ILogger<VideoWebRtcService> _logger;
         private readonly IVideoStreamingService _videoStreamingService;
         private readonly IHubContext<AudioStreamHub> _hubContext;
+        private readonly IWebRtcConfigService _webRtcConfigService;
 
         // Peer connections keyed by "{peerId}_v_{roomId}"
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = new();
@@ -38,16 +39,18 @@ namespace BabyMonitarr.Backend.Services
         public VideoWebRtcService(
             ILogger<VideoWebRtcService> logger,
             IVideoStreamingService videoStreamingService,
-            IHubContext<AudioStreamHub> hubContext)
+            IHubContext<AudioStreamHub> hubContext,
+            IWebRtcConfigService webRtcConfigService)
         {
             _logger = logger;
             _videoStreamingService = videoStreamingService;
             _hubContext = hubContext;
+            _webRtcConfigService = webRtcConfigService;
         }
 
         private static string GetConnectionKey(string peerId, int roomId) => $"{peerId}_v_{roomId}";
 
-        public async Task<string> CreateVideoPeerConnection(string peerId, int roomId)
+        public async Task<string> CreateVideoPeerConnection(string peerId, int roomId, string? hostHint)
         {
             string key = GetConnectionKey(peerId, roomId);
 
@@ -59,30 +62,40 @@ namespace BabyMonitarr.Backend.Services
 
             _logger.LogInformation("Creating video WebRTC peer connection for peer {PeerId}, room {RoomId}", peerId, roomId);
 
-            var config = new RTCConfiguration
-            {
-                iceServers = new List<RTCIceServer>
-                {
-                    new RTCIceServer { urls = "stun:stun.l.google.com:19302" }
-                },
-                bundlePolicy = RTCBundlePolicy.max_bundle,
-                rtcpMuxPolicy = RTCRtcpMuxPolicy.require
-            };
-
-            var pc = new RTCPeerConnection(config);
+            var settings = _webRtcConfigService.GetPeerConnectionSettings(hostHint);
+            var advertisedAddress = settings.AdvertisedAddress;
+            var pc = new RTCPeerConnection(settings.Configuration, settings.BindPort, settings.PortRange, false);
 
             // ICE candidate handler - send to client via SignalR
             pc.onicecandidate += (candidate) =>
             {
                 if (candidate != null)
                 {
-                    _ = _hubContext.Clients.Client(peerId).SendAsync(
-                        "ReceiveVideoIceCandidate",
-                        roomId,
-                        candidate.candidate,
-                        candidate.sdpMid ?? string.Empty,
-                        candidate.sdpMLineIndex);
+                    _ = SendVideoIceCandidate(peerId, roomId, candidate);
+
+                    var advertisedCandidate = _webRtcConfigService.CreateAdvertisedCandidate(candidate, advertisedAddress);
+                    if (advertisedCandidate != null)
+                    {
+                        _logger.LogDebug(
+                            "Sending mapped video ICE candidate for {Key}: {SourceAddress}:{SourcePort} -> {MappedAddress}:{MappedPort}",
+                            key,
+                            candidate.address,
+                            candidate.port,
+                            advertisedCandidate.address,
+                            advertisedCandidate.port);
+
+                        _ = SendVideoIceCandidate(peerId, roomId, advertisedCandidate);
+                    }
                 }
+            };
+
+            pc.onicecandidateerror += (candidate, error) =>
+            {
+                _logger.LogWarning(
+                    "Video ICE candidate error for {Key}. Error={Error}, Candidate={Candidate}",
+                    key,
+                    error,
+                    candidate?.candidate);
             };
 
             // Connection state handler
@@ -284,6 +297,16 @@ namespace BabyMonitarr.Backend.Services
             {
                 _logger.LogDebug("Error encoding/sending video to peer {Key}: {Error}", key, ex.Message);
             }
+        }
+
+        private Task SendVideoIceCandidate(string peerId, int roomId, RTCIceCandidate candidate)
+        {
+            return _hubContext.Clients.Client(peerId).SendAsync(
+                "ReceiveVideoIceCandidate",
+                roomId,
+                candidate.candidate,
+                candidate.sdpMid ?? string.Empty,
+                candidate.sdpMLineIndex);
         }
 
         public void Dispose()

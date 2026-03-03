@@ -18,6 +18,7 @@ public class AudioStreamHub : Hub
     private readonly IVideoStreamingService _videoStreamingService;
     private readonly IGoogleNestAuthService _nestAuthService;
     private readonly IGoogleNestDeviceService _nestDeviceService;
+    private readonly IWebRtcConfigService _webRtcConfigService;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
@@ -27,7 +28,8 @@ public class AudioStreamHub : Hub
         IVideoWebRtcService videoWebRtcService,
         IVideoStreamingService videoStreamingService,
         IGoogleNestAuthService nestAuthService,
-        IGoogleNestDeviceService nestDeviceService)
+        IGoogleNestDeviceService nestDeviceService,
+        IWebRtcConfigService webRtcConfigService)
     {
         _logger = logger;
         _audioWebRtcService = audioWebRtcService;
@@ -37,6 +39,7 @@ public class AudioStreamHub : Hub
         _videoStreamingService = videoStreamingService;
         _nestAuthService = nestAuthService;
         _nestDeviceService = nestDeviceService;
+        _webRtcConfigService = webRtcConfigService;
     }
 
     public override async Task OnConnectedAsync()
@@ -64,7 +67,10 @@ public class AudioStreamHub : Hub
         _logger.LogInformation("Client {ConnectionId} requested audio stream for room {RoomId}",
             Context.ConnectionId, roomId);
 
-        var offerSdp = await _audioWebRtcService.CreateAudioPeerConnection(Context.ConnectionId, roomId);
+        var offerSdp = await _audioWebRtcService.CreateAudioPeerConnection(
+            Context.ConnectionId,
+            roomId,
+            GetRequestHostHint());
         return offerSdp;
     }
 
@@ -108,7 +114,10 @@ public class AudioStreamHub : Hub
         _logger.LogInformation("Client {ConnectionId} requested video stream for room {RoomId}",
             Context.ConnectionId, roomId);
 
-        var offerSdp = await _videoWebRtcService.CreateVideoPeerConnection(Context.ConnectionId, roomId);
+        var offerSdp = await _videoWebRtcService.CreateVideoPeerConnection(
+            Context.ConnectionId,
+            roomId,
+            GetRequestHostHint());
         return offerSdp;
     }
 
@@ -143,6 +152,13 @@ public class AudioStreamHub : Hub
         _logger.LogInformation("Client {ConnectionId} requested to stop video stream for room {RoomId}",
             Context.ConnectionId, roomId);
         await _videoWebRtcService.CloseVideoPeerConnection(Context.ConnectionId, roomId);
+    }
+    #endregion
+
+    #region WebRTC Config
+    public WebRtcClientConfig GetWebRtcConfig()
+    {
+        return _webRtcConfigService.GetClientConfig();
     }
     #endregion
 
@@ -253,4 +269,10 @@ public class AudioStreamHub : Hub
         return await _nestAuthService.IsLinked();
     }
     #endregion
+
+    private string? GetRequestHostHint()
+    {
+        var host = Context.GetHttpContext()?.Request.Host.Host;
+        return string.IsNullOrWhiteSpace(host) ? null : host.Trim();
+    }
 }

@@ -14,6 +14,8 @@ let audioElements = {};           // { roomId: HTMLAudioElement }
 // State
 let currentRooms = [];
 let monitoringRooms = new Set();  // roomIds this client is actively monitoring
+const DEFAULT_ICE_SERVERS = Object.freeze([{ urls: "stun:stun.l.google.com:19302" }]);
+let webrtcIceServers = DEFAULT_ICE_SERVERS.map((server) => ({ ...server }));
 
 // Diagnostics state
 const DIAG_PREFIX = "[BM-DIAG]";
@@ -66,6 +68,73 @@ function parseBooleanToggle(value) {
     if (["1", "true", "yes", "on"].includes(normalized)) return true;
     if (["0", "false", "no", "off"].includes(normalized)) return false;
     return null;
+}
+
+function normalizeIceServerEntry(entry) {
+    if (!entry || typeof entry !== "object") {
+        return null;
+    }
+
+    const urls = typeof entry.urls === "string" ? entry.urls.trim() : "";
+    if (!urls) {
+        return null;
+    }
+
+    const normalized = { urls };
+
+    if (typeof entry.username === "string" && entry.username.trim()) {
+        normalized.username = entry.username.trim();
+    }
+
+    if (typeof entry.credential === "string" && entry.credential.trim()) {
+        normalized.credential = entry.credential.trim();
+    }
+
+    return normalized;
+}
+
+function summarizeIceServers(iceServers) {
+    return iceServers.map((server) => ({
+        urls: server.urls,
+        hasUsername: !!server.username,
+        hasCredential: !!server.credential
+    }));
+}
+
+async function loadWebRtcConfig() {
+    const fallback = DEFAULT_ICE_SERVERS.map((server) => ({ ...server }));
+
+    try {
+        const config = await invokeHubWithDiagnostics("GetWebRtcConfig", [], { area: "webrtc-config" });
+        const configuredServers = Array.isArray(config?.iceServers)
+            ? config.iceServers.map(normalizeIceServerEntry).filter((server) => !!server)
+            : [];
+
+        if (configuredServers.length > 0) {
+            webrtcIceServers = configuredServers;
+            diagInfo("webrtc.config.loaded", {
+                source: "hub",
+                serverCount: configuredServers.length,
+                servers: summarizeIceServers(configuredServers)
+            });
+            return;
+        }
+
+        webrtcIceServers = fallback;
+        diagWarn("webrtc.config.fallback", {
+            reason: "missing-or-empty",
+            serverCount: webrtcIceServers.length,
+            servers: summarizeIceServers(webrtcIceServers)
+        });
+    } catch (error) {
+        webrtcIceServers = fallback;
+        diagWarn("webrtc.config.fallback", {
+            reason: "load-failed",
+            error: normalizeError(error),
+            serverCount: webrtcIceServers.length,
+            servers: summarizeIceServers(webrtcIceServers)
+        });
+    }
 }
 
 function diagInfo(event, context = {}) {
@@ -718,6 +787,7 @@ function initializeSignalRConnection() {
                 state: connection.state,
                 connectionId: connection.connectionId ?? null
             });
+            await loadWebRtcConfig();
             await loadRooms();
         })
         .catch(err => {
@@ -1018,9 +1088,7 @@ async function startVideoStream(roomId) {
         });
 
         const configuration = {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' }
-            ]
+            iceServers: webrtcIceServers
         };
 
         const pc = new RTCPeerConnection(configuration);
@@ -1277,9 +1345,7 @@ async function startAudioStream(roomId) {
         });
 
         const configuration = {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' }
-            ]
+            iceServers: webrtcIceServers
         };
 
         const pc = new RTCPeerConnection(configuration);

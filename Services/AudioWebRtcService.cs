@@ -13,7 +13,7 @@ namespace BabyMonitarr.Backend.Services
 {
     public interface IAudioWebRtcService
     {
-        Task<string> CreateAudioPeerConnection(string peerId, int roomId);
+        Task<string> CreateAudioPeerConnection(string peerId, int roomId, string? hostHint);
         Task SetAudioRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc);
         Task AddAudioIceCandidate(string peerId, int roomId, RTCIceCandidateInit candidate);
         Task CloseAudioPeerConnection(string peerId, int roomId);
@@ -25,6 +25,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly ILogger<AudioWebRtcService> _logger;
         private readonly IAudioStreamingService _audioStreamingService;
         private readonly IHubContext<AudioStreamHub> _hubContext;
+        private readonly IWebRtcConfigService _webRtcConfigService;
 
         // Peer connections keyed by "{peerId}_a_{roomId}"
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = new();
@@ -44,11 +45,13 @@ namespace BabyMonitarr.Backend.Services
         public AudioWebRtcService(
             ILogger<AudioWebRtcService> logger,
             IAudioStreamingService audioStreamingService,
-            IHubContext<AudioStreamHub> hubContext)
+            IHubContext<AudioStreamHub> hubContext,
+            IWebRtcConfigService webRtcConfigService)
         {
             _logger = logger;
             _audioStreamingService = audioStreamingService;
             _hubContext = hubContext;
+            _webRtcConfigService = webRtcConfigService;
 
             // Subscribe to sound threshold events
             _audioStreamingService.SoundThresholdExceeded += OnSoundThresholdExceeded;
@@ -56,7 +59,7 @@ namespace BabyMonitarr.Backend.Services
 
         private static string GetConnectionKey(string peerId, int roomId) => $"{peerId}_a_{roomId}";
 
-        public async Task<string> CreateAudioPeerConnection(string peerId, int roomId)
+        public async Task<string> CreateAudioPeerConnection(string peerId, int roomId, string? hostHint)
         {
             string key = GetConnectionKey(peerId, roomId);
 
@@ -68,30 +71,40 @@ namespace BabyMonitarr.Backend.Services
 
             _logger.LogInformation("Creating audio WebRTC peer connection for peer {PeerId}, room {RoomId}", peerId, roomId);
 
-            var config = new RTCConfiguration
-            {
-                iceServers = new List<RTCIceServer>
-                {
-                    new RTCIceServer { urls = "stun:stun.l.google.com:19302" }
-                },
-                bundlePolicy = RTCBundlePolicy.max_bundle,
-                rtcpMuxPolicy = RTCRtcpMuxPolicy.require
-            };
-
-            var pc = new RTCPeerConnection(config);
+            var settings = _webRtcConfigService.GetPeerConnectionSettings(hostHint);
+            var advertisedAddress = settings.AdvertisedAddress;
+            var pc = new RTCPeerConnection(settings.Configuration, settings.BindPort, settings.PortRange, false);
 
             // ICE candidate handler - send to client via SignalR
             pc.onicecandidate += (candidate) =>
             {
                 if (candidate != null)
                 {
-                    _ = _hubContext.Clients.Client(peerId).SendAsync(
-                        "ReceiveAudioIceCandidate",
-                        roomId,
-                        candidate.candidate,
-                        candidate.sdpMid ?? string.Empty,
-                        candidate.sdpMLineIndex);
+                    _ = SendAudioIceCandidate(peerId, roomId, candidate);
+
+                    var advertisedCandidate = _webRtcConfigService.CreateAdvertisedCandidate(candidate, advertisedAddress);
+                    if (advertisedCandidate != null)
+                    {
+                        _logger.LogDebug(
+                            "Sending mapped audio ICE candidate for {Key}: {SourceAddress}:{SourcePort} -> {MappedAddress}:{MappedPort}",
+                            key,
+                            candidate.address,
+                            candidate.port,
+                            advertisedCandidate.address,
+                            advertisedCandidate.port);
+
+                        _ = SendAudioIceCandidate(peerId, roomId, advertisedCandidate);
+                    }
                 }
+            };
+
+            pc.onicecandidateerror += (candidate, error) =>
+            {
+                _logger.LogWarning(
+                    "Audio ICE candidate error for {Key}. Error={Error}, Candidate={Candidate}",
+                    key,
+                    error,
+                    candidate?.candidate);
             };
 
             // Connection state handler
@@ -352,6 +365,16 @@ namespace BabyMonitarr.Backend.Services
             {
                 _logger.LogError(ex, "Error creating audio data channel for {Key}", key);
             }
+        }
+
+        private Task SendAudioIceCandidate(string peerId, int roomId, RTCIceCandidate candidate)
+        {
+            return _hubContext.Clients.Client(peerId).SendAsync(
+                "ReceiveAudioIceCandidate",
+                roomId,
+                candidate.candidate,
+                candidate.sdpMid ?? string.Empty,
+                candidate.sdpMLineIndex);
         }
 
         private void SendRawAudioToPeer(string key, byte[] rawOpusData, uint durationRtpUnits)

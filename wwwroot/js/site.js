@@ -8,6 +8,8 @@ let audioContext;
 let audioElement;
 // Queue for ICE candidates that arrive before peer connection is ready
 let pendingIceCandidates = [];
+const DEFAULT_ICE_SERVERS = Object.freeze([{ urls: "stun:stun.l.google.com:19302" }]);
+let webRtcIceServers = DEFAULT_ICE_SERVERS.map((server) => ({ ...server }));
 // Debounce timer for auto-save
 let saveDebounceTimer;
 
@@ -102,6 +104,7 @@ function initializeSignalRConnection() {
     connection.start()
         .then(async () => {
             console.log("SignalR Connected");
+            await loadWebRtcConfig();
             await loadRooms();
             await loadGlobalSettings();
 
@@ -116,6 +119,52 @@ function initializeSignalRConnection() {
             console.error(err);
             setTimeout(initializeSignalRConnection, 5000);
         });
+}
+
+function normalizeIceServerEntry(entry) {
+    if (!entry || typeof entry !== "object") {
+        return null;
+    }
+
+    const urls = typeof entry.urls === "string" ? entry.urls.trim() : "";
+    if (!urls) {
+        return null;
+    }
+
+    const normalized = { urls };
+
+    if (typeof entry.username === "string" && entry.username.trim()) {
+        normalized.username = entry.username.trim();
+    }
+
+    if (typeof entry.credential === "string" && entry.credential.trim()) {
+        normalized.credential = entry.credential.trim();
+    }
+
+    return normalized;
+}
+
+async function loadWebRtcConfig() {
+    const fallback = DEFAULT_ICE_SERVERS.map((server) => ({ ...server }));
+
+    try {
+        const config = await connection.invoke("GetWebRtcConfig");
+        const configuredServers = Array.isArray(config?.iceServers)
+            ? config.iceServers.map(normalizeIceServerEntry).filter((server) => !!server)
+            : [];
+
+        if (configuredServers.length > 0) {
+            webRtcIceServers = configuredServers;
+            console.log(`Loaded ${configuredServers.length} WebRTC ICE server entries from backend config.`);
+            return;
+        }
+
+        webRtcIceServers = fallback;
+        console.warn("No backend WebRTC ICE servers were returned. Falling back to default STUN.");
+    } catch (err) {
+        webRtcIceServers = fallback;
+        console.warn("Failed to load backend WebRTC ICE config. Falling back to default STUN.", err);
+    }
 }
 
 async function loadRooms() {
@@ -411,9 +460,7 @@ async function startWebRtcStream() {
         console.log("Got offer from server");
 
         const configuration = {
-            iceServers: [
-                { urls: 'stun:stun.l.google.com:19302' }
-            ]
+            iceServers: webRtcIceServers
         };
 
         peerConnection = new RTCPeerConnection(configuration);
