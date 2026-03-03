@@ -139,19 +139,77 @@ async function loadWebRtcConfig() {
 
 function diagInfo(event, context = {}) {
     if (!DIAG_VERBOSE) return;
-    console.info(`${DIAG_PREFIX} ${event}`, buildDiagContext(context));
+    emitDiagLog("info", event, context);
 }
 
 function diagWarn(event, context = {}) {
     if (!DIAG_VERBOSE) return;
-    console.warn(`${DIAG_PREFIX} ${event}`, buildDiagContext(context));
+    emitDiagLog("warn", event, context);
 }
 
 function diagError(event, error, context = {}) {
-    console.error(`${DIAG_PREFIX} ${event}`, buildDiagContext({
+    emitDiagLog("error", event, {
         ...context,
         error: normalizeError(error)
-    }));
+    });
+}
+
+function emitDiagLog(level, event, context = {}) {
+    const payload = buildDiagContext(context);
+    const serializedPayload = serializeDiagPayload(payload);
+    const message = `${DIAG_PREFIX} ${event} ${serializedPayload}`;
+
+    if (level === "warn") {
+        console.warn(message);
+        return;
+    }
+
+    if (level === "error") {
+        console.error(message);
+        return;
+    }
+
+    console.info(message);
+}
+
+function serializeDiagPayload(payload) {
+    try {
+        return JSON.stringify(payload, createDiagJsonReplacer());
+    } catch (error) {
+        return JSON.stringify({
+            sessionId: DIAG_SESSION_ID,
+            elapsedMs: Date.now() - DIAG_SESSION_START_MS,
+            page: "dashboard",
+            serializationError: normalizeError(error),
+            payloadType: typeof payload,
+            payloadPreview: String(payload)
+        });
+    }
+}
+
+function createDiagJsonReplacer() {
+    const seen = new WeakSet();
+
+    return function diagJsonReplacer(_key, value) {
+        if (typeof value === "bigint") return value.toString();
+        if (value instanceof Error) return normalizeError(value);
+        if (value instanceof Date) return value.toISOString();
+        if (value instanceof Set) return Array.from(value);
+        if (value instanceof Map) return Object.fromEntries(value);
+
+        if (typeof value === "function") {
+            return `[Function ${value.name || "anonymous"}]`;
+        }
+
+        if (value && typeof value === "object") {
+            if (seen.has(value)) {
+                return "[Circular]";
+            }
+            seen.add(value);
+        }
+
+        return value;
+    };
 }
 
 function buildDiagContext(context = {}) {
