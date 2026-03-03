@@ -1,20 +1,34 @@
 using System;
 using System.Runtime.InteropServices;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using BabyMonitarr.Backend.Models;
 using FFmpeg.AutoGen;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace BabyMonitarr.Backend.Services
 {
+    public enum VideoPassthroughCodec
+    {
+        H264,
+        H265,
+        VP8
+    }
+
     public class VideoFrameEventArgs : EventArgs
     {
-        public byte[] I420Data { get; set; } = Array.Empty<byte>();
-        public int Width { get; set; }
-        public int Height { get; set; }
-        public long TimestampMs { get; set; }
-        public byte[]? RawH264Data { get; set; }
+        public VideoPassthroughCodec Codec { get; set; }
+        public byte[] EncodedData { get; set; } = Array.Empty<byte>();
         public uint DurationRtpUnits { get; set; }
+        public long TimestampMs { get; set; }
+    }
+
+    public class VideoSourceInfoEventArgs : EventArgs
+    {
+        public int RoomId { get; set; }
+        public string SourceCodecName { get; set; } = string.Empty;
+        public VideoPassthroughCodec? PassthroughCodec { get; set; }
+        public string? FailureReason { get; set; }
+        public bool IsSupported => PassthroughCodec.HasValue;
     }
 
     internal class RtspVideoReader : IDisposable
@@ -32,11 +46,9 @@ namespace BabyMonitarr.Backend.Services
         private CancellationTokenSource? _cts;
         private const int MaxRetryAttempts = 3;
         private const int RetryDelayMs = 5000;
-        private const int TargetFps = 10;
-        private const int MaxWidth = 640;
-        private const int MaxHeight = 480;
 
         public event EventHandler<VideoFrameEventArgs>? VideoFrameReceived;
+        public event EventHandler<VideoSourceInfoEventArgs>? VideoSourceInfoDetected;
 
         public RtspVideoReader(
             Room room,
@@ -86,8 +98,11 @@ namespace BabyMonitarr.Backend.Services
                 {
                     if (retryCount > 0)
                     {
-                        _logger.LogInformation("Retrying RTSP video connection for room {RoomId} (attempt {Attempt} of {Max})...",
-                            _room.Id, retryCount + 1, MaxRetryAttempts);
+                        _logger.LogInformation(
+                            "Retrying RTSP video connection for room {RoomId} (attempt {Attempt} of {Max})...",
+                            _room.Id,
+                            retryCount + 1,
+                            MaxRetryAttempts);
                         await Task.Delay(RetryDelayMs, cancellationToken);
                     }
 
@@ -101,12 +116,18 @@ namespace BabyMonitarr.Backend.Services
                 catch (Exception ex)
                 {
                     retryCount++;
-                    _logger.LogError(ex, "Error processing RTSP video stream for room {RoomId} (attempt {Attempt} of {Max})",
-                        _room.Id, retryCount, MaxRetryAttempts);
+                    _logger.LogError(
+                        ex,
+                        "Error processing RTSP video stream for room {RoomId} (attempt {Attempt} of {Max})",
+                        _room.Id,
+                        retryCount,
+                        MaxRetryAttempts);
 
                     if (retryCount >= MaxRetryAttempts)
                     {
-                        _logger.LogError("Max retry attempts reached for room {RoomId}. Giving up on RTSP video stream.", _room.Id);
+                        _logger.LogError(
+                            "Max retry attempts reached for room {RoomId}. Giving up on RTSP video stream.",
+                            _room.Id);
                     }
                 }
             }
@@ -123,12 +144,9 @@ namespace BabyMonitarr.Backend.Services
                 diagnostics.Enabled);
 
             AVFormatContext* formatContext = null;
-            AVCodecContext* codecContext = null;
-            SwsContext* swsContext = null;
             AVDictionary* options = null;
             AVPacket* packet = null;
-            AVFrame* frame = null;
-            AVFrame* i420Frame = null;
+            AVBSFContext* bitstreamFilterContext = null;
             int videoStreamIndex = -1;
 
             RtspStatsAccumulator? stats = diagnostics.Enabled && diagnostics.LogFrameStats
@@ -225,7 +243,6 @@ namespace BabyMonitarr.Backend.Services
                     }
                 }
 
-                // Find video stream
                 for (int i = 0; i < formatContext->nb_streams; i++)
                 {
                     if (formatContext->streams[i]->codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
@@ -246,86 +263,39 @@ namespace BabyMonitarr.Backend.Services
                     throw new Exception("Could not find video stream in RTSP feed");
                 }
 
-                AVCodecParameters* codecParams = formatContext->streams[videoStreamIndex]->codecpar;
-                AVCodec* codec = ffmpeg.avcodec_find_decoder(codecParams->codec_id);
-                if (codec == null)
+                AVStream* videoStream = formatContext->streams[videoStreamIndex];
+                AVCodecParameters* codecParams = videoStream->codecpar;
+
+                string sourceCodecName = GetCodecName(codecParams->codec_id);
+                if (!TryResolvePassthroughCodec(codecParams->codec_id, out var passthroughCodec))
                 {
-                    throw new Exception("Unsupported video codec");
+                    string reason =
+                        $"Video passthrough for room {_room.Id} does not support RTSP codec '{sourceCodecName}'. " +
+                        "Supported codecs are H264, H265, and VP8.";
+
+                    EmitVideoSourceInfo(sourceCodecName, null, reason);
+                    throw new InvalidOperationException(reason);
                 }
 
-                codecContext = ffmpeg.avcodec_alloc_context3(codec);
-                if (codecContext == null)
+                EmitVideoSourceInfo(sourceCodecName, passthroughCodec, null);
+
+                AVRational streamTimeBase = videoStream->time_base;
+                if (passthroughCodec == VideoPassthroughCodec.H264)
                 {
-                    throw new InvalidOperationException("Could not allocate FFmpeg codec context for RTSP video stream");
+                    bitstreamFilterContext = CreateBitstreamFilterContext(codecParams, streamTimeBase, "h264_mp4toannexb");
                 }
-
-                ret = ffmpeg.avcodec_parameters_to_context(codecContext, codecParams);
-                if (ret < 0)
+                else if (passthroughCodec == VideoPassthroughCodec.H265)
                 {
-                    throw new Exception($"Failed to copy codec parameters to context: {RtspDiagnostics.GetFfmpegError(ret)}");
-                }
-
-                codecContext->err_recognition = 0;
-                codecContext->flags2 |= ffmpeg.AV_CODEC_FLAG2_FAST;
-
-                ret = ffmpeg.avcodec_open2(codecContext, codec, null);
-                if (ret < 0)
-                {
-                    throw new Exception($"Failed to open video codec: {RtspDiagnostics.GetFfmpegError(ret)}");
-                }
-
-                int srcWidth = codecContext->width;
-                int srcHeight = codecContext->height;
-                AVPixelFormat srcPixFmt = codecContext->pix_fmt;
-
-                if (srcWidth <= 0 || srcHeight <= 0)
-                {
-                    srcWidth = codecParams->width;
-                    srcHeight = codecParams->height;
-                }
-
-                if (srcWidth <= 0 || srcHeight <= 0)
-                {
-                    throw new Exception(
-                        $"Invalid video dimensions: {srcWidth}x{srcHeight} (codec={codec->id}, format={srcPixFmt})");
-                }
-
-                int dstWidth, dstHeight;
-                CalculateScaledDimensions(srcWidth, srcHeight, out dstWidth, out dstHeight);
-
-                _logger.LogInformation("Video stream found for room {RoomId}: {SrcW}x{SrcH} -> {DstW}x{DstH}, format={Fmt}",
-                    _room.Id, srcWidth, srcHeight, dstWidth, dstHeight, srcPixFmt);
-
-                swsContext = ffmpeg.sws_getContext(
-                    srcWidth, srcHeight, srcPixFmt,
-                    dstWidth, dstHeight, AVPixelFormat.AV_PIX_FMT_YUV420P,
-                    (int)SwsFlags.SWS_BILINEAR, null, null, null);
-
-                if (swsContext == null)
-                {
-                    throw new Exception("Could not create sws scaling context");
+                    bitstreamFilterContext = CreateBitstreamFilterContext(codecParams, streamTimeBase, "hevc_mp4toannexb");
                 }
 
                 packet = ffmpeg.av_packet_alloc();
-                frame = ffmpeg.av_frame_alloc();
-                i420Frame = ffmpeg.av_frame_alloc();
-                if (packet == null || frame == null || i420Frame == null)
+                if (packet == null)
                 {
-                    throw new InvalidOperationException("Could not allocate FFmpeg packet/frame buffers for RTSP video stream");
+                    throw new InvalidOperationException("Could not allocate FFmpeg packet buffer for RTSP video stream");
                 }
 
-                i420Frame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
-                i420Frame->width = dstWidth;
-                i420Frame->height = dstHeight;
-                ret = ffmpeg.av_frame_get_buffer(i420Frame, 32);
-                if (ret < 0)
-                {
-                    throw new Exception($"Could not allocate I420 frame buffer: {RtspDiagnostics.GetFfmpegError(ret)}");
-                }
-
-                AVRational timeBase = formatContext->streams[videoStreamIndex]->time_base;
-                long minPtsInterval = (long)(timeBase.den / (timeBase.num * TargetFps));
-                long lastEmittedPts = long.MinValue;
+                long lastPacketPts = ffmpeg.AV_NOPTS_VALUE;
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
@@ -339,8 +309,10 @@ namespace BabyMonitarr.Backend.Services
                         else
                         {
                             stats?.RecordReadError();
-                            _logger.LogWarning("Error reading video frame for room {RoomId}: {Error}",
-                                _room.Id, RtspDiagnostics.GetFfmpegError(ret));
+                            _logger.LogWarning(
+                                "Error reading video frame for room {RoomId}: {Error}",
+                                _room.Id,
+                                RtspDiagnostics.GetFfmpegError(ret));
                         }
                         break;
                     }
@@ -354,77 +326,88 @@ namespace BabyMonitarr.Backend.Services
                         continue;
                     }
 
-                    ret = ffmpeg.avcodec_send_packet(codecContext, packet);
-                    ffmpeg.av_packet_unref(packet);
-
-                    if (ret < 0)
+                    if (bitstreamFilterContext != null)
                     {
-                        stats?.RecordSendPacketError();
+                        ret = ffmpeg.av_bsf_send_packet(bitstreamFilterContext, packet);
+                        ffmpeg.av_packet_unref(packet);
 
-                        if (diagnostics.Enabled)
+                        if (ret < 0)
                         {
                             _logger.LogDebug(
-                                "avcodec_send_packet failed for RTSP video room {RoomId}: {Error}",
+                                "av_bsf_send_packet failed for RTSP video room {RoomId}: {Error}",
                                 _room.Id,
                                 RtspDiagnostics.GetFfmpegError(ret));
+                            continue;
                         }
 
-                        continue;
-                    }
-
-                    while (true)
-                    {
-                        ret = ffmpeg.avcodec_receive_frame(codecContext, frame);
-                        if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                        while (!cancellationToken.IsCancellationRequested)
                         {
-                            break;
-                        }
-                        else if (ret < 0)
-                        {
-                            stats?.RecordReceiveFrameError();
-                            _logger.LogWarning(
-                                "avcodec_receive_frame failed for RTSP video room {RoomId}: {Error}",
-                                _room.Id,
-                                RtspDiagnostics.GetFfmpegError(ret));
-                            break;
-                        }
-
-                        long pts = frame->best_effort_timestamp;
-                        if (pts != ffmpeg.AV_NOPTS_VALUE && lastEmittedPts != long.MinValue)
-                        {
-                            long ptsDiff = pts - lastEmittedPts;
-                            if (ptsDiff < minPtsInterval)
+                            ret = ffmpeg.av_bsf_receive_packet(bitstreamFilterContext, packet);
+                            if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
                             {
-                                ffmpeg.av_frame_unref(frame);
-                                continue;
+                                break;
+                            }
+
+                            if (ret < 0)
+                            {
+                                _logger.LogDebug(
+                                    "av_bsf_receive_packet failed for RTSP video room {RoomId}: {Error}",
+                                    _room.Id,
+                                    RtspDiagnostics.GetFfmpegError(ret));
+                                break;
+                            }
+
+                            EmitEncodedPacket(packet, passthroughCodec, streamTimeBase, ref lastPacketPts);
+                            stats?.RecordFrameDecoded();
+                            ffmpeg.av_packet_unref(packet);
+
+                            if (stats != null && diagnostics.Enabled && diagnostics.LogFrameStats && stats.ShouldLog())
+                            {
+                                _logger.LogDebug(
+                                    "RTSP video passthrough stats for room {RoomId}: {Stats}",
+                                    _room.Id,
+                                    stats.BuildSummary());
                             }
                         }
-                        lastEmittedPts = pts;
-
-                        ffmpeg.sws_scale(swsContext,
-                            frame->data, frame->linesize, 0, frame->height,
-                            i420Frame->data, i420Frame->linesize);
-
-                        EmitVideoFrame(i420Frame, dstWidth, dstHeight, pts, timeBase);
-
-                        ffmpeg.av_frame_unref(frame);
+                    }
+                    else
+                    {
+                        EmitEncodedPacket(packet, passthroughCodec, streamTimeBase, ref lastPacketPts);
+                        stats?.RecordFrameDecoded();
+                        ffmpeg.av_packet_unref(packet);
 
                         if (stats != null && diagnostics.Enabled && diagnostics.LogFrameStats && stats.ShouldLog())
                         {
                             _logger.LogDebug(
-                                "RTSP video decode stats for room {RoomId}: {Stats}",
+                                "RTSP video passthrough stats for room {RoomId}: {Stats}",
                                 _room.Id,
                                 stats.BuildSummary());
                         }
                     }
                 }
 
-                ffmpeg.avcodec_send_packet(codecContext, null);
-                while (true)
+                if (bitstreamFilterContext != null)
                 {
-                    ret = ffmpeg.avcodec_receive_frame(codecContext, frame);
-                    if (ret < 0) break;
-                    ffmpeg.av_frame_unref(frame);
+                    ret = ffmpeg.av_bsf_send_packet(bitstreamFilterContext, null);
+                    if (ret >= 0)
+                    {
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            ret = ffmpeg.av_bsf_receive_packet(bitstreamFilterContext, packet);
+                            if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
+                            {
+                                break;
+                            }
+
+                            if (ret < 0)
+                            {
+                                break;
+                            }
+
+                            EmitEncodedPacket(packet, passthroughCodec, streamTimeBase, ref lastPacketPts);
+                            ffmpeg.av_packet_unref(packet);
+                        }
+                    }
                 }
             }
             finally
@@ -434,29 +417,14 @@ namespace BabyMonitarr.Backend.Services
                     ffmpeg.av_dict_free(&options);
                 }
 
-                if (i420Frame != null)
-                {
-                    ffmpeg.av_frame_free(&i420Frame);
-                }
-
-                if (frame != null)
-                {
-                    ffmpeg.av_frame_free(&frame);
-                }
-
                 if (packet != null)
                 {
                     ffmpeg.av_packet_free(&packet);
                 }
 
-                if (swsContext != null)
+                if (bitstreamFilterContext != null)
                 {
-                    ffmpeg.sws_freeContext(swsContext);
-                }
-
-                if (codecContext != null)
-                {
-                    ffmpeg.avcodec_free_context(&codecContext);
+                    ffmpeg.av_bsf_free(&bitstreamFilterContext);
                 }
 
                 if (formatContext != null)
@@ -467,78 +435,156 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
-        private void CalculateScaledDimensions(int srcWidth, int srcHeight, out int dstWidth, out int dstHeight)
+        private unsafe AVBSFContext* CreateBitstreamFilterContext(
+            AVCodecParameters* codecParameters,
+            AVRational streamTimeBase,
+            string filterName)
         {
-            if (srcWidth <= MaxWidth && srcHeight <= MaxHeight)
+            AVBitStreamFilter* bitstreamFilter = ffmpeg.av_bsf_get_by_name(filterName);
+            if (bitstreamFilter == null)
             {
-                // Ensure dimensions are even (required for YUV420P)
-                dstWidth = srcWidth & ~1;
-                dstHeight = srcHeight & ~1;
+                throw new InvalidOperationException($"FFmpeg bitstream filter '{filterName}' is not available.");
+            }
+
+            AVBSFContext* context = null;
+            int ret = ffmpeg.av_bsf_alloc(bitstreamFilter, &context);
+            if (ret < 0 || context == null)
+            {
+                throw new InvalidOperationException(
+                    $"Could not allocate FFmpeg bitstream filter '{filterName}': {RtspDiagnostics.GetFfmpegError(ret)}");
+            }
+
+            ret = ffmpeg.avcodec_parameters_copy(context->par_in, codecParameters);
+            if (ret < 0)
+            {
+                ffmpeg.av_bsf_free(&context);
+                throw new InvalidOperationException(
+                    $"Could not copy codec parameters for bitstream filter '{filterName}': {RtspDiagnostics.GetFfmpegError(ret)}");
+            }
+
+            context->time_base_in = streamTimeBase;
+
+            ret = ffmpeg.av_bsf_init(context);
+            if (ret < 0)
+            {
+                ffmpeg.av_bsf_free(&context);
+                throw new InvalidOperationException(
+                    $"Could not initialize FFmpeg bitstream filter '{filterName}': {RtspDiagnostics.GetFfmpegError(ret)}");
+            }
+
+            return context;
+        }
+
+        private unsafe void EmitEncodedPacket(
+            AVPacket* packet,
+            VideoPassthroughCodec codec,
+            AVRational timeBase,
+            ref long lastPacketPts)
+        {
+            if (packet == null || packet->data == null || packet->size <= 0)
+            {
                 return;
             }
 
-            double scale = Math.Min((double)MaxWidth / srcWidth, (double)MaxHeight / srcHeight);
-            dstWidth = ((int)(srcWidth * scale)) & ~1;  // Round down to even
-            dstHeight = ((int)(srcHeight * scale)) & ~1;
-        }
-
-        private unsafe void EmitVideoFrame(AVFrame* i420Frame, int width, int height, long pts, AVRational timeBase)
-        {
             try
             {
-                // Calculate I420 data size: Y plane + U plane + V plane
-                int ySize = width * height;
-                int uvSize = (width / 2) * (height / 2);
-                int totalSize = ySize + uvSize * 2;
+                long packetPts = packet->pts != ffmpeg.AV_NOPTS_VALUE ? packet->pts : packet->dts;
+                uint durationRtpUnits = CalculateDurationRtpUnits(packet, timeBase, packetPts, ref lastPacketPts);
+                long timestampMs = packetPts != ffmpeg.AV_NOPTS_VALUE
+                    ? ffmpeg.av_rescale_q(packetPts, timeBase, new AVRational { num = 1, den = 1000 })
+                    : DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-                byte[] i420Data = new byte[totalSize];
-                int offset = 0;
-
-                // Copy Y plane
-                for (int row = 0; row < height; row++)
-                {
-                    Marshal.Copy((IntPtr)(i420Frame->data[0] + row * i420Frame->linesize[0]),
-                        i420Data, offset, width);
-                    offset += width;
-                }
-
-                // Copy U plane
-                int uvWidth = width / 2;
-                int uvHeight = height / 2;
-                for (int row = 0; row < uvHeight; row++)
-                {
-                    Marshal.Copy((IntPtr)(i420Frame->data[1] + row * i420Frame->linesize[1]),
-                        i420Data, offset, uvWidth);
-                    offset += uvWidth;
-                }
-
-                // Copy V plane
-                for (int row = 0; row < uvHeight; row++)
-                {
-                    Marshal.Copy((IntPtr)(i420Frame->data[2] + row * i420Frame->linesize[2]),
-                        i420Data, offset, uvWidth);
-                    offset += uvWidth;
-                }
-
-                // Convert PTS to milliseconds
-                long timestampMs = 0;
-                if (pts != ffmpeg.AV_NOPTS_VALUE)
-                {
-                    timestampMs = pts * 1000 * timeBase.num / timeBase.den;
-                }
+                byte[] encodedData = new byte[packet->size];
+                Marshal.Copy((IntPtr)packet->data, encodedData, 0, encodedData.Length);
 
                 VideoFrameReceived?.Invoke(this, new VideoFrameEventArgs
                 {
-                    I420Data = i420Data,
-                    Width = width,
-                    Height = height,
+                    Codec = codec,
+                    EncodedData = encodedData,
+                    DurationRtpUnits = durationRtpUnits,
                     TimestampMs = timestampMs
                 });
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error emitting video frame for room {RoomId}", _room.Id);
+                _logger.LogError(ex, "Error emitting encoded video packet for room {RoomId}", _room.Id);
             }
+        }
+
+        private unsafe uint CalculateDurationRtpUnits(
+            AVPacket* packet,
+            AVRational timeBase,
+            long packetPts,
+            ref long lastPacketPts)
+        {
+            long durationRtpUnits;
+            if (packet->duration > 0)
+            {
+                durationRtpUnits = ffmpeg.av_rescale_q(
+                    packet->duration,
+                    timeBase,
+                    new AVRational { num = 1, den = 90000 });
+            }
+            else if (packetPts != ffmpeg.AV_NOPTS_VALUE &&
+                     lastPacketPts != ffmpeg.AV_NOPTS_VALUE &&
+                     packetPts > lastPacketPts)
+            {
+                durationRtpUnits = ffmpeg.av_rescale_q(
+                    packetPts - lastPacketPts,
+                    timeBase,
+                    new AVRational { num = 1, den = 90000 });
+            }
+            else
+            {
+                durationRtpUnits = 3000;
+            }
+
+            if (packetPts != ffmpeg.AV_NOPTS_VALUE)
+            {
+                lastPacketPts = packetPts;
+            }
+
+            durationRtpUnits = Math.Clamp(durationRtpUnits, 1, 90000);
+            return (uint)durationRtpUnits;
+        }
+
+        private void EmitVideoSourceInfo(
+            string sourceCodecName,
+            VideoPassthroughCodec? passthroughCodec,
+            string? failureReason)
+        {
+            VideoSourceInfoDetected?.Invoke(this, new VideoSourceInfoEventArgs
+            {
+                RoomId = _room.Id,
+                SourceCodecName = sourceCodecName,
+                PassthroughCodec = passthroughCodec,
+                FailureReason = failureReason
+            });
+        }
+
+        private static bool TryResolvePassthroughCodec(AVCodecID codecId, out VideoPassthroughCodec codec)
+        {
+            switch (codecId)
+            {
+                case AVCodecID.AV_CODEC_ID_H264:
+                    codec = VideoPassthroughCodec.H264;
+                    return true;
+                case AVCodecID.AV_CODEC_ID_HEVC:
+                    codec = VideoPassthroughCodec.H265;
+                    return true;
+                case AVCodecID.AV_CODEC_ID_VP8:
+                    codec = VideoPassthroughCodec.VP8;
+                    return true;
+                default:
+                    codec = default;
+                    return false;
+            }
+        }
+
+        private static unsafe string GetCodecName(AVCodecID codecId)
+        {
+            string? codecName = ffmpeg.avcodec_get_name(codecId);
+            return string.IsNullOrWhiteSpace(codecName) ? codecId.ToString() : codecName.Trim();
         }
 
         public void Stop()
@@ -553,7 +599,7 @@ namespace BabyMonitarr.Backend.Services
                 }
                 catch (AggregateException)
                 {
-                    // Task was cancelled, expected
+                    // Task cancellation is expected on shutdown.
                 }
                 _processingTask = null;
             }
@@ -578,6 +624,7 @@ namespace BabyMonitarr.Backend.Services
                 {
                     Stop();
                 }
+
                 _isDisposed = true;
             }
         }

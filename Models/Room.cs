@@ -13,6 +13,10 @@ public class Room
     public string? CameraPassword { get; set; }
     public string StreamSourceType { get; set; } = "rtsp";
     public string? NestDeviceId { get; set; }
+    public string? VideoSourceCodecName { get; set; }
+    public string? VideoPassthroughCodec { get; set; }
+    public string? VideoCodecFailureReason { get; set; }
+    public DateTime? VideoCodecCheckedAtUtc { get; set; }
     public bool IsActive { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

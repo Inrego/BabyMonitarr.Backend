@@ -232,6 +232,23 @@ function normalizeError(error) {
     };
 }
 
+function getDisplayErrorMessage(error, fallbackMessage) {
+    if (typeof error === "string" && error.trim()) {
+        return error.trim();
+    }
+
+    if (error && typeof error.message === "string" && error.message.trim()) {
+        return error.message.trim();
+    }
+
+    const normalized = normalizeError(error);
+    if (normalized && typeof normalized.message === "string" && normalized.message.trim()) {
+        return normalized.message.trim();
+    }
+
+    return fallbackMessage;
+}
+
 function logEnvironmentSnapshot() {
     diagInfo("environment.snapshot", {
         diagnosticsVerbose: DIAG_VERBOSE,
@@ -1136,6 +1153,7 @@ async function startVideoStream(roomId) {
             console.error(`No SDP offer received for video room ${roomId}`);
             if (loadingEl) loadingEl.style.display = 'none';
             finalizeStreamAttempt(roomId, streamType, "failed", { reason: "missing-offer" });
+            showMessage("No SDP offer received for video stream", true);
             return;
         }
 
@@ -1330,6 +1348,7 @@ async function startVideoStream(roomId) {
         void capturePeerStats(roomId, streamType, videoConnections[roomId], "start-exception");
         finalizeStreamAttempt(roomId, streamType, "failed", { reason: "start-exception" });
         console.error(`Error starting video stream for room ${roomId}:`, error);
+        showMessage(getDisplayErrorMessage(error, "Error starting video stream"), true);
         const loadingEl = document.getElementById(`videoLoading-${roomId}`);
         if (loadingEl) loadingEl.style.display = 'none';
     }

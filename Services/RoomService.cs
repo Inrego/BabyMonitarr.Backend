@@ -13,6 +13,12 @@ public interface IRoomService
     Task<bool> DeleteRoomAsync(int id);
     Task<Room?> SetActiveRoomAsync(int roomId);
     Task<Room?> GetActiveRoomAsync();
+    Task UpdateRoomVideoCodecMetadataAsync(
+        int roomId,
+        string sourceCodecName,
+        VideoPassthroughCodec? passthroughCodec,
+        string? failureReason,
+        DateTime checkedAtUtc);
     Task<GlobalSettings> GetGlobalSettingsAsync();
     Task<GlobalSettings> UpdateGlobalSettingsAsync(GlobalSettings settings);
     Task<AudioSettings> GetComposedAudioSettingsAsync();
@@ -22,10 +28,18 @@ public interface IRoomService
 public class RoomService : IRoomService
 {
     private readonly BabyMonitarrDbContext _db;
+    private readonly IVideoCodecProbeService _videoCodecProbeService;
+    private readonly ILogger<RoomService> _logger;
+    private static readonly TimeSpan CodecProbeTimeout = TimeSpan.FromSeconds(5);
 
-    public RoomService(BabyMonitarrDbContext db)
+    public RoomService(
+        BabyMonitarrDbContext db,
+        IVideoCodecProbeService videoCodecProbeService,
+        ILogger<RoomService> logger)
     {
         _db = db;
+        _videoCodecProbeService = videoCodecProbeService;
+        _logger = logger;
     }
 
     public async Task<List<Room>> GetAllRoomsAsync()
@@ -51,6 +65,8 @@ public class RoomService : IRoomService
             suffix++;
         }
 
+        await RefreshVideoCodecMetadataAsync(room, CancellationToken.None);
+
         _db.Rooms.Add(room);
         await _db.SaveChangesAsync();
         return room;
@@ -60,6 +76,15 @@ public class RoomService : IRoomService
     {
         var existing = await _db.Rooms.FindAsync(room.Id);
         if (existing == null) return null;
+
+        bool shouldRefreshCodecMetadata =
+            existing.VideoCodecCheckedAtUtc == null ||
+            existing.EnableVideoStream != room.EnableVideoStream ||
+            !string.Equals(existing.StreamSourceType, room.StreamSourceType, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(existing.CameraStreamUrl, room.CameraStreamUrl, StringComparison.Ordinal) ||
+            !string.Equals(existing.CameraUsername, room.CameraUsername, StringComparison.Ordinal) ||
+            !string.Equals(existing.CameraPassword, room.CameraPassword, StringComparison.Ordinal) ||
+            !string.Equals(existing.NestDeviceId, room.NestDeviceId, StringComparison.Ordinal);
 
         existing.Name = room.Name;
         existing.Icon = room.Icon;
@@ -71,6 +96,11 @@ public class RoomService : IRoomService
         existing.CameraPassword = room.CameraPassword;
         existing.StreamSourceType = room.StreamSourceType;
         existing.NestDeviceId = room.NestDeviceId;
+
+        if (shouldRefreshCodecMetadata)
+        {
+            await RefreshVideoCodecMetadataAsync(existing, CancellationToken.None);
+        }
 
         await _db.SaveChangesAsync();
         return existing;
@@ -103,6 +133,31 @@ public class RoomService : IRoomService
     public async Task<Room?> GetActiveRoomAsync()
     {
         return await _db.Rooms.FirstOrDefaultAsync(r => r.IsActive);
+    }
+
+    public async Task UpdateRoomVideoCodecMetadataAsync(
+        int roomId,
+        string sourceCodecName,
+        VideoPassthroughCodec? passthroughCodec,
+        string? failureReason,
+        DateTime checkedAtUtc)
+    {
+        var room = await _db.Rooms.FindAsync(roomId);
+        if (room == null)
+        {
+            return;
+        }
+
+        room.VideoSourceCodecName = string.IsNullOrWhiteSpace(sourceCodecName)
+            ? null
+            : sourceCodecName.Trim();
+        room.VideoPassthroughCodec = passthroughCodec?.ToString();
+        room.VideoCodecFailureReason = string.IsNullOrWhiteSpace(failureReason)
+            ? null
+            : failureReason.Trim();
+        room.VideoCodecCheckedAtUtc = checkedAtUtc;
+
+        await _db.SaveChangesAsync();
     }
 
     public async Task<GlobalSettings> GetGlobalSettingsAsync()
@@ -172,5 +227,74 @@ public class RoomService : IRoomService
             CameraUsername = room?.CameraUsername,
             CameraPassword = room?.CameraPassword
         };
+    }
+
+    private async Task RefreshVideoCodecMetadataAsync(Room room, CancellationToken cancellationToken)
+    {
+        room.VideoSourceCodecName = null;
+        room.VideoPassthroughCodec = null;
+        room.VideoCodecFailureReason = null;
+        room.VideoCodecCheckedAtUtc = null;
+
+        if (!room.EnableVideoStream)
+        {
+            return;
+        }
+
+        if (string.Equals(room.StreamSourceType, "google_nest", StringComparison.OrdinalIgnoreCase))
+        {
+            room.VideoSourceCodecName = "h264";
+            room.VideoPassthroughCodec = VideoPassthroughCodec.H264.ToString();
+            room.VideoCodecCheckedAtUtc = DateTime.UtcNow;
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(room.CameraStreamUrl))
+        {
+            room.VideoCodecFailureReason = "Camera stream URL is not configured.";
+            room.VideoCodecCheckedAtUtc = DateTime.UtcNow;
+            return;
+        }
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(CodecProbeTimeout);
+
+            var probeResult = await _videoCodecProbeService.ProbeAsync(
+                room.Id,
+                room.CameraStreamUrl,
+                room.CameraUsername,
+                room.CameraPassword,
+                timeoutCts.Token);
+
+            room.VideoSourceCodecName = string.IsNullOrWhiteSpace(probeResult.SourceCodecName)
+                ? null
+                : probeResult.SourceCodecName.Trim();
+            room.VideoPassthroughCodec = probeResult.PassthroughCodec?.ToString();
+            room.VideoCodecFailureReason = string.IsNullOrWhiteSpace(probeResult.FailureReason)
+                ? null
+                : probeResult.FailureReason.Trim();
+            room.VideoCodecCheckedAtUtc = probeResult.CheckedAtUtc;
+        }
+        catch (OperationCanceledException)
+        {
+            room.VideoCodecFailureReason = "Timed out while probing video source codec.";
+            room.VideoCodecCheckedAtUtc = DateTime.UtcNow;
+            _logger.LogWarning(
+                "Timed out probing video codec for room {RoomId} ({Name})",
+                room.Id,
+                room.Name);
+        }
+        catch (Exception ex)
+        {
+            room.VideoCodecFailureReason = RtspDiagnostics.RedactFreeText(ex.Message);
+            room.VideoCodecCheckedAtUtc = DateTime.UtcNow;
+            _logger.LogWarning(
+                ex,
+                "Could not probe video codec for room {RoomId} ({Name})",
+                room.Id,
+                room.Name);
+        }
     }
 }

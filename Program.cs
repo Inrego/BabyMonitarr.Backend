@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
+using System.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -42,6 +43,7 @@ builder.Services.AddHttpClient();
 builder.Services.AddScoped<IRoomService, RoomService>();
 builder.Services.AddScoped<IGoogleNestAuthService, GoogleNestAuthService>();
 builder.Services.AddScoped<IGoogleNestDeviceService, GoogleNestDeviceService>();
+builder.Services.AddSingleton<IVideoCodecProbeService, VideoCodecProbeService>();
 builder.Services.AddSingleton<FfprobeSnapshotService>();
 builder.Services.AddSingleton<NestStreamReaderManager>();
 builder.Services.AddSingleton<IWebRtcConfigService, WebRtcConfigService>();
@@ -75,6 +77,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
     db.Database.EnsureCreated();
+    EnsureRoomVideoCodecColumns(db);
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -149,3 +152,63 @@ app.MapControllerRoute(
         pattern: "{controller=Home}/{action=Dashboard}/{id?}");
 
 app.Run();
+
+static void EnsureRoomVideoCodecColumns(BabyMonitarrDbContext db)
+{
+    var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var connection = db.Database.GetDbConnection();
+    bool closeAfter = connection.State != ConnectionState.Open;
+
+    if (closeAfter)
+    {
+        connection.Open();
+    }
+
+    try
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA table_info('Rooms');";
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            string columnName = reader["name"]?.ToString() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(columnName))
+            {
+                existingColumns.Add(columnName);
+            }
+        }
+    }
+    finally
+    {
+        if (closeAfter)
+        {
+            connection.Close();
+        }
+    }
+
+    AddRoomColumnIfMissing("VideoSourceCodecName");
+    AddRoomColumnIfMissing("VideoPassthroughCodec");
+    AddRoomColumnIfMissing("VideoCodecFailureReason");
+    AddRoomColumnIfMissing("VideoCodecCheckedAtUtc");
+
+    void AddRoomColumnIfMissing(string columnName)
+    {
+        if (existingColumns.Contains(columnName))
+        {
+            return;
+        }
+
+        string alterSql = columnName switch
+        {
+            "VideoSourceCodecName" => "ALTER TABLE Rooms ADD COLUMN VideoSourceCodecName TEXT NULL;",
+            "VideoPassthroughCodec" => "ALTER TABLE Rooms ADD COLUMN VideoPassthroughCodec TEXT NULL;",
+            "VideoCodecFailureReason" => "ALTER TABLE Rooms ADD COLUMN VideoCodecFailureReason TEXT NULL;",
+            "VideoCodecCheckedAtUtc" => "ALTER TABLE Rooms ADD COLUMN VideoCodecCheckedAtUtc TEXT NULL;",
+            _ => throw new InvalidOperationException($"Unsupported Room column '{columnName}'.")
+        };
+
+        db.Database.ExecuteSqlRaw(alterSql);
+        existingColumns.Add(columnName);
+    }
+}

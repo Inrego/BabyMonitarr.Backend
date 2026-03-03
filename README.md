@@ -32,7 +32,7 @@ BabyMonitarr turns your existing cameras into a low-latency, privacy-first baby 
 ## Features
 
 - **Multi-Room Monitoring** — Set up as many rooms as you need, each with its own camera and settings. See them all at a glance from the dashboard.
-- **Low-Latency Audio & Video** — WebRTC peer-to-peer streaming with Opus audio. Hear your baby the moment they stir, not 5 seconds later.
+- **Low-Latency Audio & Video** — WebRTC peer-to-peer streaming with Opus audio and source-codec video passthrough when supported by the client.
 - **Sound Detection & Alerts** — Configurable audio threshold alerts tell you when noise exceeds a level you set. No more staring at a screen waiting.
 - **RTSP Camera Support** — Works with virtually any IP camera, DVR, or NVR that supports RTSP or HTTP streams.
 - **Google Nest Integration** — Connect your Nest cameras via the Smart Device Management API with built-in OAuth setup.
@@ -156,6 +156,15 @@ Optional overrides:
 
 Credentials in RTSP URLs are automatically redacted in application logs.
 
+### Video Codec Passthrough (No Re-Encode)
+
+Video streaming is passthrough-only: BabyMonitarr does not transcode video as a fallback.
+
+- Source codecs supported for passthrough: `H264`, `H265`, `VP8`.
+- If the source codec is outside that set, stream startup fails with an explicit signaling error.
+- If the browser/client cannot negotiate the source codec, stream startup fails with an explicit signaling error.
+- Video frame cadence follows source packet timing instead of a fixed FPS cap.
+
 ### Frontend WebRTC Playback Diagnostics (Dashboard)
 
 If playback fails in Docker but works locally, you can enable detailed browser-side WebRTC diagnostics on the Dashboard:
@@ -219,6 +228,7 @@ To use Google Nest cameras, you'll need OAuth 2.0 credentials from the [Google C
 | Real-time | SignalR + WebRTC |
 | Media | FFmpeg, SIPSorcery, NAudio |
 | Audio Codec | Opus (48kHz mono) |
+| Video Codec Handling | Passthrough only (`H264`, `H265`, `VP8`) |
 | Database | SQLite |
 | Frontend | Bootstrap 5, jQuery, SignalR JS |
 | Container | Docker (multi-arch: amd64/arm64) |

@@ -757,7 +757,8 @@ public class NestStreamReader : IDisposable
 
         VideoFrameReceived?.Invoke(this, new VideoFrameEventArgs
         {
-            RawH264Data = annexB,
+            Codec = VideoPassthroughCodec.H264,
+            EncodedData = annexB,
             DurationRtpUnits = durationRtpUnits,
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         });
