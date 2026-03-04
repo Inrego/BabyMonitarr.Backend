@@ -45,6 +45,10 @@ public class ApiKeysController : Controller
         TempData["NewKey"] = plainTextKey;
         TempData["NewKeyName"] = name.Trim();
 
+        var serverBaseUrl = $"{Request.Scheme}://{Request.Host}";
+        var qrPayload = QrCodeService.BuildQrPayload(plainTextKey, serverBaseUrl);
+        TempData["NewKeyQr"] = QrCodeService.GenerateQrPngBase64(qrPayload);
+
         return RedirectToAction("Index");
     }
 

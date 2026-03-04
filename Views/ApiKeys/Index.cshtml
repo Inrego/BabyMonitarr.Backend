@@ -3,6 +3,7 @@
     ViewData["Title"] = "API Keys";
     var newKey = TempData["NewKey"] as string;
     var newKeyName = TempData["NewKeyName"] as string;
+    var newKeyQr = TempData["NewKeyQr"] as string;
     var error = TempData["Error"] as string;
 }
 
@@ -27,6 +28,21 @@
                 <i class="fas fa-copy"></i>
             </button>
         </div>
+        @if (!string.IsNullOrEmpty(newKeyQr))
+        {
+            <div style="text-align: center; margin-top: 20px; padding-top: 16px; border-top: 1px solid rgba(136, 213, 195, 0.2);">
+                <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 12px;">
+                    <i class="fas fa-qrcode" style="margin-right: 4px;"></i>
+                    Scan this QR code with the BabyMonitarr app to connect instantly.
+                </p>
+                <img src="data:image/png;base64,@newKeyQr"
+                     alt="QR code for mobile setup"
+                     style="width: 220px; height: 220px; border-radius: 12px; background: white; padding: 12px;" />
+                <p style="color: var(--text-muted); font-size: 0.75rem; margin-top: 8px;">
+                    This QR code won't be shown again.
+                </p>
+            </div>
+        }
     </div>
 }
 
