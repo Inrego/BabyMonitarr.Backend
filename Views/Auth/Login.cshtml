@@ -1,0 +1,28 @@
+@{
+    Layout = "_AuthLayout";
+    ViewData["Title"] = "Login";
+}
+
+<h2 class="auth-title">Sign In</h2>
+
+@if (ViewData["Error"] is string error)
+{
+    <div class="auth-error">
+        <i class="fas fa-exclamation-circle"></i> @error
+    </div>
+}
+
+<form method="post" asp-action="LoginPost" asp-controller="Auth">
+    @Html.AntiForgeryToken()
+    <input type="hidden" name="returnUrl" value="@ViewData["ReturnUrl"]" />
+
+    <label class="auth-label" for="username">Username</label>
+    <input type="text" id="username" name="username" class="auth-input"
+           placeholder="Enter your username" autocomplete="username" required autofocus />
+
+    <label class="auth-label" for="password">Password</label>
+    <input type="password" id="password" name="password" class="auth-input"
+           placeholder="Enter your password" autocomplete="current-password" required />
+
+    <button type="submit" class="auth-btn">Sign In</button>
+</form>

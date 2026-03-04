@@ -1,0 +1,34 @@
+@{
+    Layout = "_AuthLayout";
+    ViewData["Title"] = "Setup";
+}
+
+<h2 class="auth-title">Create Admin Account</h2>
+<p style="text-align: center; color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 24px;">
+    Set up your first account to secure BabyMonitarr.
+</p>
+
+@if (ViewData["Error"] is string error)
+{
+    <div class="auth-error">
+        <i class="fas fa-exclamation-circle"></i> @error
+    </div>
+}
+
+<form method="post" asp-action="SetupPost" asp-controller="Auth">
+    @Html.AntiForgeryToken()
+
+    <label class="auth-label" for="username">Username</label>
+    <input type="text" id="username" name="username" class="auth-input"
+           placeholder="Choose a username" autocomplete="username" required autofocus />
+
+    <label class="auth-label" for="password">Password</label>
+    <input type="password" id="password" name="password" class="auth-input"
+           placeholder="At least 8 characters" autocomplete="new-password" required minlength="8" />
+
+    <label class="auth-label" for="confirmPassword">Confirm Password</label>
+    <input type="password" id="confirmPassword" name="confirmPassword" class="auth-input"
+           placeholder="Re-enter your password" autocomplete="new-password" required minlength="8" />
+
+    <button type="submit" class="auth-btn">Create Account</button>
+</form>

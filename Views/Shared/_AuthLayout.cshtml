@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>@ViewData["Title"] - BabyMonitarr</title>
+    <link rel="icon" type="image/svg+xml" href="~/images/icon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com"/>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"/>
+    <link rel="stylesheet" href="~/lib/bootstrap/dist/css/bootstrap.min.css"/>
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true"/>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .auth-container {
+            width: 100%;
+            max-width: 420px;
+            padding: 24px;
+        }
+        .auth-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 40px 32px;
+        }
+        .auth-logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 32px;
+        }
+        .auth-logo img {
+            width: 48px;
+            height: 48px;
+        }
+        .auth-logo span {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent-peach);
+        }
+        .auth-title {
+            text-align: center;
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 24px;
+            color: var(--text-primary);
+        }
+        .auth-input {
+            width: 100%;
+            padding: 12px 16px;
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            margin-bottom: 16px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .auth-input:focus {
+            border-color: var(--accent-peach);
+        }
+        .auth-input::placeholder {
+            color: var(--text-muted);
+        }
+        .auth-label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+        .auth-btn {
+            width: 100%;
+            padding: 12px;
+            background: var(--accent-peach);
+            color: var(--bg-main);
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .auth-btn:hover {
+            opacity: 0.9;
+        }
+        .auth-error {
+            background: rgba(255, 139, 148, 0.15);
+            color: var(--accent-pink);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            margin-bottom: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="auth-container">
+        <div class="auth-card">
+            <div class="auth-logo">
+                <img src="~/images/icon.svg" alt="BabyMonitarr" />
+                <span>BabyMonitarr</span>
+            </div>
+            @RenderBody()
+        </div>
+    </div>
+</body>
+</html>

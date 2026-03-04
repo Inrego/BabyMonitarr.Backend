@@ -1,0 +1,108 @@
+@model List<BabyMonitarr.Backend.Models.ApiKey>
+@{
+    ViewData["Title"] = "API Keys";
+    var newKey = TempData["NewKey"] as string;
+    var newKeyName = TempData["NewKeyName"] as string;
+    var error = TempData["Error"] as string;
+}
+
+<div class="page-header">
+    <h2>API Keys</h2>
+    <p class="page-subtitle">Generate API keys for the mobile app to connect to your server.</p>
+</div>
+
+@if (!string.IsNullOrEmpty(newKey))
+{
+    <div class="card mb-4" style="background: rgba(136, 213, 195, 0.1); border: 1px solid var(--accent-teal); border-radius: 12px; padding: 20px;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
+            <i class="fas fa-check-circle" style="color: var(--accent-teal);"></i>
+            <strong style="color: var(--accent-teal);">New API Key Created: @newKeyName</strong>
+        </div>
+        <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 12px;">
+            Copy this key now. You won't be able to see it again.
+        </p>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <code id="newKeyValue" style="flex: 1; background: var(--bg-input); padding: 12px; border-radius: 8px; word-break: break-all; font-size: 0.85rem; color: var(--text-primary);">@newKey</code>
+            <button onclick="copyKey()" class="btn-icon" title="Copy to clipboard" style="background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px 14px; cursor: pointer; color: var(--text-primary);">
+                <i class="fas fa-copy"></i>
+            </button>
+        </div>
+    </div>
+}
+
+@if (!string.IsNullOrEmpty(error))
+{
+    <div class="auth-error" style="margin-bottom: 16px;">
+        <i class="fas fa-exclamation-circle"></i> @error
+    </div>
+}
+
+<div class="card mb-4" style="background: var(--bg-card); border-radius: 12px; padding: 20px;">
+    <h5 style="margin-bottom: 16px; font-weight: 600;">Generate New Key</h5>
+    <form method="post" asp-action="Create" asp-controller="ApiKeys" style="display: flex; gap: 12px; align-items: end;">
+        @Html.AntiForgeryToken()
+        <div style="flex: 1;">
+            <label style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 6px;">Device Name</label>
+            <input type="text" name="name" placeholder="e.g., My Phone"
+                   style="width: 100%; padding: 10px 14px; background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-size: 0.9rem; outline: none;"
+                   required />
+        </div>
+        <button type="submit" style="padding: 10px 20px; background: var(--accent-peach); color: var(--bg-main); border: none; border-radius: 8px; font-weight: 600; cursor: pointer; white-space: nowrap;">
+            <i class="fas fa-plus"></i> Generate
+        </button>
+    </form>
+</div>
+
+<div class="card" style="background: var(--bg-card); border-radius: 12px; padding: 20px;">
+    <h5 style="margin-bottom: 16px; font-weight: 600;">Your Keys</h5>
+
+    @if (Model.Count == 0)
+    {
+        <p style="color: var(--text-muted); text-align: center; padding: 24px 0;">
+            No API keys yet. Generate one to connect the mobile app.
+        </p>
+    }
+    else
+    {
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+            @foreach (var key in Model)
+            {
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-input); border-radius: 8px;">
+                    <div style="flex: 1;">
+                        <div style="font-weight: 600; margin-bottom: 2px;">@key.Name</div>
+                        <div style="font-size: 0.8rem; color: var(--text-muted);">
+                            <code>@key.KeyPrefix...</code>
+                            &middot; Created @key.CreatedAt.ToString("MMM dd, yyyy")
+                            @if (key.LastUsedAt.HasValue)
+                            {
+                                <span>&middot; Last used @key.LastUsedAt.Value.ToString("MMM dd, yyyy")</span>
+                            }
+                        </div>
+                    </div>
+                    <form method="post" asp-action="Delete" asp-controller="ApiKeys" asp-route-id="@key.Id"
+                          onsubmit="return confirm('Revoke this API key? The mobile app will need a new key to reconnect.');">
+                        @Html.AntiForgeryToken()
+                        <button type="submit" style="background: none; border: none; color: var(--accent-pink); cursor: pointer; padding: 6px 10px;" title="Revoke key">
+                            <i class="fas fa-trash-alt"></i>
+                        </button>
+                    </form>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+@section Scripts {
+    <script>
+        function copyKey() {
+            var keyEl = document.getElementById('newKeyValue');
+            if (keyEl) {
+                navigator.clipboard.writeText(keyEl.textContent.trim()).then(function() {
+                    var btn = event.currentTarget;
+                    btn.innerHTML = '<i class="fas fa-check"></i>';
+                    setTimeout(function() { btn.innerHTML = '<i class="fas fa-copy"></i>'; }, 2000);
+                });
+            }
+        }
+    </script>
+}

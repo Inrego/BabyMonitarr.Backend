@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
+using BabyMonitarr.Backend.Auth;
 using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
@@ -54,6 +55,9 @@ builder.Services.AddSingleton<IVideoStreamingService, VideoStreamingService>();
 builder.Services.AddSingleton<IVideoWebRtcService, VideoWebRtcService>();
 builder.Services.AddHostedService(sp => (VideoStreamingService)sp.GetRequiredService<IVideoStreamingService>());
 
+// Add authentication
+builder.Services.AddBabyMonitarrAuth(builder.Configuration);
+
 // Add SignalR
 builder.Services.AddSignalR();
 
@@ -78,6 +82,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
     db.Database.EnsureCreated();
     EnsureRoomVideoCodecColumns(db);
+    EnsureAuthTables(db);
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -141,6 +146,7 @@ app.UseRouting();
 
 app.UseCors("SignalRWithCredentials");
 
+app.UseAuthentication();
 app.UseAuthorization();
 
 // Map SignalR hub
@@ -211,4 +217,38 @@ static void EnsureRoomVideoCodecColumns(BabyMonitarrDbContext db)
         db.Database.ExecuteSqlRaw(alterSql);
         existingColumns.Add(columnName);
     }
+}
+
+static void EnsureAuthTables(BabyMonitarrDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS Users (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Username TEXT NOT NULL,
+            PasswordHash TEXT,
+            DisplayName TEXT,
+            Email TEXT,
+            IsAdmin INTEGER NOT NULL DEFAULT 0,
+            CreatedAt TEXT NOT NULL DEFAULT '0001-01-01T00:00:00'
+        );
+        """);
+    db.Database.ExecuteSqlRaw(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_Users_Username ON Users (Username);");
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS ApiKeys (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            UserId INTEGER NOT NULL,
+            KeyHash TEXT NOT NULL,
+            KeyPrefix TEXT NOT NULL,
+            Name TEXT NOT NULL,
+            CreatedAt TEXT NOT NULL DEFAULT '0001-01-01T00:00:00',
+            LastUsedAt TEXT,
+            FOREIGN KEY (UserId) REFERENCES Users(Id) ON DELETE CASCADE
+        );
+        """);
+    db.Database.ExecuteSqlRaw(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_ApiKeys_KeyHash ON ApiKeys (KeyHash);");
+    db.Database.ExecuteSqlRaw(
+        "CREATE INDEX IF NOT EXISTS IX_ApiKeys_KeyPrefix ON ApiKeys (KeyPrefix);");
 }
