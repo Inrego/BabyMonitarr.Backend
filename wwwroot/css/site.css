@@ -364,6 +364,120 @@ a:hover {
     background-color: #9ce0d0;
 }
 
+/* ===== Page Header ===== */
+.page-header {
+    margin-bottom: 28px;
+}
+
+.page-subtitle {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-top: 4px;
+}
+
+/* ===== API Keys ===== */
+.success-card {
+    background: rgba(136, 213, 195, 0.1);
+    border: 1px solid var(--accent-teal);
+    border-radius: 12px;
+    padding: 20px;
+}
+
+.success-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+    color: var(--accent-teal);
+    font-weight: 600;
+}
+
+.key-display {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.key-display code {
+    flex: 1;
+    background: var(--bg-input);
+    padding: 12px;
+    border-radius: 8px;
+    word-break: break-all;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+}
+
+.btn-icon {
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    color: var(--text-primary);
+    transition: border-color 0.15s ease;
+}
+
+.btn-icon:hover {
+    border-color: rgba(142, 139, 135, 0.4);
+}
+
+.qr-section {
+    text-align: center;
+    margin-top: 20px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(136, 213, 195, 0.2);
+}
+
+.api-key-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    background: var(--bg-input);
+    border-radius: 8px;
+}
+
+.api-key-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.api-key-meta {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.api-key-meta code {
+    color: var(--text-secondary);
+}
+
+.btn-revoke {
+    background: none;
+    border: none;
+    color: var(--accent-pink);
+    cursor: pointer;
+    padding: 6px 10px;
+    transition: opacity 0.15s ease;
+}
+
+.btn-revoke:hover {
+    opacity: 0.8;
+}
+
+.empty-state {
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 24px 0;
+}
+
+.generate-form {
+    display: flex;
+    gap: 12px;
+    align-items: end;
+}
+
 /* ===== Config Section ===== */
 .config-section-title {
     font-size: 18px;

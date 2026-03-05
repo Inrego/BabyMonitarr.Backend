@@ -8,29 +8,29 @@
 }
 
 <div class="page-header">
-    <h2>API Keys</h2>
+    <h1 class="page-title">API Keys</h1>
     <p class="page-subtitle">Generate API keys for the mobile app to connect to your server.</p>
 </div>
 
 @if (!string.IsNullOrEmpty(newKey))
 {
-    <div class="card mb-4" style="background: rgba(136, 213, 195, 0.1); border: 1px solid var(--accent-teal); border-radius: 12px; padding: 20px;">
-        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
-            <i class="fas fa-check-circle" style="color: var(--accent-teal);"></i>
-            <strong style="color: var(--accent-teal);">New API Key Created: @newKeyName</strong>
+    <div class="success-card mb-4">
+        <div class="success-card-header">
+            <i class="fas fa-check-circle"></i>
+            <strong>New API Key Created: @newKeyName</strong>
         </div>
         <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 12px;">
             Copy this key now. You won't be able to see it again.
         </p>
-        <div style="display: flex; align-items: center; gap: 8px;">
-            <code id="newKeyValue" style="flex: 1; background: var(--bg-input); padding: 12px; border-radius: 8px; word-break: break-all; font-size: 0.85rem; color: var(--text-primary);">@newKey</code>
-            <button onclick="copyKey()" class="btn-icon" title="Copy to clipboard" style="background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px 14px; cursor: pointer; color: var(--text-primary);">
+        <div class="key-display">
+            <code id="newKeyValue">@newKey</code>
+            <button onclick="copyKey()" class="btn-icon" title="Copy to clipboard">
                 <i class="fas fa-copy"></i>
             </button>
         </div>
         @if (!string.IsNullOrEmpty(newKeyQr))
         {
-            <div style="text-align: center; margin-top: 20px; padding-top: 16px; border-top: 1px solid rgba(136, 213, 195, 0.2);">
+            <div class="qr-section">
                 <p style="color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 12px;">
                     <i class="fas fa-qrcode" style="margin-right: 4px;"></i>
                     Scan this QR code with the BabyMonitarr app to connect instantly.
@@ -38,7 +38,7 @@
                 <img src="data:image/png;base64,@newKeyQr"
                      alt="QR code for mobile setup"
                      style="width: 220px; height: 220px; border-radius: 12px; background: white; padding: 12px;" />
-                <p style="color: var(--text-muted); font-size: 0.75rem; margin-top: 8px;">
+                <p style="color: var(--text-secondary); font-size: 0.75rem; margin-top: 8px;">
                     This QR code won't be shown again.
                 </p>
             </div>
@@ -53,28 +53,28 @@
     </div>
 }
 
-<div class="card mb-4" style="background: var(--bg-card); border-radius: 12px; padding: 20px;">
-    <h5 style="margin-bottom: 16px; font-weight: 600;">Generate New Key</h5>
-    <form method="post" asp-action="Create" asp-controller="ApiKeys" style="display: flex; gap: 12px; align-items: end;">
+<div class="content-card mb-4">
+    <h2 class="config-section-title">Generate New Key</h2>
+    <form method="post" asp-action="Create" asp-controller="ApiKeys" class="generate-form">
         @Html.AntiForgeryToken()
         <div style="flex: 1;">
-            <label style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 6px;">Device Name</label>
+            <label class="form-label-dark">Device Name</label>
             <input type="text" name="name" placeholder="e.g., My Phone"
-                   style="width: 100%; padding: 10px 14px; background: var(--bg-input); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); font-size: 0.9rem; outline: none;"
+                   class="form-control-dark"
                    required />
         </div>
-        <button type="submit" style="padding: 10px 20px; background: var(--accent-peach); color: var(--bg-main); border: none; border-radius: 8px; font-weight: 600; cursor: pointer; white-space: nowrap;">
+        <button type="submit" class="btn-monitor-start">
             <i class="fas fa-plus"></i> Generate
         </button>
     </form>
 </div>
 
-<div class="card" style="background: var(--bg-card); border-radius: 12px; padding: 20px;">
-    <h5 style="margin-bottom: 16px; font-weight: 600;">Your Keys</h5>
+<div class="content-card">
+    <h2 class="config-section-title">Your Keys</h2>
 
     @if (Model.Count == 0)
     {
-        <p style="color: var(--text-muted); text-align: center; padding: 24px 0;">
+        <p class="empty-state">
             No API keys yet. Generate one to connect the mobile app.
         </p>
     }
@@ -83,10 +83,10 @@
         <div style="display: flex; flex-direction: column; gap: 8px;">
             @foreach (var key in Model)
             {
-                <div style="display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; background: var(--bg-input); border-radius: 8px;">
+                <div class="api-key-card">
                     <div style="flex: 1;">
-                        <div style="font-weight: 600; margin-bottom: 2px;">@key.Name</div>
-                        <div style="font-size: 0.8rem; color: var(--text-muted);">
+                        <div class="api-key-name">@key.Name</div>
+                        <div class="api-key-meta">
                             <code>@key.KeyPrefix...</code>
                             &middot; Created @key.CreatedAt.ToString("MMM dd, yyyy")
                             @if (key.LastUsedAt.HasValue)
@@ -98,7 +98,7 @@
                     <form method="post" asp-action="Delete" asp-controller="ApiKeys" asp-route-id="@key.Id"
                           onsubmit="return confirm('Revoke this API key? The mobile app will need a new key to reconnect.');">
                         @Html.AntiForgeryToken()
-                        <button type="submit" style="background: none; border: none; color: var(--accent-pink); cursor: pointer; padding: 6px 10px;" title="Revoke key">
+                        <button type="submit" class="btn-revoke" title="Revoke key">
                             <i class="fas fa-trash-alt"></i>
                         </button>
                     </form>
