@@ -1,6 +1,7 @@
 @{
     var currentPage = ViewData["Title"]?.ToString() ?? "";
 }
+@inject BabyMonitarr.Backend.Services.IAppVersionProvider AppVersionProvider
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -61,7 +62,7 @@
                     </a>
                 </div>
             }
-            <span>BabyMonitarr v1.0.0</span>
+            <span>BabyMonitarr v@AppVersionProvider.DisplayVersion</span>
             <span>Made with <i class="fas fa-heart sidebar-heart"></i></span>
         </div>
     </aside>

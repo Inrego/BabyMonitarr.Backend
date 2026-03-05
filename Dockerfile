@@ -14,7 +14,8 @@ RUN dotnet tool install -g Microsoft.Web.LibraryManager.Cli && \
 
 # Copy everything else and publish
 COPY . .
-RUN dotnet publish -c Release -o /app/publish
+ARG APP_VERSION=1.0.0
+RUN dotnet publish -c Release -o /app/publish /p:Version=${APP_VERSION}
 
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime

@@ -128,6 +128,15 @@ dotnet run
 
 All settings are managed through the web UI — no config files to edit.
 
+## Versioning and Docker Publishing
+
+Docker publishes from `master` use repository tags in the format `vX.Y.Z`.
+
+- `VERSION` is the source of truth for `major.minor` (example: `0.1`).
+- On each publish, patch auto-increments for the current `major.minor`.
+- The workflow creates and pushes a git tag for the published commit (for example: `v0.1.3`).
+- To start a new minor/major line, update `VERSION`; the next publish starts at patch `0` (for example `0.2.0` or `1.0.0`).
+
 ### Docker RTSP/FFmpeg Debug Mode
 
 If RTSP streams fail in Docker, you can enable deep FFmpeg diagnostics without rebuilding:

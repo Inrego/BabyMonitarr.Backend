@@ -47,6 +47,7 @@ builder.Services.AddScoped<IGoogleNestDeviceService, GoogleNestDeviceService>();
 builder.Services.AddSingleton<IVideoCodecProbeService, VideoCodecProbeService>();
 builder.Services.AddSingleton<FfprobeSnapshotService>();
 builder.Services.AddSingleton<NestStreamReaderManager>();
+builder.Services.AddSingleton<IAppVersionProvider, AppVersionProvider>();
 builder.Services.AddSingleton<IWebRtcConfigService, WebRtcConfigService>();
 builder.Services.AddSingleton<IAudioStreamingService, AudioStreamingService>();
 builder.Services.AddHostedService(sp => (AudioStreamingService)sp.GetRequiredService<IAudioStreamingService>());

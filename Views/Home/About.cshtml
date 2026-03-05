@@ -1,6 +1,7 @@
 @{
     ViewData["Title"] = "BabyMonitarr - About";
 }
+@inject BabyMonitarr.Backend.Services.IAppVersionProvider AppVersionProvider
 
 <div class="breadcrumb-dark">About > <span>Information</span></div>
 <h1 class="page-title">About BabyMonitarr</h1>
@@ -15,7 +16,7 @@
             </tr>
             <tr>
                 <td style="opacity: 0.7;">Version</td>
-                <td>v1.0.0</td>
+                <td>v@AppVersionProvider.DisplayVersion</td>
             </tr>
             <tr>
                 <td style="opacity: 0.7;">Description</td>

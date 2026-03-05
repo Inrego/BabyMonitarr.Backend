@@ -2,10 +2,13 @@ name: Docker Build & Publish
 
 on:
   push:
-    branches: [master, "docker-tag/*"]
-    tags: ["v*"]
+    branches: [master]
   pull_request:
     branches: [master]
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -15,12 +18,55 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f VERSION ]]; then
+            echo "VERSION file is missing." >&2
+            exit 1
+          fi
+
+          major_minor="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$major_minor" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION must be in 'major.minor' format (for example: 1.4)." >&2
+            exit 1
+          fi
+
+          latest_tag=""
+          for tag in $(git tag -l "v${major_minor}.*" --sort=-version:refname); do
+            latest_tag="$tag"
+            break
+          done
+
+          if [[ -z "$latest_tag" ]]; then
+            next_patch=0
+          else
+            current_patch="${latest_tag##*.}"
+            if [[ ! "$current_patch" =~ ^[0-9]+$ ]]; then
+              echo "Latest tag '$latest_tag' does not contain a numeric patch value." >&2
+              exit 1
+            fi
+            next_patch=$((current_patch + 1))
+          fi
+
+          full_version="${major_minor}.${next_patch}"
+          tag_name="v${full_version}"
+
+          echo "major_minor=${major_minor}" >> "$GITHUB_OUTPUT"
+          echo "full_version=${full_version}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -36,11 +82,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve branch-based Docker tag
-        id: branch_tag
-        if: startsWith(github.ref, 'refs/heads/docker-tag/')
-        run: echo "value=${GITHUB_REF#refs/heads/docker-tag/}" >> "$GITHUB_OUTPUT"
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -48,9 +89,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ steps.branch_tag.outputs.value }},enable=${{ steps.branch_tag.outputs.value != '' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.full_version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
             type=sha
 
       - name: Build and push
@@ -59,7 +99,26 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.full_version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create and push git tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+          TARGET_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag '$TAG_NAME' already exists; skipping creation."
+            exit 0
+          fi
+
+          git tag "$TAG_NAME" "$TARGET_SHA"
+          git push origin "$TAG_NAME"
