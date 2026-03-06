@@ -13,7 +13,8 @@ public sealed class AppVersionProvider : IAppVersionProvider
 
     private static string ResolveVersion()
     {
-        Assembly assembly = Assembly.GetEntryAssembly() ?? Assembly.GetExecutingAssembly();
+        // Use this assembly directly so the resolved version is stable across host models.
+        Assembly assembly = typeof(AppVersionProvider).Assembly;
 
         string? informationalVersion = assembly
             .GetCustomAttribute<AssemblyInformationalVersionAttribute>()

@@ -15,7 +15,11 @@ RUN dotnet tool install -g Microsoft.Web.LibraryManager.Cli && \
 # Copy everything else and publish
 COPY . .
 ARG APP_VERSION=1.0.0
-RUN dotnet publish -c Release -o /app/publish /p:Version=${APP_VERSION}
+RUN dotnet publish BabyMonitarr.Backend.csproj -c Release -o /app/publish \
+    -p:Version=${APP_VERSION} \
+    -p:AssemblyVersion=${APP_VERSION}.0 \
+    -p:FileVersion=${APP_VERSION}.0 \
+    -p:InformationalVersion=${APP_VERSION}
 
 # Runtime stage
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS runtime
