@@ -76,6 +76,39 @@ Video streaming is passthrough-only — BabyMonitarr does **not** transcode vide
 - If the source codec is unsupported or the browser cannot negotiate it, stream startup fails with an explicit error
 - Video frame cadence follows source packet timing (no fixed FPS cap)
 
+## Google Cast
+
+Casting a room to Chromecast displays and Google/Nest speakers is handled entirely by the
+backend: it discovers receivers over mDNS, transcodes the room to HLS with FFmpeg, and tells
+each receiver to play it. Several receivers can show the same room at once, and the app only
+selects targets.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `Cast__Enabled` | `true` | Turns discovery and casting off entirely. |
+| `Cast__BaseUrl` | (derived) | URL the receivers fetch HLS from, e.g. `http://192.168.0.100:8080`. Falls back to `WebRtc__AdvertisedAddress` with the HTTP port, then to the requesting client's host. |
+| `Cast__HlsPath` | system temp | Where segments are written. |
+| `Cast__DiscoveryIntervalSeconds` | `300` | How often the mDNS sweep runs. |
+| `Cast__DiscoveryTimeoutSeconds` | `5` | Length of each sweep. |
+| `Cast__SegmentSeconds` | `2` | Lower means less cast delay, more segment churn. |
+| `Cast__PlaylistSize` | `6` | Segments kept in the live window. |
+| `Cast__StreamLingerSeconds` | `15` | How long FFmpeg keeps running after the last receiver stops. |
+| `Cast__FfmpegPath` | (auto) | Overrides the bundled/Jellyfin FFmpeg binary. |
+
+Things worth knowing:
+
+- **HLS is not WebRTC.** Cast receivers cannot play WebRTC, so cast output runs a few seconds
+  behind the in-app stream. The app itself is unaffected.
+- **Plain HTTP only.** Cast receivers reject self-signed certificates, so `/cast/hls/**` is
+  excluded from HTTPS redirection and served anonymously, gated by a random per-session token
+  in the URL.
+- **mDNS needs a flat network.** In Docker, discovery only works with `--network host`.
+  Otherwise add receivers by IP from the app (Cast sheet -> add by IP address).
+- **RTSP rooms only.** Google Nest rooms arrive as WebRTC inside the backend, so there is no
+  source URL for FFmpeg to pull and casting them is rejected with a clear message.
+- **Non-H.264 cameras are re-encoded** (roughly one CPU core per 1080p stream); H.264 sources
+  are copied straight through.
+
 ## Logging
 
 Standard ASP.NET Core logging configuration:

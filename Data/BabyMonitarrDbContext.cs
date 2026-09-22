@@ -12,6 +12,8 @@ public class BabyMonitarrDbContext : DbContext
     public DbSet<GoogleNestSettings> GoogleNestSettings => Set<GoogleNestSettings>();
     public DbSet<User> Users => Set<User>();
     public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
+    public DbSet<CastDevice> CastDevices => Set<CastDevice>();
+    public DbSet<RoomCastTarget> RoomCastTargets => Set<RoomCastTarget>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -35,6 +37,16 @@ public class BabyMonitarrDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(k => k.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<CastDevice>(entity =>
+        {
+            entity.HasIndex(d => d.DeviceId).IsUnique();
+        });
+
+        modelBuilder.Entity<RoomCastTarget>(entity =>
+        {
+            entity.HasIndex(t => new { t.RoomId, t.DeviceId }).IsUnique();
         });
 
         modelBuilder.Entity<GlobalSettings>().HasData(new GlobalSettings { Id = 1 });

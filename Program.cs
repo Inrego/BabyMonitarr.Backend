@@ -38,6 +38,8 @@ builder.Services.Configure<FfmpegDiagnosticsOptions>(
     builder.Configuration.GetSection("FFmpegDiagnostics"));
 builder.Services.Configure<WebRtcOptions>(
     builder.Configuration.GetSection("WebRtc"));
+builder.Services.Configure<CastOptions>(
+    builder.Configuration.GetSection("Cast"));
 
 // Register services
 builder.Services.AddHttpClient();
@@ -55,6 +57,14 @@ builder.Services.AddSingleton<IAudioWebRtcService, AudioWebRtcService>();
 builder.Services.AddSingleton<IVideoStreamingService, VideoStreamingService>();
 builder.Services.AddSingleton<IVideoWebRtcService, VideoWebRtcService>();
 builder.Services.AddHostedService(sp => (VideoStreamingService)sp.GetRequiredService<IVideoStreamingService>());
+
+// Google Cast: LAN discovery, HLS renditions for the receivers, and the sessions themselves
+builder.Services.AddSingleton<ICastHlsStreamService, CastHlsStreamService>();
+builder.Services.AddHostedService(sp => (CastHlsStreamService)sp.GetRequiredService<ICastHlsStreamService>());
+builder.Services.AddSingleton<ICastDeviceService, CastDeviceService>();
+builder.Services.AddHostedService(sp => (CastDeviceService)sp.GetRequiredService<ICastDeviceService>());
+builder.Services.AddSingleton<ICastSessionService, CastSessionService>();
+builder.Services.AddHostedService(sp => (CastSessionService)sp.GetRequiredService<ICastSessionService>());
 
 // Add authentication
 builder.Services.AddBabyMonitarrAuth(builder.Configuration);
@@ -84,6 +94,7 @@ using (var scope = app.Services.CreateScope())
     db.Database.EnsureCreated();
     EnsureRoomVideoCodecColumns(db);
     EnsureAuthTables(db);
+    EnsureCastTables(db);
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -141,7 +152,10 @@ if (!app.Environment.IsDevelopment())
     app.UseHsts();
 }
 
-app.UseHttpsRedirection();
+// Cast receivers refuse self-signed TLS, so the HLS endpoints must stay on plain HTTP.
+app.UseWhen(
+    context => !context.Request.Path.StartsWithSegments("/cast/hls"),
+    branch => branch.UseHttpsRedirection());
 app.UseStaticFiles();
 app.UseRouting();
 
@@ -218,6 +232,37 @@ static void EnsureRoomVideoCodecColumns(BabyMonitarrDbContext db)
         db.Database.ExecuteSqlRaw(alterSql);
         existingColumns.Add(columnName);
     }
+}
+
+static void EnsureCastTables(BabyMonitarrDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS CastDevices (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            DeviceId TEXT NOT NULL,
+            Name TEXT NOT NULL DEFAULT '',
+            Model TEXT NOT NULL DEFAULT '',
+            Host TEXT NOT NULL DEFAULT '',
+            Port INTEGER NOT NULL DEFAULT 8009,
+            Capabilities INTEGER NOT NULL DEFAULT 0,
+            IsVideoCapable INTEGER NOT NULL DEFAULT 0,
+            IsGroup INTEGER NOT NULL DEFAULT 0,
+            ManuallyAdded INTEGER NOT NULL DEFAULT 0,
+            LastSeenUtc TEXT
+        );
+        """);
+    db.Database.ExecuteSqlRaw(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_CastDevices_DeviceId ON CastDevices (DeviceId);");
+
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS RoomCastTargets (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            RoomId INTEGER NOT NULL,
+            DeviceId TEXT NOT NULL
+        );
+        """);
+    db.Database.ExecuteSqlRaw(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_RoomCastTargets_RoomId_DeviceId ON RoomCastTargets (RoomId, DeviceId);");
 }
 
 static void EnsureAuthTables(BabyMonitarrDbContext db)

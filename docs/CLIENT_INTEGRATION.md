@@ -215,12 +215,22 @@ await connection.invoke("UpdateAudioSettings", {
 | `StopWebRtcStream` | none | void | Stop the WebRTC stream |
 | `GetAudioSettings` | none | `AudioSettings` | Get current audio settings |
 | `UpdateAudioSettings` | `settings: AudioSettings` | void | Update audio settings |
+| `GetCastDevices` | none | `CastDeviceInfo[]` | Known cast receivers, each with the room it is currently playing |
+| `RefreshCastDevices` | none | `CastDeviceInfo[]` | Run an mDNS sweep now |
+| `AddCastDevice` | `host: string`, `port: int`, `name: string?`, `isVideoCapable: bool` | `CastDeviceInfo` | Add a receiver by IP where mDNS does not reach |
+| `ForgetCastDevice` | `deviceId: string` | `bool` | Remove a receiver and its room selections |
+| `GetRoomCastTargets` | `roomId: int` | `string[]` | Saved default targets for a room |
+| `SetRoomCastTargets` | `roomId: int`, `deviceIds: string[]` | void | Save default targets (does not start casting) |
+| `StartCast` | `roomId: int`, `deviceIds: string[]?` | `CastStartResult` | Start casting; empty list uses the saved targets |
+| `StopCast` | `roomId: int`, `deviceIds: string[]?` | `int` | Stop casting the room, everywhere or on the given devices |
+| `GetCastSessions` | none | `CastSessionInfo[]` | Active cast sessions |
 
 ### Server-to-Client (On)
 
 | Event | Parameters | Description |
 |-------|------------|-------------|
 | `ReceiveIceCandidate` | `candidate: string`, `sdpMid: string`, `sdpMLineIndex: int` | Server ICE candidate |
+| `CastStateChanged` | none | Cast devices or sessions changed; re-fetch `GetCastDevices` |
 
 ## 6. Audio Format
 

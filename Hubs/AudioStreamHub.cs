@@ -19,6 +19,8 @@ public class AudioStreamHub : Hub
     private readonly IGoogleNestAuthService _nestAuthService;
     private readonly IGoogleNestDeviceService _nestDeviceService;
     private readonly IWebRtcConfigService _webRtcConfigService;
+    private readonly ICastDeviceService _castDeviceService;
+    private readonly ICastSessionService _castSessionService;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
@@ -29,7 +31,9 @@ public class AudioStreamHub : Hub
         IVideoStreamingService videoStreamingService,
         IGoogleNestAuthService nestAuthService,
         IGoogleNestDeviceService nestDeviceService,
-        IWebRtcConfigService webRtcConfigService)
+        IWebRtcConfigService webRtcConfigService,
+        ICastDeviceService castDeviceService,
+        ICastSessionService castSessionService)
     {
         _logger = logger;
         _audioWebRtcService = audioWebRtcService;
@@ -40,6 +44,8 @@ public class AudioStreamHub : Hub
         _nestAuthService = nestAuthService;
         _nestDeviceService = nestDeviceService;
         _webRtcConfigService = webRtcConfigService;
+        _castDeviceService = castDeviceService;
+        _castSessionService = castSessionService;
     }
 
     public override async Task OnConnectedAsync()
@@ -196,6 +202,8 @@ public class AudioStreamHub : Hub
         {
             _videoStreamingService.RefreshRooms();
             _audioStreamingService.RefreshRooms();
+            await _castSessionService.StopRoomAsync(id);
+            await _castDeviceService.SetRoomTargetsAsync(id, Array.Empty<string>());
             await Clients.Others.SendAsync("RoomsUpdated");
         }
         return result;
@@ -267,6 +275,104 @@ public class AudioStreamHub : Hub
     public async Task<bool> IsNestLinked()
     {
         return await _nestAuthService.IsLinked();
+    }
+    #endregion
+
+    #region Google Cast
+    /// <summary>Known cast receivers, with the room each one is currently playing.</summary>
+    public async Task<List<CastDeviceInfo>> GetCastDevices()
+    {
+        var devices = await _castDeviceService.GetDevicesAsync();
+        return Decorate(devices);
+    }
+
+    /// <summary>Runs an mDNS sweep now instead of waiting for the next scheduled one.</summary>
+    public async Task<List<CastDeviceInfo>> RefreshCastDevices()
+    {
+        var devices = await _castDeviceService.RefreshAsync();
+        await Clients.Others.SendAsync("CastStateChanged");
+        return Decorate(devices);
+    }
+
+    /// <summary>Adds a receiver by IP for networks where mDNS does not reach the server.</summary>
+    public async Task<CastDeviceInfo> AddCastDevice(string host, int port, string? name, bool isVideoCapable)
+    {
+        var device = await _castDeviceService.AddManualAsync(host, port, name, isVideoCapable);
+        await Clients.All.SendAsync("CastStateChanged");
+        return device;
+    }
+
+    public async Task<bool> ForgetCastDevice(string deviceId)
+    {
+        var removed = await _castDeviceService.ForgetAsync(deviceId);
+        if (removed)
+        {
+            await _castSessionService.StopDeviceAsync(deviceId);
+            await Clients.All.SendAsync("CastStateChanged");
+        }
+        return removed;
+    }
+
+    public async Task<List<string>> GetRoomCastTargets(int roomId)
+    {
+        var targets = await _castDeviceService.GetRoomTargetsAsync(roomId);
+        return targets.ToList();
+    }
+
+    /// <summary>Saves the default target selection for a room. Does not start or stop casting.</summary>
+    public async Task SetRoomCastTargets(int roomId, List<string> deviceIds)
+    {
+        await _castDeviceService.SetRoomTargetsAsync(roomId, deviceIds ?? new List<string>());
+        await Clients.Others.SendAsync("CastStateChanged");
+    }
+
+    /// <summary>Starts casting a room. Passing no device ids uses the room's saved targets.</summary>
+    public async Task<CastStartResult> StartCast(int roomId, List<string>? deviceIds)
+    {
+        var targets = deviceIds is { Count: > 0 }
+            ? deviceIds
+            : (await _castDeviceService.GetRoomTargetsAsync(roomId)).ToList();
+
+        if (targets.Count == 0)
+        {
+            return new CastStartResult();
+        }
+
+        var request = Context.GetHttpContext()?.Request;
+        string? requestBaseUrl = request == null ? null : $"{request.Scheme}://{request.Host}";
+
+        return await _castSessionService.StartAsync(roomId, targets, requestBaseUrl);
+    }
+
+    /// <summary>Stops casting a room everywhere, or only on the given devices.</summary>
+    public async Task<int> StopCast(int roomId, List<string>? deviceIds)
+    {
+        if (deviceIds is not { Count: > 0 })
+        {
+            return await _castSessionService.StopRoomAsync(roomId);
+        }
+
+        int stopped = 0;
+        foreach (var deviceId in deviceIds)
+        {
+            if (await _castSessionService.StopDeviceAsync(deviceId)) stopped++;
+        }
+        return stopped;
+    }
+
+    public List<CastSessionInfo> GetCastSessions()
+    {
+        return _castSessionService.GetSessions().ToList();
+    }
+
+    private List<CastDeviceInfo> Decorate(IReadOnlyList<CastDeviceInfo> devices)
+    {
+        foreach (var device in devices)
+        {
+            device.CastingRoomId = _castSessionService.RoomForDevice(device.DeviceId);
+            device.LastError = _castSessionService.LastErrorForDevice(device.DeviceId);
+        }
+        return devices.ToList();
     }
     #endregion
 
