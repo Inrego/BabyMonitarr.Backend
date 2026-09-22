@@ -5,17 +5,12 @@ using BabyMonitarr.Backend.Services;
 
 namespace BabyMonitarr.Backend.Ha;
 
-/// <summary>Frames a cast command produced: some go back to the caller, some to everyone.</summary>
-public sealed record HaCastCommandResult(
-    IReadOnlyList<string> Reply,
-    IReadOnlyList<string> Broadcast);
-
 public interface IHaCastBridge
 {
     /// <summary>True when this message type belongs to the cast.* space.</summary>
     bool Handles(string type);
 
-    Task<HaCastCommandResult> HandleAsync(
+    Task<HaCommandResult> HandleAsync(
         string type, JsonElement data, string? reference, string? baseUrl, CancellationToken ct);
 
     /// <summary>Full cast state for a newly connected client.</summary>
@@ -57,7 +52,7 @@ public class HaCastBridge : IHaCastBridge
 
     public bool Handles(string type) => type.StartsWith("cast.", StringComparison.Ordinal);
 
-    public async Task<HaCastCommandResult> HandleAsync(
+    public async Task<HaCommandResult> HandleAsync(
         string type, JsonElement data, string? reference, string? baseUrl, CancellationToken ct)
     {
         return type switch
@@ -76,7 +71,7 @@ public class HaCastBridge : IHaCastBridge
 
     #region Commands
 
-    private async Task<HaCastCommandResult> HandleDiscoveredAsync(
+    private async Task<HaCommandResult> HandleDiscoveredAsync(
         JsonElement data, string? reference, CancellationToken ct)
     {
         if (data.ValueKind != JsonValueKind.Object ||
@@ -115,12 +110,12 @@ public class HaCastBridge : IHaCastBridge
 
         await _castDeviceService.UpsertProxyDiscoveriesAsync(discoveries, ct);
 
-        return new HaCastCommandResult(
+        return new HaCommandResult(
             new[] { HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdCastDiscovered), reference) },
             new[] { await BuildDevicesFrameAsync(ct) });
     }
 
-    private async Task<HaCastCommandResult> HandleStartAsync(
+    private async Task<HaCommandResult> HandleStartAsync(
         JsonElement data, string? reference, string? baseUrl, CancellationToken ct)
     {
         int? roomId = HaJson.Int(data, "room_id");
@@ -165,10 +160,10 @@ public class HaCastBridge : IHaCastBridge
                 result.Failed),
             reference);
 
-        return new HaCastCommandResult(new[] { reply }, await BuildChangeFramesAsync(roomId.Value, ct));
+        return new HaCommandResult(new[] { reply }, await BuildChangeFramesAsync(roomId.Value, ct));
     }
 
-    private async Task<HaCastCommandResult> HandleStopAsync(
+    private async Task<HaCommandResult> HandleStopAsync(
         JsonElement data, string? reference, CancellationToken ct)
     {
         int? roomId = HaJson.Int(data, "room_id");
@@ -179,12 +174,12 @@ public class HaCastBridge : IHaCastBridge
 
         await _castSessionService.StopRoomAsync(roomId.Value);
 
-        return new HaCastCommandResult(
+        return new HaCommandResult(
             new[] { HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdCastStop), reference) },
             await BuildChangeFramesAsync(roomId.Value, ct));
     }
 
-    private async Task<HaCastCommandResult> HandleStopDeviceAsync(
+    private async Task<HaCommandResult> HandleStopDeviceAsync(
         JsonElement data, string? reference, CancellationToken ct)
     {
         string? deviceId = HaJson.String(data, "device_id");
@@ -203,12 +198,12 @@ public class HaCastBridge : IHaCastBridge
                 HaProtocol.ErrUnknownDevice, $"No cast session on device '{deviceId}'", reference));
         }
 
-        return new HaCastCommandResult(
+        return new HaCommandResult(
             new[] { HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdCastStopDevice), reference) },
             await BuildChangeFramesAsync(roomId, ct));
     }
 
-    private async Task<HaCastCommandResult> HandleSetTargetsAsync(
+    private async Task<HaCommandResult> HandleSetTargetsAsync(
         JsonElement data, string? reference, CancellationToken ct)
     {
         int? roomId = HaJson.Int(data, "room_id");
@@ -219,7 +214,7 @@ public class HaCastBridge : IHaCastBridge
 
         await _castDeviceService.SetRoomTargetsAsync(roomId.Value, HaJson.StringArray(data, "device_ids"), ct);
 
-        return new HaCastCommandResult(
+        return new HaCommandResult(
             new[] { HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdCastSetTargets), reference) },
             await BuildChangeFramesAsync(roomId.Value, ct));
     }
@@ -331,6 +326,6 @@ public class HaCastBridge : IHaCastBridge
     private static HaCastSessionInfo ToSessionInfo(CastSessionInfo session) =>
         new(session.DeviceId, session.Video, session.StartedAtUtc);
 
-    private static HaCastCommandResult Reply(string frame) =>
+    private static HaCommandResult Reply(string frame) =>
         new(new[] { frame }, Array.Empty<string>());
 }

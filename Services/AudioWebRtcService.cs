@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
 using SIPSorceryMedia.Abstractions;
+using BabyMonitarr.Backend.Ha;
 using BabyMonitarr.Backend.Hubs;
 
 namespace BabyMonitarr.Backend.Services
@@ -14,6 +15,13 @@ namespace BabyMonitarr.Backend.Services
     public interface IAudioWebRtcService
     {
         Task<string> CreateAudioPeerConnection(string peerId, int roomId, string? hostHint);
+
+        /// <summary>
+        /// Answers a remote offer instead of making one. Used by Home Assistant, which supplies
+        /// the offer. Separate from <see cref="CreateAudioPeerConnection"/> on purpose — the offer
+        /// path is what every app client uses and is not touched by this.
+        /// </summary>
+        Task<string> CreateAudioAnswer(string peerId, int roomId, string offerSdp, string? hostHint);
         Task SetAudioRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc);
         Task AddAudioIceCandidate(string peerId, int roomId, RTCIceCandidateInit candidate);
         Task CloseAudioPeerConnection(string peerId, int roomId);
@@ -26,6 +34,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly IAudioStreamingService _audioStreamingService;
         private readonly IHubContext<AudioStreamHub> _hubContext;
         private readonly IWebRtcConfigService _webRtcConfigService;
+        private readonly IHaPeerRouter _haPeerRouter;
 
         // Peer connections keyed by "{peerId}_a_{roomId}"
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = new();
@@ -46,12 +55,14 @@ namespace BabyMonitarr.Backend.Services
             ILogger<AudioWebRtcService> logger,
             IAudioStreamingService audioStreamingService,
             IHubContext<AudioStreamHub> hubContext,
-            IWebRtcConfigService webRtcConfigService)
+            IWebRtcConfigService webRtcConfigService,
+            IHaPeerRouter haPeerRouter)
         {
             _logger = logger;
             _audioStreamingService = audioStreamingService;
             _hubContext = hubContext;
             _webRtcConfigService = webRtcConfigService;
+            _haPeerRouter = haPeerRouter;
 
             // Subscribe to sound threshold events
             _audioStreamingService.SoundThresholdExceeded += OnSoundThresholdExceeded;
@@ -219,6 +230,246 @@ namespace BabyMonitarr.Backend.Services
             return sdp;
         }
 
+        /// <summary>
+        /// Builds an answer to <paramref name="offerSdp"/>. The answer carries only codecs this
+        /// room can actually produce, using the payload ids the remote proposed.
+        /// </summary>
+        /// <remarks>
+        /// No data channel is created here. The offer path adds one for audio-level updates, but a
+        /// locally-added channel would not appear in an answer to an offer that has no
+        /// <c>m=application</c> section. Home Assistant gets levels from <c>sound_level</c> instead.
+        /// </remarks>
+        public async Task<string> CreateAudioAnswer(string peerId, int roomId, string offerSdp, string? hostHint)
+        {
+            string key = GetConnectionKey(peerId, roomId);
+
+            if (_peerConnections.ContainsKey(key))
+            {
+                _logger.LogWarning("Audio peer connection already exists for {Key}, closing existing", key);
+                await CloseAudioPeerConnection(peerId, roomId);
+            }
+
+            _logger.LogInformation(
+                "Answering audio WebRTC offer for peer {PeerId}, room {RoomId}", peerId, roomId);
+
+            var offeredFormats = ParseOfferedAudioFormats(offerSdp, out string offeredSummary);
+            if (offeredFormats.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"The WebRTC offer for room {roomId} has no usable audio media section " +
+                    $"(it listed: {offeredSummary}).");
+            }
+
+            var settings = _webRtcConfigService.GetPeerConnectionSettings(hostHint);
+            var advertisedAddress = settings.AdvertisedAddress;
+            var pc = new RTCPeerConnection(settings.Configuration, settings.BindPort, settings.PortRange, false);
+
+            pc.onicecandidate += candidate =>
+            {
+                if (candidate == null) return;
+
+                _ = SendAudioIceCandidate(peerId, roomId, candidate);
+
+                var advertisedCandidate = _webRtcConfigService.CreateAdvertisedCandidate(candidate, advertisedAddress);
+                if (advertisedCandidate != null)
+                {
+                    _ = SendAudioIceCandidate(peerId, roomId, advertisedCandidate);
+                }
+            };
+
+            pc.onicecandidateerror += (candidate, error) =>
+            {
+                _logger.LogWarning(
+                    "Audio ICE candidate error for {Key}. Error={Error}, Candidate={Candidate}",
+                    key, error, candidate?.candidate);
+            };
+
+            pc.onconnectionstatechange += state =>
+            {
+                _logger.LogInformation(
+                    "Audio connection state changed to {State} for peer {PeerId}, room {RoomId}",
+                    state, peerId, roomId);
+
+                if (state == RTCPeerConnectionState.failed)
+                {
+                    _logger.LogWarning("Audio peer connection failed for {Key}, closing...", key);
+                    Task.Run(() => CloseAudioPeerConnection(peerId, roomId));
+                }
+            };
+
+            _peerConnections.TryAdd(key, pc);
+
+            bool isNestRoom = _audioStreamingService.IsNestRoom(roomId);
+            try
+            {
+                if (isNestRoom)
+                {
+                    // Nest is raw Opus passthrough: nothing else can be answered.
+                    var localOpus = new AudioFormat(
+                        AudioCodecsEnum.OPUS, 111, 48000, 2, "minptime=10;useinbandfec=1");
+                    var matched = MatchAudioFormats(new List<AudioFormat> { localOpus }, offeredFormats);
+
+                    if (matched.Count == 0)
+                    {
+                        throw new WebRtcCodecMismatchException(
+                            $"The WebRTC offer does not include Opus, which room {roomId} requires: " +
+                            $"its Nest audio is forwarded without transcoding. The offer listed: {offeredSummary}.");
+                    }
+
+                    pc.addTrack(new MediaStreamTrack(matched, MediaStreamStatusEnum.SendOnly));
+
+                    pc.OnAudioFormatsNegotiated += audioFormats =>
+                    {
+                        var selectedFormat = audioFormats.First();
+                        _logger.LogInformation(
+                            "Audio formats negotiated for {Key}: {Formats}. Selected: {Selected}",
+                            key,
+                            string.Join(", ", audioFormats.Select(f => f.FormatName)),
+                            selectedFormat.FormatName);
+                        _negotiatedFormats[key] = selectedFormat;
+                    };
+                }
+                else
+                {
+                    // RTSP audio is re-encoded, so anything the encoder supports and the offer
+                    // listed is fair game.
+                    var audioEncoder = new AudioEncoder(includeOpus: true);
+                    var audioSource = new AudioExtrasSource(audioEncoder,
+                        new AudioSourceOptions { AudioSource = AudioSourcesEnum.None });
+
+                    var matched = MatchAudioFormats(audioSource.GetAudioSourceFormats(), offeredFormats);
+                    if (matched.Count == 0)
+                    {
+                        audioSource.CloseAudio().Wait();
+                        throw new WebRtcCodecMismatchException(
+                            $"The WebRTC offer shares no audio codec with room {roomId}. " +
+                            $"The offer listed: {offeredSummary}.");
+                    }
+
+                    pc.addTrack(new MediaStreamTrack(matched, MediaStreamStatusEnum.SendOnly));
+
+                    pc.OnAudioFormatsNegotiated += audioFormats =>
+                    {
+                        var selectedFormat = audioFormats.First();
+                        _logger.LogInformation(
+                            "Audio formats negotiated for {Key}: {Formats}. Selected: {Selected}",
+                            key,
+                            string.Join(", ", audioFormats.Select(f => f.FormatName)),
+                            selectedFormat.FormatName);
+                        audioSource.SetAudioSourceFormat(selectedFormat);
+                        _negotiatedFormats[key] = selectedFormat;
+                    };
+
+                    _audioSources.TryAdd(key, audioSource);
+                    _audioEncoders.TryAdd(key, audioEncoder);
+                }
+
+                var setResult = pc.setRemoteDescription(new RTCSessionDescriptionInit
+                {
+                    type = RTCSdpType.offer,
+                    sdp = offerSdp
+                });
+
+                if (setResult != SetDescriptionResultEnum.OK)
+                {
+                    throw new InvalidOperationException(
+                        $"The WebRTC offer for room {roomId} was rejected: {setResult}.");
+                }
+
+                var answerInit = pc.createAnswer(null);
+                await pc.setLocalDescription(answerInit);
+
+                string sdp = pc.localDescription?.sdp?.ToString() ?? string.Empty;
+                if (string.IsNullOrEmpty(sdp))
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to create an audio SDP answer for room {roomId}.");
+                }
+
+                Action<AudioFrameEventArgs> frameHandler = args =>
+                {
+                    if (args.RawOpusData != null)
+                    {
+                        SendRawAudioToPeer(key, args.RawOpusData, args.DurationRtpUnits);
+                    }
+                    else
+                    {
+                        SendAudioDataToPeer(key, args.AudioData, args.SampleRate);
+                    }
+                };
+                _frameHandlers.TryAdd(key, frameHandler);
+                _audioStreamingService.SubscribeToRoom(roomId, frameHandler);
+
+                _logger.LogInformation("Audio answer created for {Key}", key);
+                return sdp;
+            }
+            catch
+            {
+                await CloseAudioPeerConnection(peerId, roomId);
+                throw;
+            }
+        }
+
+        /// <summary>The remote offer's audio formats, or an empty list when it has no audio section.</summary>
+        private static List<SDPAudioVideoMediaFormat> ParseOfferedAudioFormats(
+            string offerSdp, out string offeredSummary)
+        {
+            offeredSummary = "nothing";
+
+            SDP offer;
+            try
+            {
+                offer = SDP.ParseSDPDescription(offerSdp);
+            }
+            catch (Exception)
+            {
+                offeredSummary = "an SDP that could not be parsed";
+                return new List<SDPAudioVideoMediaFormat>();
+            }
+
+            var announcement = offer.Media.FirstOrDefault(m => m.Media == SDPMediaTypesEnum.audio);
+            if (announcement?.MediaFormats == null || announcement.MediaFormats.Count == 0)
+            {
+                offeredSummary = "no audio media section";
+                return new List<SDPAudioVideoMediaFormat>();
+            }
+
+            var formats = announcement.MediaFormats.Values.ToList();
+            offeredSummary = string.Join(", ", formats
+                .Select(f => $"{f.Name()}({f.ID})")
+                .Where(n => !string.IsNullOrWhiteSpace(n)));
+            return formats;
+        }
+
+        /// <summary>
+        /// Intersects what this room can send with what the remote offered, keeping the remote's
+        /// payload id so the answer stays on the wire numbering the remote chose, and the local
+        /// clock rate, channel count and parameters so the encoder gets what it expects.
+        /// </summary>
+        private static List<AudioFormat> MatchAudioFormats(
+            List<AudioFormat> localFormats, List<SDPAudioVideoMediaFormat> offeredFormats)
+        {
+            var matched = new List<AudioFormat>();
+
+            foreach (var offered in offeredFormats)
+            {
+                string? name = offered.Name();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+
+                foreach (var local in localFormats)
+                {
+                    if (!string.Equals(local.Codec.ToString(), name, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (matched.Any(m => m.Codec == local.Codec)) continue;
+
+                    matched.Add(new AudioFormat(
+                        local.Codec, offered.ID, local.ClockRate, local.ChannelCount, local.Parameters));
+                    break;
+                }
+            }
+
+            return matched;
+        }
+
         public Task SetAudioRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc)
         {
             string key = GetConnectionKey(peerId, roomId);
@@ -369,6 +620,14 @@ namespace BabyMonitarr.Backend.Services
 
         private Task SendAudioIceCandidate(string peerId, int roomId, RTCIceCandidate candidate)
         {
+            // A Home Assistant peer signals over /ha/ws and has no SignalR connection to push to.
+            if (_haPeerRouter.TrySendIceCandidate(
+                    peerId, "audio", roomId, candidate.candidate, candidate.sdpMid ?? string.Empty,
+                    candidate.sdpMLineIndex))
+            {
+                return Task.CompletedTask;
+            }
+
             return _hubContext.Clients.Client(peerId).SendAsync(
                 "ReceiveAudioIceCandidate",
                 roomId,

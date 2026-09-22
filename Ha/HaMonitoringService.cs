@@ -37,6 +37,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     private readonly IHaViewerCounter _viewerCounter;
     private readonly IAppVersionProvider _versionProvider;
     private readonly IHaCastBridge _castBridge;
+    private readonly IHaWebRtcBridge _webRtcBridge;
+    private readonly HaPeerRegistry _peerRegistry;
     private readonly HaOptions _options;
 
     private readonly ConcurrentDictionary<string, HaConnection> _connections = new();
@@ -62,6 +64,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         IHaViewerCounter viewerCounter,
         IAppVersionProvider versionProvider,
         IHaCastBridge castBridge,
+        IHaWebRtcBridge webRtcBridge,
+        HaPeerRegistry peerRegistry,
         IOptions<HaOptions> options)
     {
         _logger = logger;
@@ -71,6 +75,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         _viewerCounter = viewerCounter;
         _versionProvider = versionProvider;
         _castBridge = castBridge;
+        _webRtcBridge = webRtcBridge;
+        _peerRegistry = peerRegistry;
         _options = options.Value;
     }
 
@@ -112,6 +118,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     public async Task RegisterAsync(HaConnection connection, CancellationToken ct)
     {
         _connections[connection.Id] = connection;
+        _peerRegistry.Register(connection);
         _logger.LogInformation("HA client {ConnectionId} connected as {User}. Total HA clients: {Count}",
             connection.Id, connection.UserName, _connections.Count);
 
@@ -122,6 +129,11 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
     public void Unregister(HaConnection connection)
     {
+        _peerRegistry.Unregister(connection);
+
+        // The socket is gone, so its peer connections are dead weight holding readers open.
+        _ = _webRtcBridge.CloseAllAsync(connection);
+
         if (_connections.TryRemove(connection.Id, out _))
         {
             _logger.LogInformation("HA client {ConnectionId} disconnected. Remaining HA clients: {Count}",
@@ -139,7 +151,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
             _versionProvider.DisplayVersion,
             _options.LevelBroadcastIntervalMs,
             _options.SoundClearHoldSeconds,
-            new[] { "monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast" }), reference));
+            new[] { "monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast", "webrtc" }), reference));
 
         connection.TryEnqueue(_lastRoomsFrame ?? HaFrames.Build(HaProtocol.Rooms, new HaRoomsData(_rooms)));
         if (_lastSettingsFrame != null) connection.TryEnqueue(_lastSettingsFrame);
@@ -215,6 +227,14 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                 break;
 
             default:
+                if (_webRtcBridge.Handles(type))
+                {
+                    var webRtcResult = await _webRtcBridge.HandleAsync(connection, type, data, reference, ct);
+                    foreach (var frame in webRtcResult.Reply) connection.TryEnqueue(frame);
+                    foreach (var frame in webRtcResult.Broadcast) Broadcast(frame);
+                    break;
+                }
+
                 if (_castBridge.Handles(type))
                 {
                     var castResult = await _castBridge.HandleAsync(type, data, reference, connection.BaseUrl, ct);

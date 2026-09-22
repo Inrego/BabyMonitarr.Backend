@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using BabyMonitarr.Backend.Ha;
 using BabyMonitarr.Backend.Hubs;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
@@ -11,6 +12,13 @@ namespace BabyMonitarr.Backend.Services
     public interface IVideoWebRtcService
     {
         Task<string> CreateVideoPeerConnection(string peerId, int roomId, string? hostHint);
+
+        /// <summary>
+        /// Answers a remote offer instead of making one. Used by Home Assistant, whose camera API
+        /// supplies the offer. Separate from <see cref="CreateVideoPeerConnection"/> on purpose —
+        /// the offer path is what every app client uses and is not touched by this.
+        /// </summary>
+        Task<string> CreateVideoAnswer(string peerId, int roomId, string offerSdp, string? hostHint);
         Task SetVideoRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc);
         Task AddVideoIceCandidate(string peerId, int roomId, RTCIceCandidateInit candidate);
         Task CloseVideoPeerConnection(string peerId, int roomId);
@@ -29,6 +37,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly IVideoStreamingService _videoStreamingService;
         private readonly IHubContext<AudioStreamHub> _hubContext;
         private readonly IWebRtcConfigService _webRtcConfigService;
+        private readonly IHaPeerRouter _haPeerRouter;
 
         // Peer connections keyed by "{peerId}_v_{roomId}".
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = new();
@@ -43,12 +52,14 @@ namespace BabyMonitarr.Backend.Services
             ILogger<VideoWebRtcService> logger,
             IVideoStreamingService videoStreamingService,
             IHubContext<AudioStreamHub> hubContext,
-            IWebRtcConfigService webRtcConfigService)
+            IWebRtcConfigService webRtcConfigService,
+            IHaPeerRouter haPeerRouter)
         {
             _logger = logger;
             _videoStreamingService = videoStreamingService;
             _hubContext = hubContext;
             _webRtcConfigService = webRtcConfigService;
+            _haPeerRouter = haPeerRouter;
         }
 
         private static string GetConnectionKey(string peerId, int roomId) => $"{peerId}_v_{roomId}";
@@ -201,6 +212,229 @@ namespace BabyMonitarr.Backend.Services
                 _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Builds an answer to <paramref name="offerSdp"/> carrying only the room's passthrough
+        /// codec, taken from the remote offer so the payload id and fmtp are the ones the remote
+        /// actually proposed.
+        /// </summary>
+        public async Task<string> CreateVideoAnswer(string peerId, int roomId, string offerSdp, string? hostHint)
+        {
+            string key = GetConnectionKey(peerId, roomId);
+
+            if (_peerConnections.ContainsKey(key))
+            {
+                _logger.LogWarning("Video peer connection already exists for {Key}, closing existing", key);
+                await CloseVideoPeerConnection(peerId, roomId);
+            }
+
+            _logger.LogInformation(
+                "Answering video WebRTC offer for peer {PeerId}, room {RoomId}", peerId, roomId);
+
+            // Same source-of-truth as the offer path: VideoCodecProbeService decides the codec.
+            RoomVideoSourceInfo sourceInfo;
+            using (var lookupTimeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(SourceCodecLookupTimeoutMs)))
+            {
+                try
+                {
+                    sourceInfo = await _videoStreamingService.GetRoomVideoSourceInfoAsync(roomId, lookupTimeoutCts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+                    throw new InvalidOperationException(
+                        $"Timed out waiting for the video source codec in room {roomId}. " +
+                        "Unable to answer with a passthrough-only description.");
+                }
+            }
+
+            if (!sourceInfo.IsSupported || sourceInfo.PassthroughCodec is null)
+            {
+                _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+                throw new InvalidOperationException(
+                    sourceInfo.FailureReason ??
+                    $"Video source codec '{sourceInfo.SourceCodecName}' is not supported for passthrough.");
+            }
+
+            VideoPassthroughCodec expectedCodec = sourceInfo.PassthroughCodec.Value;
+
+            // The remote offer lists codecs the RTP forwarder cannot produce. Pick ours out of it,
+            // or fail: transcoding is not an option here and a mismatched answer would send frames
+            // the remote cannot decode.
+            var offeredFormat = SelectPassthroughFormatFromOffer(offerSdp, expectedCodec, out string offeredSummary);
+            if (offeredFormat == null)
+            {
+                _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+                throw new WebRtcCodecMismatchException(
+                    $"The WebRTC offer does not include the room's video codec '{expectedCodec}'. " +
+                    $"The offer listed: {offeredSummary}. " +
+                    "The camera is forwarded without transcoding, so the offer must include this codec.");
+            }
+
+            var settings = _webRtcConfigService.GetPeerConnectionSettings(hostHint);
+            var advertisedAddress = settings.AdvertisedAddress;
+            var pc = new RTCPeerConnection(settings.Configuration, settings.BindPort, settings.PortRange, false);
+
+            pc.onicecandidate += candidate =>
+            {
+                if (candidate == null) return;
+
+                _ = SendVideoIceCandidate(peerId, roomId, candidate);
+
+                var advertisedCandidate = _webRtcConfigService.CreateAdvertisedCandidate(candidate, advertisedAddress);
+                if (advertisedCandidate != null)
+                {
+                    _ = SendVideoIceCandidate(peerId, roomId, advertisedCandidate);
+                }
+            };
+
+            pc.onicecandidateerror += (candidate, error) =>
+            {
+                _logger.LogWarning(
+                    "Video ICE candidate error for {Key}. Error={Error}, Candidate={Candidate}",
+                    key, error, candidate?.candidate);
+            };
+
+            pc.onconnectionstatechange += state =>
+            {
+                _logger.LogInformation(
+                    "Video connection state changed to {State} for peer {PeerId}, room {RoomId}",
+                    state, peerId, roomId);
+
+                if (state == RTCPeerConnectionState.failed)
+                {
+                    _logger.LogWarning("Video peer connection failed for {Key}, closing...", key);
+                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId));
+                }
+            };
+
+            pc.OnVideoFormatsNegotiated += videoFormats =>
+            {
+                if (videoFormats.Count == 0)
+                {
+                    _logger.LogWarning(
+                        "No video formats were negotiated for {Key}. Expected source codec {ExpectedCodec}.",
+                        key, expectedCodec);
+                    return;
+                }
+
+                var selected = videoFormats[0];
+                _negotiatedCodecs[key] = selected.Codec;
+                _logger.LogInformation(
+                    "Video formats negotiated for {Key}: {Formats}. Selected: {SelectedCodec}. Expected source codec: {ExpectedCodec}",
+                    key,
+                    string.Join(", ", videoFormats.Select(f => f.FormatName)),
+                    selected.Codec,
+                    expectedCodec);
+            };
+
+            // Exactly one format, echoing the remote's own payload id and fmtp for that codec.
+            var videoTrack = new MediaStreamTrack(
+                new List<VideoFormat> { offeredFormat.Value }, MediaStreamStatusEnum.SendOnly);
+            pc.addTrack(videoTrack);
+
+            _expectedCodecs[key] = expectedCodec;
+            _peerConnections.TryAdd(key, pc);
+
+            try
+            {
+                var setResult = pc.setRemoteDescription(new RTCSessionDescriptionInit
+                {
+                    type = RTCSdpType.offer,
+                    sdp = offerSdp
+                });
+
+                if (setResult != SetDescriptionResultEnum.OK)
+                {
+                    throw new InvalidOperationException(
+                        $"The WebRTC offer for room {roomId} was rejected: {setResult}.");
+                }
+
+                EnsureNegotiatedCodec(key, roomId);
+
+                var answerInit = pc.createAnswer(null);
+                await pc.setLocalDescription(answerInit);
+
+                string sdp = pc.localDescription?.sdp?.ToString() ?? string.Empty;
+                if (string.IsNullOrEmpty(sdp))
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to create a video SDP answer for room {roomId}.");
+                }
+
+                Action<VideoFrameEventArgs> frameHandler = args => SendVideoFrameToPeer(key, args);
+                _frameHandlers.TryAdd(key, frameHandler);
+                _videoStreamingService.SubscribeToRoom(roomId, frameHandler);
+
+                _logger.LogInformation(
+                    "Video answer created for {Key} with source codec {Codec} on payload {PayloadId}",
+                    key, expectedCodec, offeredFormat.Value.FormatID);
+                return sdp;
+            }
+            catch
+            {
+                await CloseVideoPeerConnection(peerId, roomId);
+                _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Finds the remote offer's entry for <paramref name="codec"/>, preserving its payload id
+        /// and fmtp. <paramref name="offeredSummary"/> describes what the offer did contain, for
+        /// the error message when there is no match.
+        /// </summary>
+        private static VideoFormat? SelectPassthroughFormatFromOffer(
+            string offerSdp, VideoPassthroughCodec codec, out string offeredSummary)
+        {
+            offeredSummary = "nothing";
+
+            SDP offer;
+            try
+            {
+                offer = SDP.ParseSDPDescription(offerSdp);
+            }
+            catch (Exception)
+            {
+                offeredSummary = "an SDP that could not be parsed";
+                return null;
+            }
+
+            var videoAnnouncement = offer.Media
+                .FirstOrDefault(m => m.Media == SDPMediaTypesEnum.video);
+            if (videoAnnouncement?.MediaFormats == null || videoAnnouncement.MediaFormats.Count == 0)
+            {
+                offeredSummary = "no video media section";
+                return null;
+            }
+
+            var formats = videoAnnouncement.MediaFormats.Values.ToList();
+            offeredSummary = string.Join(", ", formats
+                .Select(f => $"{f.Name()}({f.ID})")
+                .Where(n => !string.IsNullOrWhiteSpace(n)));
+
+            string wanted = codec switch
+            {
+                VideoPassthroughCodec.H264 => "H264",
+                VideoPassthroughCodec.H265 => "H265",
+                VideoPassthroughCodec.VP8 => "VP8",
+                _ => throw new ArgumentOutOfRangeException(nameof(codec), codec, "Unsupported passthrough codec.")
+            };
+
+            foreach (var format in formats)
+            {
+                string? name = format.Name();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (!string.Equals(name, wanted, StringComparison.OrdinalIgnoreCase)) continue;
+
+                // H.265 is sometimes announced as HEVC; Name() normalises the common spellings.
+                int clockRate = format.ClockRate() > 0 ? format.ClockRate() : 90000;
+                return new VideoFormat(
+                    ToVideoCodecsEnum(codec), format.ID, clockRate, format.Fmtp ?? string.Empty);
+            }
+
+            return null;
         }
 
         public Task SetVideoRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc)
@@ -437,6 +671,14 @@ namespace BabyMonitarr.Backend.Services
 
         private Task SendVideoIceCandidate(string peerId, int roomId, RTCIceCandidate candidate)
         {
+            // A Home Assistant peer signals over /ha/ws and has no SignalR connection to push to.
+            if (_haPeerRouter.TrySendIceCandidate(
+                    peerId, "video", roomId, candidate.candidate, candidate.sdpMid ?? string.Empty,
+                    candidate.sdpMLineIndex))
+            {
+                return Task.CompletedTask;
+            }
+
             return _hubContext.Clients.Client(peerId).SendAsync(
                 "ReceiveVideoIceCandidate",
                 roomId,

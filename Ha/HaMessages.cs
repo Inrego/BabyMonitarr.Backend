@@ -30,6 +30,9 @@ public static class HaProtocol
     public const string SoundEvent = "sound_event";
     public const string StreamOnline = "stream_online";
     public const string Monitoring = "monitoring";
+    public const string WebRtcAnswer = "webrtc.answer";
+    public const string WebRtcCandidate = "webrtc.candidate";
+    public const string WebRtcClosed = "webrtc.closed";
     public const string CastDevices = "cast.devices";
     public const string CastState = "cast.state";
     public const string CastStartResult = "cast.start_result";
@@ -43,6 +46,9 @@ public static class HaProtocol
     public const string CmdSetMonitoring = "set_monitoring";
     public const string CmdSetGlobalSettings = "set_global_settings";
     public const string CmdSetActiveRoom = "set_active_room";
+    public const string CmdWebRtcOffer = "webrtc.offer";
+    public const string CmdWebRtcCandidate = "webrtc.candidate";
+    public const string CmdWebRtcStop = "webrtc.stop";
     public const string CmdCastDiscovered = "cast.discovered";
     public const string CmdCastStart = "cast.start";
     public const string CmdCastStop = "cast.stop";
@@ -54,6 +60,12 @@ public static class HaProtocol
     public const string ErrUnknownType = "unknown_type";
     public const string ErrUnknownRoom = "unknown_room";
     public const string ErrUnknownDevice = "unknown_device";
+    public const string ErrWebRtcCodecMismatch = "webrtc_codec_mismatch";
+    public const string ErrWebRtcFailed = "webrtc_failed";
+
+    /// <summary>Media kinds a webrtc.* message can carry.</summary>
+    public const string KindVideo = "video";
+    public const string KindAudio = "audio";
     public const string ErrInternal = "internal_error";
 }
 
@@ -175,3 +187,32 @@ public sealed record HaCastStartResultData(
     [property: JsonPropertyName("room_id")] int RoomId,
     [property: JsonPropertyName("started")] IReadOnlyList<HaCastSessionInfo> Started,
     [property: JsonPropertyName("failed")] IReadOnlyDictionary<string, string> Failed);
+
+public sealed record HaWebRtcAnswerData(
+    [property: JsonPropertyName("room_id")] int RoomId,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("sdp")] string Sdp);
+
+public sealed record HaWebRtcCandidateData(
+    [property: JsonPropertyName("room_id")] int RoomId,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("candidate")] string Candidate,
+    [property: JsonPropertyName("sdp_mid")] string SdpMid,
+    [property: JsonPropertyName("sdp_m_line_index")] int SdpMLineIndex);
+
+public sealed record HaWebRtcClosedData(
+    [property: JsonPropertyName("room_id")] int RoomId,
+    [property: JsonPropertyName("kind")] string Kind,
+    [property: JsonPropertyName("reason")] string Reason);
+
+/// <summary>
+/// What a command handler produced: frames for the caller, and frames for every client. Handlers
+/// return frames instead of broadcasting so they need no reference back to the connection registry.
+/// </summary>
+public sealed record HaCommandResult(
+    IReadOnlyList<string> Reply,
+    IReadOnlyList<string> Broadcast)
+{
+    public static readonly HaCommandResult Empty =
+        new(Array.Empty<string>(), Array.Empty<string>());
+}

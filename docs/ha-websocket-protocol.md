@@ -1,8 +1,9 @@
 # BabyMonitarr ↔ Home Assistant WebSocket protocol
 
 Version **1**. Implemented in `Ha/` (`HaWebSocketEndpoint.cs`, `HaConnection.cs`,
-`HaMonitoringService.cs`, `HaCastBridge.cs`, `HaMessages.cs`, `HaJson.cs`). This document is the
-contract; if code and document disagree, that is a bug in one of them.
+`HaMonitoringService.cs`, `HaWebRtcBridge.cs`, `HaCastBridge.cs`, `HaPeerRegistry.cs`,
+`HaMessages.cs`, `HaJson.cs`). This document is the contract; if code and document disagree, that
+is a bug in one of them.
 
 The endpoint is plain WebSocket, deliberately not SignalR — the Home Assistant side has no
 SignalR client. It runs alongside the existing `/audioHub` SignalR hub and changes nothing about
@@ -83,7 +84,7 @@ First frame on every connection.
   "server_version": "1.4.2",
   "level_interval_ms": 1000,
   "sound_clear_hold_seconds": 30,
-  "features": ["monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast"]
+  "features": ["monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast", "webrtc"]
 }
 ```
 
@@ -235,6 +236,42 @@ clients, not only the requester.
 "data": { "room_id": 1, "enabled": true }
 ```
 
+### `webrtc.answer`
+The answer to a `webrtc.offer`. Sent only to the requester, with `ref` set.
+
+```jsonc
+"data": {
+  "room_id": 1,
+  "kind": "video",   // "video" | "audio" — echoes the offer
+  "sdp": "v=0\r\no=- ..."
+}
+```
+
+### `webrtc.candidate`
+A server-side ICE candidate, trickled as gathering proceeds. Sent unsolicited after an answer, no
+`ref`. Same shape in both directions.
+
+```jsonc
+"data": {
+  "room_id": 1,
+  "kind": "video",
+  "candidate": "candidate:1 1 udp 2130706431 192.168.1.10 50000 typ host",
+  "sdp_mid": "0",
+  "sdp_m_line_index": 0
+}
+```
+
+The server may send the **same candidate twice with different addresses**: once as gathered, and
+once rewritten to the configured advertised address (the `WebRtc:AdvertisedAddress` setting, or the
+host inferred from the handshake). Both are real candidates; add both and let ICE pick.
+
+### `webrtc.closed`
+The server tore a peer connection down.
+
+```jsonc
+"data": { "room_id": 1, "kind": "video", "reason": "Closed by client" }
+```
+
 ### `cast.devices`
 Every Cast receiver the backend knows, from all three discovery origins. Sent in the snapshot,
 after any `cast.*` command, and again whenever the list or a device's state changes.
@@ -324,6 +361,8 @@ a request, otherwise `null`.
 | `unknown_type` | The `type` is not a command this protocol version handles. |
 | `unknown_room` | `room_id` does not exist. |
 | `unknown_device` | `device_id` is not a device, or has no session to stop. |
+| `webrtc_codec_mismatch` | The offer did not contain the codec this room is forwarded in. Actionable: change what the offer lists. |
+| `webrtc_failed` | Any other negotiation failure — no source codec, probe timeout, rejected SDP. `message` carries the specific reason. |
 | `internal_error` | The command threw. The connection stays open. |
 
 ### `pong`
@@ -371,6 +410,53 @@ step. Answered with a broadcast `global_settings` (if anything changed) and an `
 ```
 Answered with a broadcast `active_room` and an `ack`; SignalR clients get `ActiveRoomChanged`.
 `unknown_room` if the room does not exist.
+
+### `webrtc.offer`
+Hands the backend an offer and gets an answer. This is the direction Home Assistant's camera API
+uses.
+
+```jsonc
+{
+  "type": "webrtc.offer",
+  "id": "30",
+  "data": {
+    "room_id": 1,
+    "kind": "video",          // optional; "audio" selects audio, anything else (or absent) is video
+    "sdp": "v=0\r\no=- ..."
+  }
+}
+```
+
+Answered with `webrtc.answer`, then a stream of `webrtc.candidate` frames. On failure, `error`
+with `webrtc_codec_mismatch` or `webrtc_failed` and nothing is left allocated.
+
+Re-offering for a room that already has a peer on this connection **replaces** it: the old peer is
+closed first. One peer per `(connection, room, kind)`.
+
+### `webrtc.candidate`
+A client ICE candidate. Identical shape to the server→client message. No reply — not even an
+`ack`, because candidates are high-rate. A candidate for a peer that no longer exists is dropped
+silently rather than raising an error.
+
+```jsonc
+{
+  "type": "webrtc.candidate",
+  "data": {
+    "room_id": 1, "kind": "video",
+    "candidate": "candidate:...", "sdp_mid": "0", "sdp_m_line_index": 0
+  }
+}
+```
+
+Candidates arriving before the answer is applied are queued server-side and replayed, so there is
+no need to wait for `webrtc.answer` before sending them.
+
+### `webrtc.stop`
+```jsonc
+{ "type": "webrtc.stop", "id": "31", "data": { "room_id": 1, "kind": "video" } }
+```
+Closes the peer. Answered with `webrtc.closed` and an `ack`. Stopping a peer that does not exist is
+a success.
 
 ### `cast.discovered`
 The mDNS proxy push. Home Assistant runs the `_googlecast._tcp.local.` browser (it has host
@@ -469,6 +555,10 @@ Reconnect contract:
   monitoring on for it. This is intentional.
 - Sound state, level and stream-online are derived, not persisted; after a backend restart they
   begin at `false`/`null` and refill as audio arrives.
+- **WebRTC peers die with the socket.** When a /ha/ws connection drops, every peer connection it
+  owns is closed server-side, mirroring what the SignalR hub does on disconnect. A reconnecting
+  client must re-offer; there is no session to resume and no `webrtc.closed` will arrive for peers
+  killed this way, because the socket carrying it is already gone.
 - **Cast devices and saved targets are persisted**; live cast sessions are not and do not survive a
   backend restart. Proxy-discovered devices keep their last known host, so HA should re-push
   `cast.discovered` on every reconnect.
@@ -520,57 +610,88 @@ poll.
 
 ---
 
-## 8. Extension points
+## 8. Subsystem notes
 
-These are reserved now so a later task can add them without a version bump. **A v1 client must
-ignore server frames whose `type` it does not recognise**, which is what makes this safe.
+The two prefixed message spaces, `webrtc.` and `cast.`, are both implemented; §8.1 and §8.2 are
+the models behind their messages, which are specified in §3 and §4 like everything else. §8.3 is
+what remains genuinely reserved.
 
-### 8.1 WebRTC signalling — reserved prefix `webrtc.`
+**A v1 client must ignore server frames whose `type` it does not recognise** and unknown fields
+inside `data`. That is what lets further message types be added without a version bump.
 
-**Not implemented. Blocked on a design decision, not on effort.** The prefix stays reserved; a v1
-client must keep ignoring `webrtc.*` frames, and a `webrtc.*` command is answered with `error` /
-`unknown_type`.
+### 8.1 WebRTC signalling — `webrtc.` — IMPLEMENTED
 
-The reason is a direction mismatch that the HA-side worker needs to know about before building a
-camera entity:
+The messages are specified in §3 (`webrtc.answer`, `webrtc.candidate`, `webrtc.closed`) and §4
+(`webrtc.offer`, `webrtc.candidate`, `webrtc.stop`). This section is the model behind them, and it
+matters more than usual because the constraints here are not negotiable.
 
-- **The backend is always the offerer.** `AudioWebRtcService` and `VideoWebRtcService` both do
-  `pc.createOffer()` + `setLocalDescription()` and hand the offer SDP to the client; the client
-  replies with an answer (`SetVideoRemoteDescription`) and trickles its ICE candidates in.
-- **Home Assistant's native camera WebRTC is the opposite.** `Camera.async_handle_async_webrtc_offer`
-  receives an offer from HA and expects the integration to return a `WebRTCAnswer`.
+#### Direction: the client offers
 
-So relaying the existing flow verbatim would hand HA an offer it cannot feed to a camera entity.
-Making the backend answer instead is not a relay change: the video offer is deliberately built
-**passthrough-only**, pinned to the camera's exact codec because frames are forwarded as RTP
-without transcoding, so accepting an arbitrary HA offer risks negotiating a codec the forwarder
-cannot produce.
+The backend's own flow, used by the web dashboard and the mobile app over SignalR, is the
+**opposite** of what is exposed here: there the backend calls `createOffer()` and the client
+answers. Home Assistant's camera API (`Camera.async_handle_async_webrtc_offer`) hands the
+integration an offer and expects a `WebRTCAnswer`, so `/ha/ws` exposes an **answer path** added
+alongside the offer path — `CreateVideoAnswer` / `CreateAudioAnswer`. The offer path is untouched
+and still serves every existing client.
 
-When this is resolved the messages will be:
+Practically: **send `webrtc.offer` with whatever SDP Home Assistant gave you.** Do not try to
+produce an offer of your own or to reverse the direction.
 
-- Client → server: `webrtc.offer`, `webrtc.answer`, `webrtc.candidate`, `webrtc.stop`
-- Server → client: `webrtc.offer`, `webrtc.answer`, `webrtc.candidate`, `webrtc.closed`
-- `data` shape `{ "room_id": int, "session_id": string, ... }`, `session_id` scoping one
-  negotiation so several cameras can negotiate over one socket.
-- `hello.features` gains `"webrtc"`. Feature-test on that, never on `server_version`.
+#### Codec: the answer is passthrough-only, or it fails
 
-#### Camera fallbacks — what the backend actually has
+Video frames are forwarded from the camera as RTP **without transcoding**. The backend can only
+send the codec the camera already produces, decided by `VideoCodecProbeService` — the same source
+of truth the offer path uses. So:
 
-The design assumed HLS and stills as the camera entity's fallback path. Checked against the code,
-**neither is available**, and neither was built:
+1. The room's passthrough codec is resolved (H264, H265 or VP8).
+2. That codec is looked up **in your offer**, and the answer carries only it, reusing the payload
+   id and `fmtp` your offer proposed for it. Every other codec in your offer is dropped.
+3. **If your offer does not list that codec, the offer is rejected** with
+   `webrtc_codec_mismatch`, and the message names the room's codec and everything your offer did
+   list. Nothing is allocated and nothing falls back to transcoding.
 
-- **Still images: there is no snapshot capability at all.** `FfprobeSnapshotService`, despite the
-  name, runs `ffprobe` to write stream metadata into the log when an RTSP open fails. It is a
-  diagnostics helper and never produces an image. Nothing else in the backend encodes a frame to
-  JPEG or PNG. A still endpoint would be new machinery.
-- **HLS exists only for the duration of a cast session.** `CastHlsStreamService` spins up an
-  ffmpeg HLS rendition when a cast starts, serves it at `/cast/hls/{token}/index.m3u8` behind a
-  random per-session token, reference-counts it and tears it down when the last session releases
-  it. There is no room-level HLS endpoint, and the token is meaningless once casting stops, so it
-  cannot back a camera entity.
+The practical consequence for the integration: an H.265 camera will fail against a browser that
+only offers H.264, and that is the correct outcome — the alternative is a connection that
+negotiates successfully and then sends frames the peer cannot decode. Surface the error text; it
+is written to be read by a human.
 
-Until §8.1 is resolved, the HA camera entity has no working stream path. Do not advertise a still
-or HLS fallback from the integration.
+Audio follows the same rule with a different shape. A Nest room is raw Opus passthrough and
+requires Opus in the offer. An RTSP room is re-encoded, so any codec shared between the offer and
+the encoder is acceptable; the answer carries the intersection.
+
+#### Media kinds are separate peer connections
+
+Video and audio are negotiated as **separate peer connections**, selected by `kind`, because the
+backend keeps them in separate services with separate peers. One `webrtc.offer` produces one peer
+of one kind.
+
+If your offer contains both an audio and a video m-line — which is what a browser-generated camera
+offer normally looks like — the backend answers the m-line matching `kind` and leaves the other one
+unmatched. **This is the least-tested part of this protocol**: it depends on SIPSorcery rejecting
+an m-line it has no local track for rather than refusing the whole description. If you see
+`webrtc_failed` with a message like `The WebRTC offer for room N was rejected: ...`, that is what
+happened, and the fix on your side is to offer a single media section per `webrtc.offer`.
+
+#### No data channel on this path
+
+The SignalR offer path opens a data channel for audio-level updates. The answer path does not: a
+locally-added channel cannot appear in an answer to an offer with no `m=application` section. Use
+the `sound_level` message (§3) for levels — it is throttled, per-room, and does not need a peer
+connection at all.
+
+#### Lifecycle
+
+- One peer per `(connection, room, kind)`. Re-offering replaces it.
+- `webrtc.stop` closes one peer.
+- Dropping the socket closes all of that connection's peers, mirroring
+  `AudioStreamHub.OnDisconnectedAsync`.
+- Closing the last peer for a room releases the video reader if nothing else is using it, so a
+  camera that nobody is watching does not keep ffmpeg running.
+
+#### Fallbacks: there are none
+
+The camera entity has native WebRTC and nothing else. See §9 — this was a correction to the
+original design, not an omission.
 
 ### 8.2 Cast devices and commands — `cast.` — IMPLEMENTED
 
@@ -639,3 +760,36 @@ and the address is corrected on the next push. Nothing re-resolves on the backen
 - New values of `error.code`. Treat an unrecognised code as a generic failure.
 - Per-room settings overrides, if they ever arrive, will be a separate `room_settings` message and
   a `set_room_settings` command; `global_settings` keeps its current meaning.
+
+---
+
+## 9. Corrections to DESIGN.md
+
+`babymonitarr-hacs/docs/DESIGN.md` is the agreed design. Two of its statements did not survive
+contact with the backend code. They are recorded here rather than edited there, and the decisions
+below are the ones actually implemented.
+
+### 9.1 "HA native camera WebRTC on the existing offer/answer flow"
+
+The existing flow could not be reused as-is. The backend was always the offerer; HA's camera API
+requires the integration to answer. DESIGN.md assumed these matched.
+
+**Resolution:** an answer path was added to `VideoWebRtcService` and `AudioWebRtcService`, additive
+and separate from the offer path, and exposed as `webrtc.*`. The passthrough-only codec constraint
+is real and is enforced by selecting the room's codec out of the remote offer and failing cleanly
+when it is absent — see §8.1.
+
+### 9.2 "HLS and stills as fallback"
+
+Neither exists in the backend.
+
+- **Stills.** `FfprobeSnapshotService` is named misleadingly: it shells out to `ffprobe` to write
+  stream metadata into the log when an RTSP open fails. It is a diagnostics helper and never
+  produces an image. Nothing else in the backend encodes a frame to JPEG or PNG.
+- **HLS.** `CastHlsStreamService` produces HLS only for the lifetime of a cast session, behind a
+  random per-session token at `/cast/hls/{token}/index.m3u8`, reference-counted and torn down when
+  the last session releases it. There is no room-level HLS endpoint and the token is meaningless
+  once casting stops.
+
+**Resolution:** neither was built. The camera entity has native WebRTC only. Building either would
+be new backend machinery and a separate decision.
