@@ -108,6 +108,7 @@ using (var scope = app.Services.CreateScope())
     EnsureRoomVideoCodecColumns(db);
     EnsureAuthTables(db);
     EnsureCastTables(db);
+    EnsureHaTables(db);
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -285,6 +286,21 @@ static void EnsureCastTables(BabyMonitarrDbContext db)
         """);
     db.Database.ExecuteSqlRaw(
         "CREATE UNIQUE INDEX IF NOT EXISTS IX_RoomCastTargets_RoomId_DeviceId ON RoomCastTargets (RoomId, DeviceId);");
+}
+
+// The Home Assistant always-on monitoring switch. Persisted so it survives a backend restart:
+// the switch reflects backend state, so without this every room's switch turned itself off on
+// every restart and the always-on detection was quietly lost.
+static void EnsureHaTables(BabyMonitarrDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS HaMonitoredRooms (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            RoomId INTEGER NOT NULL
+        );
+        """);
+    db.Database.ExecuteSqlRaw(
+        "CREATE UNIQUE INDEX IF NOT EXISTS IX_HaMonitoredRooms_RoomId ON HaMonitoredRooms (RoomId);");
 }
 
 static void AddColumnIfMissing(BabyMonitarrDbContext db, string table, string column, string alterSql)

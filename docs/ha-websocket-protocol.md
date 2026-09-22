@@ -426,6 +426,10 @@ reconnect, or when HA reloads the config entry. Never poll it on a timer.
 Turns the always-on subscription for a room on or off. Drives `switch.<room>_monitoring`.
 Answered with a broadcast `monitoring`, a broadcast `room_state` for that room, and an `ack`.
 
+The new value is written to the database before the broadcasts, so it survives a backend restart
+(see §6). A database write that fails is logged and does not fail the command: the switch has
+already moved in the running backend, and only the restart behaviour is lost.
+
 ### `set_global_settings`
 ```jsonc
 { "type": "set_global_settings", "id": "10", "data": { "sound_threshold_db": -25.0 } }
@@ -579,14 +583,22 @@ Reconnect contract:
   sound detection. The reconnecting client learns the current state from `room_state.monitoring`
   and should reconcile its switch entities to it (or re-assert its own desired state with
   `set_monitoring`).
-- **Monitoring is in-memory and resets to off when the backend restarts.** It is not persisted.
-  After a backend restart every room starts unmonitored, and the client must re-assert
-  `set_monitoring` for each room whose switch is on. `room_state` in the snapshot always tells the
-  truth, so a client that reconciles against the snapshot handles this without special-casing.
+- **Monitoring is persisted and survives a backend restart.** The backend stores one row per
+  monitored room and, on startup, re-establishes the always-on subscriber for each of them before
+  it accepts /ha/ws connections. The first snapshot a reconnecting client receives therefore
+  already reports `monitoring: true` for those rooms, and the client must **not** re-assert
+  `set_monitoring` from its own cached switch state — the backend remains the source of truth, and
+  `room_state` in the snapshot always tells it.
+  Restoring a room whose camera is unreachable is not special-cased: the switch comes back on and
+  the reader is started exactly as if the switch had been flipped by hand, so it retries and gives
+  up the same way. Such a room reports `monitoring: true` with `stream_online: false` and no
+  `sound_level` entries until the camera is reachable and monitoring is toggled off and on again.
+  A persisted room that no longer exists is dropped on startup.
 - **Monitoring defaults OFF for a new room.** A room gets no always-on reader until HA turns
   monitoring on for it. This is intentional.
 - Sound state, level and stream-online are derived, not persisted; after a backend restart they
-  begin at `false`/`null` and refill as audio arrives.
+  begin at `false`/`null` and refill as audio arrives — including for a restored monitored room,
+  which reports `stream_online: false` until its first frame lands.
 - **WebRTC peers die with the socket.** When a /ha/ws connection drops, every peer connection it
   owns is closed server-side, mirroring what the SignalR hub does on disconnect. A reconnecting
   client must re-offer; there is no session to resume and no `webrtc.closed` will arrive for peers

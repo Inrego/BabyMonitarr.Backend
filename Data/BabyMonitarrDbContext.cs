@@ -14,6 +14,7 @@ public class BabyMonitarrDbContext : DbContext
     public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
     public DbSet<CastDevice> CastDevices => Set<CastDevice>();
     public DbSet<RoomCastTarget> RoomCastTargets => Set<RoomCastTarget>();
+    public DbSet<HaMonitoredRoom> HaMonitoredRooms => Set<HaMonitoredRoom>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -47,6 +48,11 @@ public class BabyMonitarrDbContext : DbContext
         modelBuilder.Entity<RoomCastTarget>(entity =>
         {
             entity.HasIndex(t => new { t.RoomId, t.DeviceId }).IsUnique();
+        });
+
+        modelBuilder.Entity<HaMonitoredRoom>(entity =>
+        {
+            entity.HasIndex(m => m.RoomId).IsUnique();
         });
 
         modelBuilder.Entity<GlobalSettings>().HasData(new GlobalSettings { Id = 1 });

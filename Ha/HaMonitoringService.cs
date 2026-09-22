@@ -3,6 +3,8 @@ using System.Net.WebSockets;
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Options;
+using Microsoft.EntityFrameworkCore;
+using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Hubs;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
@@ -33,6 +35,11 @@ public interface IHaMonitoringService
 /// processor, so a room that runs only because the phone app or the web client is streaming it
 /// reports too. That observation is passive: it starts no reader and, once the reader stops, the
 /// room's monitor entry is dropped rather than left emitting its last value.
+///
+/// Monitoring is persisted, in the HaMonitoredRooms table: one row per room whose switch is on.
+/// The backend is the source of truth for that switch, so without persistence a restart turned
+/// every switch off and the always-on detection was silently lost. On startup the rows are read
+/// back and re-subscribed through the same ordinary path a set_monitoring command takes.
 /// </summary>
 public class HaMonitoringService : IHaMonitoringService, IHostedService, IDisposable
 {
@@ -86,11 +93,16 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         _options = options.Value;
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _audioStreamingService.SoundThresholdExceeded += OnSoundThresholdExceeded;
         _audioStreamingService.AudioLevelMeasured += OnAudioLevelMeasured;
+
+        // Awaited before the timers start, and before this hosted service reports started: the
+        // audio streaming service is registered ahead of this one, so its room cache is already
+        // loaded and SubscribeToRoom can actually start a reader by the time we get here.
+        await RestorePersistedMonitoringAsync();
 
         var levelInterval = TimeSpan.FromMilliseconds(Math.Max(100, _options.LevelBroadcastIntervalMs));
         _levelTimer = new Timer(_ => OnLevelTick(), null, levelInterval, levelInterval);
@@ -100,7 +112,6 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
         _logger.LogInformation("HA monitoring service started (level interval {Interval}ms, clear hold {Hold}s)",
             _options.LevelBroadcastIntervalMs, _options.SoundClearHoldSeconds);
-        return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -280,6 +291,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         }
 
         SetMonitoring(roomId, enabled);
+        await PersistMonitoringAsync(roomId, enabled);
 
         Broadcast(HaFrames.Build(HaProtocol.Monitoring, new HaMonitoringData(roomId, enabled)));
         Broadcast(HaFrames.Build(HaProtocol.RoomState, BuildRoomState(roomId)));
@@ -410,6 +422,91 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         // alone; RefreshRooms starts readers for rooms that already have subscribers.
         _audioStreamingService.RefreshRooms();
         _logger.LogInformation("HA monitoring enabled for room {RoomId}", roomId);
+    }
+
+    /// <summary>
+    /// Re-establishes the always-on subscribers for the rooms whose switch was on when the backend
+    /// last ran. Deliberately no special startup path: each room goes through the same
+    /// <see cref="SetMonitoring"/> an ordinary <c>set_monitoring</c> command uses, so there is one
+    /// subscriber mechanism and one reader lifecycle.
+    ///
+    /// Rows for rooms that no longer exist are deleted rather than carried forward; nothing else
+    /// prunes them, and a re-used room id would otherwise resurrect a switch nobody turned on.
+    /// A room whose camera is unreachable is still restored: the switch is on, the reader is asked
+    /// to start and fails the way it would have if the switch had been flipped by hand.
+    /// </summary>
+    private async Task RestorePersistedMonitoringAsync()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
+
+            var persisted = await db.HaMonitoredRooms.ToListAsync();
+            if (persisted.Count == 0) return;
+
+            var knownRoomIds = (await scope.ServiceProvider.GetRequiredService<IRoomService>()
+                    .GetAllRoomsAsync())
+                .Select(r => r.Id)
+                .ToHashSet();
+
+            var stale = persisted.Where(m => !knownRoomIds.Contains(m.RoomId)).ToList();
+            if (stale.Count > 0)
+            {
+                db.HaMonitoredRooms.RemoveRange(stale);
+                await db.SaveChangesAsync();
+                _logger.LogInformation(
+                    "Dropped persisted HA monitoring for {Count} room(s) that no longer exist", stale.Count);
+            }
+
+            foreach (var roomId in persisted.Select(m => m.RoomId).Where(knownRoomIds.Contains))
+            {
+                SetMonitoring(roomId, true);
+            }
+
+            _logger.LogInformation(
+                "Restored HA monitoring for {Count} room(s) from the database",
+                persisted.Count - stale.Count);
+        }
+        catch (Exception ex)
+        {
+            // A database that cannot be read must not stop the endpoint coming up; HA can still
+            // re-assert the switches, which is exactly the behaviour this replaces.
+            _logger.LogError(ex, "Failed to restore persisted HA monitoring state");
+        }
+    }
+
+    /// <summary>
+    /// Records the switch so it survives a restart. Row present means on, absent means off.
+    /// </summary>
+    private async Task PersistMonitoringAsync(int roomId, bool enabled)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
+
+            var existing = await db.HaMonitoredRooms.FirstOrDefaultAsync(m => m.RoomId == roomId);
+
+            if (enabled)
+            {
+                if (existing != null) return;
+                db.HaMonitoredRooms.Add(new HaMonitoredRoom { RoomId = roomId });
+            }
+            else
+            {
+                if (existing == null) return;
+                db.HaMonitoredRooms.Remove(existing);
+            }
+
+            await db.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            // The in-memory switch has already moved; losing the row only costs us the restart.
+            _logger.LogError(ex,
+                "Failed to persist HA monitoring state {Enabled} for room {RoomId}", enabled, roomId);
+        }
     }
 
     private void StopMonitoring(RoomMonitor monitor)
