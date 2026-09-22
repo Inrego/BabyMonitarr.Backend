@@ -75,6 +75,7 @@ builder.Services.AddBabyMonitarrAuth(builder.Configuration);
 builder.Services.Configure<HaOptions>(builder.Configuration.GetSection("Ha"));
 var haViewerCountFilter = new HaViewerCountFilter();
 builder.Services.AddSingleton<IHaViewerCounter>(haViewerCountFilter);
+builder.Services.AddSingleton<IHaCastBridge, HaCastBridge>();
 builder.Services.AddSingleton<IHaMonitoringService, HaMonitoringService>();
 builder.Services.AddHostedService(sp => (HaMonitoringService)sp.GetRequiredService<IHaMonitoringService>());
 
@@ -261,11 +262,16 @@ static void EnsureCastTables(BabyMonitarrDbContext db)
             IsVideoCapable INTEGER NOT NULL DEFAULT 0,
             IsGroup INTEGER NOT NULL DEFAULT 0,
             ManuallyAdded INTEGER NOT NULL DEFAULT 0,
+            Origin TEXT NOT NULL DEFAULT 'discovered',
             LastSeenUtc TEXT
         );
         """);
     db.Database.ExecuteSqlRaw(
         "CREATE UNIQUE INDEX IF NOT EXISTS IX_CastDevices_DeviceId ON CastDevices (DeviceId);");
+
+    // Added with the Home Assistant proxy origin; databases created before it need the column.
+    AddColumnIfMissing(db, "CastDevices", "Origin",
+        "ALTER TABLE CastDevices ADD COLUMN Origin TEXT NOT NULL DEFAULT 'discovered';");
 
     db.Database.ExecuteSqlRaw("""
         CREATE TABLE IF NOT EXISTS RoomCastTargets (
@@ -276,6 +282,33 @@ static void EnsureCastTables(BabyMonitarrDbContext db)
         """);
     db.Database.ExecuteSqlRaw(
         "CREATE UNIQUE INDEX IF NOT EXISTS IX_RoomCastTargets_RoomId_DeviceId ON RoomCastTargets (RoomId, DeviceId);");
+}
+
+static void AddColumnIfMissing(BabyMonitarrDbContext db, string table, string column, string alterSql)
+{
+    var connection = db.Database.GetDbConnection();
+    bool closeAfter = connection.State != ConnectionState.Open;
+    if (closeAfter) connection.Open();
+
+    try
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA table_info('{table}');";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader["name"]?.ToString(), column, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+    }
+    finally
+    {
+        if (closeAfter) connection.Close();
+    }
+
+    db.Database.ExecuteSqlRaw(alterSql);
 }
 
 static void EnsureAuthTables(BabyMonitarrDbContext db)

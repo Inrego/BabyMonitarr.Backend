@@ -36,6 +36,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     private readonly IHubContext<AudioStreamHub> _hubContext;
     private readonly IHaViewerCounter _viewerCounter;
     private readonly IAppVersionProvider _versionProvider;
+    private readonly IHaCastBridge _castBridge;
     private readonly HaOptions _options;
 
     private readonly ConcurrentDictionary<string, HaConnection> _connections = new();
@@ -60,6 +61,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         IHubContext<AudioStreamHub> hubContext,
         IHaViewerCounter viewerCounter,
         IAppVersionProvider versionProvider,
+        IHaCastBridge castBridge,
         IOptions<HaOptions> options)
     {
         _logger = logger;
@@ -68,6 +70,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         _hubContext = hubContext;
         _viewerCounter = viewerCounter;
         _versionProvider = versionProvider;
+        _castBridge = castBridge;
         _options = options.Value;
     }
 
@@ -114,7 +117,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
         // A fresh client must be able to populate every entity from the snapshot alone.
         await RefreshRoomsCacheAsync();
-        SendSnapshot(connection, null);
+        await SendSnapshotAsync(connection, null, ct);
     }
 
     public void Unregister(HaConnection connection)
@@ -129,14 +132,14 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         // create a sound-detection gap. It resets only when the backend restarts.
     }
 
-    private void SendSnapshot(HaConnection connection, string? reference)
+    private async Task SendSnapshotAsync(HaConnection connection, string? reference, CancellationToken ct)
     {
         connection.TryEnqueue(HaFrames.Build(HaProtocol.Hello, new HaHelloData(
             HaProtocol.Version,
             _versionProvider.DisplayVersion,
             _options.LevelBroadcastIntervalMs,
             _options.SoundClearHoldSeconds,
-            new[] { "monitoring", "sound_state", "sound_level", "global_settings", "rooms" }), reference));
+            new[] { "monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast" }), reference));
 
         connection.TryEnqueue(_lastRoomsFrame ?? HaFrames.Build(HaProtocol.Rooms, new HaRoomsData(_rooms)));
         if (_lastSettingsFrame != null) connection.TryEnqueue(_lastSettingsFrame);
@@ -147,6 +150,11 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         foreach (var room in _rooms)
         {
             connection.TryEnqueue(HaFrames.Build(HaProtocol.RoomState, BuildRoomState(room.Id)));
+        }
+
+        foreach (var frame in await _castBridge.BuildSnapshotFramesAsync(ct))
+        {
+            connection.TryEnqueue(frame);
         }
 
         connection.TryEnqueue(HaFrames.Build(HaProtocol.Ready, null, reference));
@@ -191,7 +199,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
             case HaProtocol.CmdGetState:
                 await RefreshRoomsCacheAsync();
-                SendSnapshot(connection, reference);
+                await SendSnapshotAsync(connection, reference, ct);
                 break;
 
             case HaProtocol.CmdSetMonitoring:
@@ -207,6 +215,14 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                 break;
 
             default:
+                if (_castBridge.Handles(type))
+                {
+                    var castResult = await _castBridge.HandleAsync(type, data, reference, connection.BaseUrl, ct);
+                    foreach (var frame in castResult.Reply) connection.TryEnqueue(frame);
+                    foreach (var frame in castResult.Broadcast) Broadcast(frame);
+                    break;
+                }
+
                 connection.TryEnqueue(HaFrames.Error(
                     HaProtocol.ErrUnknownType,
                     $"Unsupported command '{type}' in protocol v{HaProtocol.Version}",
@@ -217,11 +233,16 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
     private async Task HandleSetMonitoringAsync(HaConnection connection, JsonElement data, string? reference)
     {
-        if (!TryGetInt(data, "room_id", out int roomId) || !TryGetBool(data, "enabled", out bool enabled))
+        int? requestedRoom = HaJson.Int(data, "room_id");
+        bool? requestedEnabled = HaJson.Bool(data, "enabled");
+        if (requestedRoom == null || requestedEnabled == null)
         {
             connection.TryEnqueue(HaFrames.Error(HaProtocol.ErrBadRequest, "Expected room_id and enabled", reference));
             return;
         }
+
+        int roomId = requestedRoom.Value;
+        bool enabled = requestedEnabled.Value;
 
         await RefreshRoomsCacheAsync();
         if (_rooms.All(r => r.Id != roomId))
@@ -249,13 +270,13 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         var roomService = scope.ServiceProvider.GetRequiredService<IRoomService>();
         var settings = await roomService.GetGlobalSettingsAsync();
 
-        if (TryGetDouble(data, "sound_threshold_db", out double threshold)) settings.SoundThreshold = threshold;
-        if (TryGetInt(data, "threshold_pause_seconds", out int pause)) settings.ThresholdPauseDuration = pause;
-        if (TryGetDouble(data, "volume_adjustment_db", out double volume)) settings.VolumeAdjustmentDb = volume;
-        if (TryGetBool(data, "audio_filter_enabled", out bool filter)) settings.FilterEnabled = filter;
-        if (TryGetInt(data, "average_sample_count", out int samples)) settings.AverageSampleCount = samples;
-        if (TryGetInt(data, "low_pass_hz", out int lowPass)) settings.LowPassFrequency = lowPass;
-        if (TryGetInt(data, "high_pass_hz", out int highPass)) settings.HighPassFrequency = highPass;
+        if (HaJson.Double(data, "sound_threshold_db") is double threshold) settings.SoundThreshold = threshold;
+        if (HaJson.Int(data, "threshold_pause_seconds") is int pause) settings.ThresholdPauseDuration = pause;
+        if (HaJson.Double(data, "volume_adjustment_db") is double volume) settings.VolumeAdjustmentDb = volume;
+        if (HaJson.Bool(data, "audio_filter_enabled") is bool filter) settings.FilterEnabled = filter;
+        if (HaJson.Int(data, "average_sample_count") is int samples) settings.AverageSampleCount = samples;
+        if (HaJson.Int(data, "low_pass_hz") is int lowPass) settings.LowPassFrequency = lowPass;
+        if (HaJson.Int(data, "high_pass_hz") is int highPass) settings.HighPassFrequency = highPass;
 
         await roomService.UpdateGlobalSettingsAsync(settings);
 
@@ -269,7 +290,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
     private async Task HandleSetActiveRoomAsync(HaConnection connection, JsonElement data, string? reference)
     {
-        if (!TryGetInt(data, "room_id", out int roomId))
+        int? roomId = HaJson.Int(data, "room_id");
+        if (roomId == null)
         {
             connection.TryEnqueue(HaFrames.Error(HaProtocol.ErrBadRequest, "Expected room_id", reference));
             return;
@@ -277,7 +299,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
         using var scope = _scopeFactory.CreateScope();
         var roomService = scope.ServiceProvider.GetRequiredService<IRoomService>();
-        var room = await roomService.SetActiveRoomAsync(roomId);
+        var room = await roomService.SetActiveRoomAsync(roomId.Value);
 
         if (room == null)
         {
@@ -480,6 +502,11 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                 _lastViewersFrame = viewersFrame;
                 Broadcast(viewersFrame);
             }
+
+            foreach (var frame in await _castBridge.PollChangedFramesAsync(CancellationToken.None))
+            {
+                Broadcast(frame);
+            }
         }
         catch (Exception ex)
         {
@@ -561,50 +588,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         settings.LowPassFrequency,
         settings.HighPassFrequency);
 
-    /// <summary>Compares frames ignoring the envelope timestamp, which always differs.</summary>
-    private static bool FramesEqual(string? left, string? right)
-    {
-        if (left == null || right == null) return false;
-
-        static string Payload(string frame)
-        {
-            int index = frame.IndexOf("\"data\":", StringComparison.Ordinal);
-            return index < 0 ? frame : frame[index..];
-        }
-
-        return string.Equals(Payload(left), Payload(right), StringComparison.Ordinal);
-    }
-
-    private static bool TryGetInt(JsonElement data, string name, out int value)
-    {
-        value = 0;
-        return data.ValueKind == JsonValueKind.Object &&
-               data.TryGetProperty(name, out var element) &&
-               element.ValueKind == JsonValueKind.Number &&
-               element.TryGetInt32(out value);
-    }
-
-    private static bool TryGetDouble(JsonElement data, string name, out double value)
-    {
-        value = 0;
-        return data.ValueKind == JsonValueKind.Object &&
-               data.TryGetProperty(name, out var element) &&
-               element.ValueKind == JsonValueKind.Number &&
-               element.TryGetDouble(out value);
-    }
-
-    private static bool TryGetBool(JsonElement data, string name, out bool value)
-    {
-        value = false;
-        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty(name, out var element))
-            return false;
-
-        if (element.ValueKind != JsonValueKind.True && element.ValueKind != JsonValueKind.False)
-            return false;
-
-        value = element.GetBoolean();
-        return true;
-    }
+    private static bool FramesEqual(string? left, string? right) => HaFrames.PayloadEquals(left, right);
 
     #endregion
 

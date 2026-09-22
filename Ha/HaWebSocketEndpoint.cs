@@ -56,6 +56,7 @@ public static class HaWebSocketEndpoint
         var connection = new HaConnection(
             Guid.NewGuid().ToString("N"),
             user.DisplayName ?? user.Username,
+            $"{context.Request.Scheme}://{context.Request.Host}",
             socket,
             Math.Max(16, options.SendQueueCapacity),
             logger);

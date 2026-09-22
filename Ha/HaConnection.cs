@@ -19,10 +19,12 @@ public sealed class HaConnection
     private readonly ILogger _logger;
     private readonly Channel<string> _outbound;
 
-    public HaConnection(string id, string userName, WebSocket socket, int sendQueueCapacity, ILogger logger)
+    public HaConnection(
+        string id, string userName, string? baseUrl, WebSocket socket, int sendQueueCapacity, ILogger logger)
     {
         Id = id;
         UserName = userName;
+        BaseUrl = baseUrl;
         _socket = socket;
         _logger = logger;
         _outbound = Channel.CreateBounded<string>(new BoundedChannelOptions(sendQueueCapacity)
@@ -35,6 +37,13 @@ public sealed class HaConnection
     public string Id { get; }
 
     public string UserName { get; }
+
+    /// <summary>
+    /// Scheme and host of the handshake, e.g. "http://192.168.1.10:8080". Cast receivers pull HLS
+    /// from this, so it must be an address they can reach — the same hint the SignalR hub takes
+    /// from its own request.
+    /// </summary>
+    public string? BaseUrl { get; }
 
     /// <summary>
     /// Queues a pre-serialized frame. Returns false when the queue is full, which means the
@@ -191,4 +200,21 @@ public static class HaFrames
 
     public static string Error(string code, string message, string? reference) =>
         Build(HaProtocol.Error, new HaErrorData(code, message), reference);
+
+    /// <summary>
+    /// Compares two frames of the same type by payload, ignoring the envelope timestamp, which
+    /// always differs. Used to push only what actually changed.
+    /// </summary>
+    public static bool PayloadEquals(string? left, string? right)
+    {
+        if (left == null || right == null) return false;
+
+        static string Payload(string frame)
+        {
+            int index = frame.IndexOf("\"data\":", StringComparison.Ordinal);
+            return index < 0 ? frame : frame[index..];
+        }
+
+        return string.Equals(Payload(left), Payload(right), StringComparison.Ordinal);
+    }
 }

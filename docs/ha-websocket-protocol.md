@@ -1,8 +1,8 @@
 # BabyMonitarr ↔ Home Assistant WebSocket protocol
 
 Version **1**. Implemented in `Ha/` (`HaWebSocketEndpoint.cs`, `HaConnection.cs`,
-`HaMonitoringService.cs`, `HaMessages.cs`). This document is the contract; if code and document
-disagree, that is a bug in one of them.
+`HaMonitoringService.cs`, `HaCastBridge.cs`, `HaMessages.cs`, `HaJson.cs`). This document is the
+contract; if code and document disagree, that is a bug in one of them.
 
 The endpoint is plain WebSocket, deliberately not SignalR — the Home Assistant side has no
 SignalR client. It runs alongside the existing `/audioHub` SignalR hub and changes nothing about
@@ -60,8 +60,9 @@ Every frame in both directions is a single JSON text message:
 
 - `ts` is server time, UTC. Clients should not rely on it for ordering beyond "later frames have
   later timestamps".
-- `ref` is present only on `ack`, `error`, `pong` and on a `get_state` snapshot. It carries the
-  `id` the client sent, so replies can be correlated.
+- `ref` is present only on a reply — `ack`, `error`, `pong`, `cast.start_result`, and the `hello`
+  and `ready` of a `get_state` snapshot. It carries the `id` the client sent, so replies can be
+  correlated. Broadcast frames never carry one.
 - Client frames use the same envelope but only `type`, optional `id` (string) and optional `data`
   are read. `v` and `ts` from a client are ignored.
 - Timestamps inside `data` (`at`, `last_event_at`) are UTC ISO-8601.
@@ -82,7 +83,7 @@ First frame on every connection.
   "server_version": "1.4.2",
   "level_interval_ms": 1000,
   "sound_clear_hold_seconds": 30,
-  "features": ["monitoring", "sound_state", "sound_level", "global_settings", "rooms"]
+  "features": ["monitoring", "sound_state", "sound_level", "global_settings", "rooms", "cast"]
 }
 ```
 
@@ -234,6 +235,74 @@ clients, not only the requester.
 "data": { "room_id": 1, "enabled": true }
 ```
 
+### `cast.devices`
+Every Cast receiver the backend knows, from all three discovery origins. Sent in the snapshot,
+after any `cast.*` command, and again whenever the list or a device's state changes.
+
+```jsonc
+"data": {
+  "devices": [
+    {
+      "device_id": "1f2e3d4c5b6a...",   // string, the mDNS TXT "id"; identity across all origins
+      "name": "Living Room TV",         // string
+      "model": "Chromecast Ultra",      // string, may be ""
+      "host": "192.168.1.42",           // string, last known address
+      "port": 8009,                     // int
+      "origin": "ha-proxy",             // "discovered" | "manual" | "ha-proxy"
+      "manually_added": false,          // bool
+      "is_video_capable": true,         // bool, from the "ca" bitmask bit 0x01
+      "is_group": false,                // bool, from the "ca" bitmask bit 0x20
+      "is_online": true,                // bool
+      "last_seen_at": "2026-09-22T12:00:00Z", // string|null
+      "casting_room_id": 1,             // int|null, room currently cast to this device
+      "last_error": null                // string|null, cleared on a successful start
+    }
+  ]
+}
+```
+
+`is_online` is true for a manually-added device, or when `last_seen_at` is within twice the
+backend's own discovery interval (floor 120 s). A device pushed by the HA proxy therefore goes
+stale if HA stops pushing — see §8.2.
+
+### `cast.state`
+Per-room cast state, one frame per room. Sent in the snapshot, after a `cast.*` command that
+touched that room, and on change.
+
+```jsonc
+"data": {
+  "room_id": 1,
+  "casting": true,                      // bool, true when at least one session is live
+  "targets": ["1f2e3d4c...", "9a8b..."],// string[], the room's SAVED target selection
+  "sessions": [                         // the sessions actually running right now
+    { "device_id": "1f2e3d4c...", "video": true, "started_at": "2026-09-22T12:00:00Z" }
+  ]
+}
+```
+
+`targets` is the persisted default selection (what `cast.start` uses when given no device ids);
+`sessions` is what is live. They are independent — a saved target with no session is not casting.
+
+### `cast.start_result`
+The reply to `cast.start`. Sent only to the requester, with `ref` set.
+
+```jsonc
+"data": {
+  "room_id": 1,
+  "started": [
+    { "device_id": "1f2e3d4c...", "video": true, "started_at": "2026-09-22T12:00:00Z" }
+  ],
+  "failed": {                           // device_id -> human-readable reason, may be empty
+    "9a8b7c6d...": "Could not reach a Cast device at 192.168.1.50:8009."
+  }
+}
+```
+
+**A partial failure is a success at the protocol level.** `cast.start` never returns `error` for a
+device that would not start; the per-device reason appears in `failed` and the devices that did
+start appear in `started`. The HA side must surface `failed` rather than treating a non-empty
+`started` as "it worked".
+
 ### `ack`
 Command succeeded. `ref` carries the request `id`.
 
@@ -254,6 +323,7 @@ a request, otherwise `null`.
 | `bad_request` | Malformed JSON, missing `type`, or missing/ill-typed fields in `data`. |
 | `unknown_type` | The `type` is not a command this protocol version handles. |
 | `unknown_room` | `room_id` does not exist. |
+| `unknown_device` | `device_id` is not a device, or has no session to stop. |
 | `internal_error` | The command threw. The connection stays open. |
 
 ### `pong`
@@ -302,6 +372,69 @@ step. Answered with a broadcast `global_settings` (if anything changed) and an `
 Answered with a broadcast `active_room` and an `ack`; SignalR clients get `ActiveRoomChanged`.
 `unknown_room` if the room does not exist.
 
+### `cast.discovered`
+The mDNS proxy push. Home Assistant runs the `_googlecast._tcp.local.` browser (it has host
+networking and can see link-local multicast; the backend on a Docker bridge network cannot) and
+pushes what it finds. See §8.2 for the model.
+
+```jsonc
+{
+  "type": "cast.discovered",
+  "id": "20",
+  "data": {
+    "devices": [
+      {
+        "id": "1f2e3d4c5b6a...",   // REQUIRED, TXT "id". This is the device identity.
+        "host": "192.168.1.42",    // REQUIRED, the resolved address
+        "port": 8009,              // optional int, defaults to 8009
+        "fn": "Living Room TV",    // optional, TXT "fn" — friendly name
+        "md": "Chromecast Ultra",  // optional, TXT "md" — model
+        "ca": "4101"               // optional, TXT "ca" — capability bitmask; int or string
+      }
+    ]
+  }
+}
+```
+
+Send the whole current set, not a delta; the backend upserts and never removes on absence. A
+device entry missing `id` or `host` is skipped silently. `bad_request` only if `devices` is absent
+or no entry survived that check. Answered with `ack` plus a broadcast `cast.devices`.
+
+Push on browser add/update, and re-push on reconnect. There is no unregister message: a receiver
+that disappears simply stops being refreshed and goes `is_online: false`.
+
+### `cast.start`
+```jsonc
+{ "type": "cast.start", "id": "21", "data": { "room_id": 1, "device_ids": ["1f2e..."] } }
+```
+`device_ids` is optional; omitted or empty means the room's saved `targets`. If that is also empty
+the reply is a `cast.start_result` with empty `started` and `failed` — not an error. Answered with
+`cast.start_result` to the caller, plus broadcast `cast.devices` and `cast.state`.
+
+A cast start is **not** cancelled if the HA socket drops while it is in flight; the session is
+server-side state.
+
+### `cast.stop`
+```jsonc
+{ "type": "cast.stop", "id": "22", "data": { "room_id": 1 } }
+```
+Stops every session for the room. Answered with `ack` plus broadcast `cast.devices` and
+`cast.state`. Stopping a room that is not casting is a success, not an error.
+
+### `cast.stop_device`
+```jsonc
+{ "type": "cast.stop_device", "id": "23", "data": { "device_id": "1f2e..." } }
+```
+Stops one device without touching the room's other targets. `unknown_device` when the device had
+no session. Answered with `ack` plus broadcast `cast.devices` and `cast.state`.
+
+### `cast.set_targets`
+```jsonc
+{ "type": "cast.set_targets", "id": "24", "data": { "room_id": 1, "device_ids": ["1f2e..."] } }
+```
+Replaces the room's saved target selection. Does **not** start or stop anything. An empty or
+absent `device_ids` clears the selection. Answered with `ack` plus broadcast `cast.state`.
+
 ---
 
 ## 5. Connect, reconnect, resync
@@ -314,7 +447,9 @@ On every accepted connection the server sends, in this order and without being a
 4. `active_room`
 5. `connected_viewers`
 6. one `room_state` per room
-7. `ready`
+7. `cast.devices`
+8. one `cast.state` per room
+9. `ready`
 
 That snapshot is complete: a fresh HA client can create and populate every entity from it alone.
 **There is no polling in this protocol.** After `ready`, the server pushes changes.
@@ -334,6 +469,9 @@ Reconnect contract:
   monitoring on for it. This is intentional.
 - Sound state, level and stream-online are derived, not persisted; after a backend restart they
   begin at `false`/`null` and refill as audio arrives.
+- **Cast devices and saved targets are persisted**; live cast sessions are not and do not survive a
+  backend restart. Proxy-discovered devices keep their last known host, so HA should re-push
+  `cast.discovered` on every reconnect.
 - Multiple HA clients may connect at once. State changes are broadcast to all of them.
 - A client that stops draining its socket (more than `SendQueueCapacity`, default 256, frames
   queued) is closed with WebSocket status 1011 and should reconnect with backoff.
@@ -389,30 +527,111 @@ ignore server frames whose `type` it does not recognise**, which is what makes t
 
 ### 8.1 WebRTC signalling — reserved prefix `webrtc.`
 
-Not implemented. Reserved for the HA native camera entity's offer/answer flow, mirroring what
-`AudioStreamHub` already does over SignalR.
+**Not implemented. Blocked on a design decision, not on effort.** The prefix stays reserved; a v1
+client must keep ignoring `webrtc.*` frames, and a `webrtc.*` command is answered with `error` /
+`unknown_type`.
+
+The reason is a direction mismatch that the HA-side worker needs to know about before building a
+camera entity:
+
+- **The backend is always the offerer.** `AudioWebRtcService` and `VideoWebRtcService` both do
+  `pc.createOffer()` + `setLocalDescription()` and hand the offer SDP to the client; the client
+  replies with an answer (`SetVideoRemoteDescription`) and trickles its ICE candidates in.
+- **Home Assistant's native camera WebRTC is the opposite.** `Camera.async_handle_async_webrtc_offer`
+  receives an offer from HA and expects the integration to return a `WebRTCAnswer`.
+
+So relaying the existing flow verbatim would hand HA an offer it cannot feed to a camera entity.
+Making the backend answer instead is not a relay change: the video offer is deliberately built
+**passthrough-only**, pinned to the camera's exact codec because frames are forwarded as RTP
+without transcoding, so accepting an arbitrary HA offer risks negotiating a codec the forwarder
+cannot produce.
+
+When this is resolved the messages will be:
 
 - Client → server: `webrtc.offer`, `webrtc.answer`, `webrtc.candidate`, `webrtc.stop`
 - Server → client: `webrtc.offer`, `webrtc.answer`, `webrtc.candidate`, `webrtc.closed`
-- Expected `data` shape: `{ "room_id": int, "session_id": string, ... }` — `session_id` scopes a
-  negotiation so several cameras can negotiate on one socket.
-- The `hello.features` list will gain `"webrtc"` when this lands. Feature-test on that.
+- `data` shape `{ "room_id": int, "session_id": string, ... }`, `session_id` scoping one
+  negotiation so several cameras can negotiate over one socket.
+- `hello.features` gains `"webrtc"`. Feature-test on that, never on `server_version`.
 
-Until then, a `webrtc.*` command is answered with `error` / `unknown_type`.
+#### Camera fallbacks — what the backend actually has
 
-### 8.2 Cast devices and commands — reserved prefix `cast.`
+The design assumed HLS and stills as the camera entity's fallback path. Checked against the code,
+**neither is available**, and neither was built:
 
-Not implemented. Reserved for cast device/target state and the `babymonitarr.cast_room` /
-`stop_cast` services, and for the HA-side mDNS proxy pushing discovered receivers in.
+- **Still images: there is no snapshot capability at all.** `FfprobeSnapshotService`, despite the
+  name, runs `ffprobe` to write stream metadata into the log when an RTSP open fails. It is a
+  diagnostics helper and never produces an image. Nothing else in the backend encodes a frame to
+  JPEG or PNG. A still endpoint would be new machinery.
+- **HLS exists only for the duration of a cast session.** `CastHlsStreamService` spins up an
+  ffmpeg HLS rendition when a cast starts, serves it at `/cast/hls/{token}/index.m3u8` behind a
+  random per-session token, reference-counts it and tears it down when the last session releases
+  it. There is no room-level HLS endpoint, and the token is meaningless once casting stops, so it
+  cannot back a camera entity.
 
-- Server → client: `cast.devices` (the known receivers), `cast.state` (per room: casting, targets)
-- Client → server: `cast.start`, `cast.stop`, `cast.set_targets`, `cast.discovered` (mDNS proxy
-  push: address, port and the `id`/`fn`/`md`/`ca` TXT fields)
-- Per-room cast state will be delivered as its own `cast.state` message rather than as new fields
-  on `room_state`, so `room_state` stays stable.
-- The `hello.features` list will gain `"cast"` when this lands.
+Until §8.1 is resolved, the HA camera entity has no working stream path. Do not advertise a still
+or HLS fallback from the integration.
 
-Until then, a `cast.*` command is answered with `error` / `unknown_type`.
+### 8.2 Cast devices and commands — `cast.` — IMPLEMENTED
+
+The messages are specified in §3 (`cast.devices`, `cast.state`, `cast.start_result`) and §4
+(`cast.discovered`, `cast.start`, `cast.stop`, `cast.stop_device`, `cast.set_targets`). This
+section is the model behind them.
+
+#### Why HA proxies discovery
+
+mDNS is link-local. The backend runs on a Docker bridge network and cannot see the multicast, so
+its own `_googlecast._tcp.local.` browse finds nothing unless the container is on host networking.
+Home Assistant already has a Zeroconf browser and the network access to use it, so it browses and
+pushes the results in over `cast.discovered`.
+
+Only *discovery* needs multicast. Once the address is known, port 8009 is ordinary outbound TCP
+that a bridge-network container reaches fine, so the backend keeps talking to receivers directly
+with Sharpcaster. Nothing about the media path changes.
+
+#### Identity and dedupe
+
+A device's identity is the mDNS TXT `id`, which is already what the backend stores as its device
+id. A receiver seen by the backend's own browse *and* pushed by HA therefore collapses to **one**
+device row, not two — no reconciliation is needed on either side.
+
+Manually-added devices are the exception: they have no TXT record, so their id is `host:port`. A
+manual entry and a later proxy push for the same physical device will not dedupe.
+
+#### Origins
+
+`origin` records **which path last saw the device**, for diagnostics and UI only. It never affects
+identity.
+
+| `origin` | Meaning |
+| --- | --- |
+| `discovered` | Last seen by the backend's own mDNS browse. |
+| `manual` | Added by IP through the BabyMonitarr UI. Sticky: a proxy push never overwrites it. |
+| `ha-proxy` | Last seen by Home Assistant's Zeroconf browser. |
+
+A device seen by both browses flips between `discovered` and `ha-proxy` depending on which ran
+last. That is intended: the field answers "which path is currently seeing this", not "where did it
+come from originally".
+
+#### Address churn
+
+Chromecast addresses move on DHCP renewal. A `cast.discovered` push for a known `id` with a new
+`host` **updates the stored address in place** — it never creates a second device. The last known
+host is all that is kept; there is no history and no persistence beyond the existing device row.
+
+The proxy does not need to survive HA being offline. If HA is down the backend still has the last
+known host and simply tries it; a connect failure surfaces per device in `cast.start_result.failed`
+and the address is corrected on the next push. Nothing re-resolves on the backend side.
+
+#### What is deliberately absent
+
+- **No unregister.** HA never tells the backend a receiver went away; it just stops refreshing it
+  and `is_online` decays.
+- **No HA cast transport.** Casting is driven by Sharpcaster from the backend, as it always was.
+  Routing a cast through HA services (to reach Sonos or AirPlay targets Sharpcaster cannot drive)
+  is a separate, deferred piece of work and no seam for it exists yet.
+- **No change to the existing paths.** Local mDNS discovery, manual add, the SignalR hub's cast
+  methods and existing app clients all behave exactly as before.
 
 ### 8.3 Other reserved space
 

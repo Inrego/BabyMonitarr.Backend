@@ -22,6 +22,14 @@ public interface ICastDeviceService
         bool isVideoCapable,
         CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Upserts receivers seen by Home Assistant's Zeroconf browser. Identity is the TXT "id", the
+    /// same value local discovery stores, so a device seen by both paths stays one row.
+    /// </summary>
+    Task<IReadOnlyList<CastDeviceInfo>> UpsertProxyDiscoveriesAsync(
+        IReadOnlyCollection<CastProxyDiscovery> discoveries,
+        CancellationToken cancellationToken = default);
+
     Task<bool> ForgetAsync(string deviceId, CancellationToken cancellationToken = default);
 
     Task<CastDevice?> FindAsync(string deviceId, CancellationToken cancellationToken = default);
@@ -141,6 +149,7 @@ public sealed class CastDeviceService : ICastDeviceService, IHostedService, IDis
                 existing.IsVideoCapable = (capabilities & 0x01) != 0;
                 existing.IsGroup = (capabilities & 0x20) != 0;
                 existing.LastSeenUtc = now;
+                if (!existing.ManuallyAdded) existing.Origin = CastDeviceOrigins.Discovered;
 
                 _seenThisRun[deviceId] = now;
             }
@@ -203,12 +212,71 @@ public sealed class CastDeviceService : ICastDeviceService, IHostedService, IDis
         device.Port = port;
         device.IsVideoCapable = isVideoCapable;
         device.ManuallyAdded = true;
+        device.Origin = CastDeviceOrigins.Manual;
         device.LastSeenUtc = DateTime.UtcNow;
 
         await db.SaveChangesAsync(cancellationToken);
         _seenThisRun[deviceId] = DateTime.UtcNow;
 
         return ToInfo(device);
+    }
+
+    public async Task<IReadOnlyList<CastDeviceInfo>> UpsertProxyDiscoveriesAsync(
+        IReadOnlyCollection<CastProxyDiscovery> discoveries,
+        CancellationToken cancellationToken = default)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
+        var now = DateTime.UtcNow;
+        int seen = 0;
+
+        foreach (var discovery in discoveries)
+        {
+            string deviceId = discovery.Id?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(deviceId) || string.IsNullOrWhiteSpace(discovery.Host)) continue;
+
+            var existing = await db.CastDevices.FirstOrDefaultAsync(
+                d => d.DeviceId == deviceId, cancellationToken);
+
+            if (existing == null)
+            {
+                existing = new CastDevice { DeviceId = deviceId };
+                db.CastDevices.Add(existing);
+            }
+
+            // Newest name wins, same rule local discovery follows.
+            if (!string.IsNullOrWhiteSpace(discovery.FriendlyName)) existing.Name = discovery.FriendlyName!.Trim();
+            else if (string.IsNullOrWhiteSpace(existing.Name)) existing.Name = "Cast device";
+
+            if (!string.IsNullOrWhiteSpace(discovery.Model)) existing.Model = discovery.Model!.Trim();
+
+            // Chromecast addresses move on DHCP renewal: a re-push for a known id updates the
+            // stored host in place rather than creating a second device.
+            existing.Host = discovery.Host.Trim();
+            existing.Port = discovery.Port > 0 ? discovery.Port : 8009;
+
+            if (discovery.Capabilities is int capabilities)
+            {
+                existing.Capabilities = capabilities;
+                existing.IsVideoCapable = (capabilities & 0x01) != 0;
+                existing.IsGroup = (capabilities & 0x20) != 0;
+            }
+
+            existing.LastSeenUtc = now;
+            if (!existing.ManuallyAdded) existing.Origin = CastDeviceOrigins.HaProxy;
+
+            _seenThisRun[deviceId] = now;
+            seen++;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        if (seen > 0)
+        {
+            _logger.LogInformation("Home Assistant proxied {Count} Cast receiver(s)", seen);
+        }
+
+        return await GetDevicesAsync(cancellationToken);
     }
 
     public async Task<bool> ForgetAsync(string deviceId, CancellationToken cancellationToken = default)
@@ -287,6 +355,8 @@ public sealed class CastDeviceService : ICastDeviceService, IHostedService, IDis
         IsVideoCapable = device.IsVideoCapable,
         IsGroup = device.IsGroup,
         ManuallyAdded = device.ManuallyAdded,
+        Origin = string.IsNullOrWhiteSpace(device.Origin) ? CastDeviceOrigins.Discovered : device.Origin,
+        Port = device.Port > 0 ? device.Port : 8009,
         LastSeenUtc = device.LastSeenUtc,
         IsOnline = device.ManuallyAdded ||
                    (device.LastSeenUtc != null &&

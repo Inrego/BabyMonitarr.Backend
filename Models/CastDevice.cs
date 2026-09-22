@@ -29,5 +29,23 @@ public class CastDevice
     /// <summary>Added by IP instead of discovered — kept even when mDNS never sees it.</summary>
     public bool ManuallyAdded { get; set; }
 
+    /// <summary>
+    /// Which path last saw this device: see <see cref="CastDeviceOrigins"/>. Diagnostics only —
+    /// identity is <see cref="DeviceId"/>, so a device seen by several paths is still one row.
+    /// </summary>
+    public string Origin { get; set; } = CastDeviceOrigins.Discovered;
+
     public DateTime? LastSeenUtc { get; set; }
+}
+
+public static class CastDeviceOrigins
+{
+    /// <summary>Found by the backend's own mDNS browse. Needs host networking.</summary>
+    public const string Discovered = "discovered";
+
+    /// <summary>Added by IP through the UI.</summary>
+    public const string Manual = "manual";
+
+    /// <summary>Pushed in by Home Assistant's Zeroconf browser, which can see link-local multicast.</summary>
+    public const string HaProxy = "ha-proxy";
 }

@@ -30,6 +30,9 @@ public static class HaProtocol
     public const string SoundEvent = "sound_event";
     public const string StreamOnline = "stream_online";
     public const string Monitoring = "monitoring";
+    public const string CastDevices = "cast.devices";
+    public const string CastState = "cast.state";
+    public const string CastStartResult = "cast.start_result";
     public const string Ack = "ack";
     public const string Error = "error";
     public const string Pong = "pong";
@@ -40,11 +43,17 @@ public static class HaProtocol
     public const string CmdSetMonitoring = "set_monitoring";
     public const string CmdSetGlobalSettings = "set_global_settings";
     public const string CmdSetActiveRoom = "set_active_room";
+    public const string CmdCastDiscovered = "cast.discovered";
+    public const string CmdCastStart = "cast.start";
+    public const string CmdCastStop = "cast.stop";
+    public const string CmdCastStopDevice = "cast.stop_device";
+    public const string CmdCastSetTargets = "cast.set_targets";
 
     // Error codes
     public const string ErrBadRequest = "bad_request";
     public const string ErrUnknownType = "unknown_type";
     public const string ErrUnknownRoom = "unknown_room";
+    public const string ErrUnknownDevice = "unknown_device";
     public const string ErrInternal = "internal_error";
 }
 
@@ -132,3 +141,37 @@ public sealed record HaAckData(
 public sealed record HaErrorData(
     [property: JsonPropertyName("code")] string Code,
     [property: JsonPropertyName("message")] string Message);
+
+public sealed record HaCastDeviceInfo(
+    [property: JsonPropertyName("device_id")] string DeviceId,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("host")] string Host,
+    [property: JsonPropertyName("port")] int Port,
+    [property: JsonPropertyName("origin")] string Origin,
+    [property: JsonPropertyName("manually_added")] bool ManuallyAdded,
+    [property: JsonPropertyName("is_video_capable")] bool IsVideoCapable,
+    [property: JsonPropertyName("is_group")] bool IsGroup,
+    [property: JsonPropertyName("is_online")] bool IsOnline,
+    [property: JsonPropertyName("last_seen_at")] DateTime? LastSeenAt,
+    [property: JsonPropertyName("casting_room_id")] int? CastingRoomId,
+    [property: JsonPropertyName("last_error")] string? LastError);
+
+public sealed record HaCastDevicesData(
+    [property: JsonPropertyName("devices")] IReadOnlyList<HaCastDeviceInfo> Devices);
+
+public sealed record HaCastSessionInfo(
+    [property: JsonPropertyName("device_id")] string DeviceId,
+    [property: JsonPropertyName("video")] bool Video,
+    [property: JsonPropertyName("started_at")] DateTime StartedAt);
+
+public sealed record HaCastStateData(
+    [property: JsonPropertyName("room_id")] int RoomId,
+    [property: JsonPropertyName("casting")] bool Casting,
+    [property: JsonPropertyName("targets")] IReadOnlyList<string> Targets,
+    [property: JsonPropertyName("sessions")] IReadOnlyList<HaCastSessionInfo> Sessions);
+
+public sealed record HaCastStartResultData(
+    [property: JsonPropertyName("room_id")] int RoomId,
+    [property: JsonPropertyName("started")] IReadOnlyList<HaCastSessionInfo> Started,
+    [property: JsonPropertyName("failed")] IReadOnlyDictionary<string, string> Failed);
