@@ -192,7 +192,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             throw new InvalidOperationException($"Room '{room.Name}' has no stream enabled to cast.");
         }
 
-        var stream = await _streams.AcquireAsync(room, video, cancellationToken);
+        var stream = await _streams.AcquireAsync(room, video, MaxVideoHeightFor(device), cancellationToken);
 
         string mediaUrl = $"{baseUrl}{stream.PlaylistPath}";
         var media = new Media
@@ -240,6 +240,15 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             throw;
         }
     }
+
+    /// <summary>
+    /// Nest Hub displays fail the load (LOAD_FAILED, then IdleReason ERROR) on 1080p H.264 of
+    /// any profile but play 720p, so they get a scaled rendition. Everything else is passed the
+    /// source untouched. Ceiling: matched on the mDNS model name; another receiver that turns
+    /// out to be resolution-limited needs adding here.
+    /// </summary>
+    private static int? MaxVideoHeightFor(CastDevice device) =>
+        device.Model.Contains("Nest Hub", StringComparison.OrdinalIgnoreCase) ? 720 : null;
 
     /// <summary>
     /// Connects to the receiver, launches the media app and loads the room. Used for the first

@@ -16,6 +16,8 @@ public sealed class CastHlsStream
     public required string Key { get; init; }
     public required int RoomId { get; init; }
     public required bool Video { get; init; }
+    /// <summary>Height cap for receivers that reject larger video; null passes the source through.</summary>
+    public int? MaxVideoHeight { get; init; }
     public required string Token { get; init; }
     public required string DirectoryPath { get; init; }
 
@@ -33,7 +35,7 @@ public sealed class CastHlsStream
 
 public interface ICastHlsStreamService
 {
-    Task<CastHlsStream> AcquireAsync(Room room, bool video, CancellationToken cancellationToken);
+    Task<CastHlsStream> AcquireAsync(Room room, bool video, int? maxVideoHeight, CancellationToken cancellationToken);
     void Release(CastHlsStream stream);
     bool TryResolveFile(string token, string fileName, out string fullPath);
 }
@@ -85,9 +87,12 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         TryCleanRoot();
     }
 
-    public async Task<CastHlsStream> AcquireAsync(Room room, bool video, CancellationToken cancellationToken)
+    public async Task<CastHlsStream> AcquireAsync(Room room, bool video, int? maxVideoHeight, CancellationToken cancellationToken)
     {
-        string key = $"{room.Id}:{(video ? "v" : "a")}";
+        if (!video) maxVideoHeight = null;
+        // Capped and uncapped renditions are separate ffmpeg processes, so a Nest Hub and a TV
+        // showing the same room each get what they can play.
+        string key = $"{room.Id}:{(video ? "v" : "a")}{maxVideoHeight}";
 
         await _gate.WaitAsync(cancellationToken);
         CastHlsStream stream;
@@ -96,7 +101,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         {
             if (!_streams.TryGetValue(key, out var existing))
             {
-                existing = StartStream(room, video, key);
+                existing = StartStream(room, video, maxVideoHeight, key);
                 _streams[key] = existing;
                 _streamsByToken[existing.Token] = existing;
                 created = true;
@@ -186,7 +191,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         return true;
     }
 
-    private CastHlsStream StartStream(Room room, bool video, string key)
+    private CastHlsStream StartStream(Room room, bool video, int? maxVideoHeight, string key)
     {
         string token = Guid.NewGuid().ToString("N");
         string dir = Path.Combine(RootPath, token);
@@ -197,6 +202,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
             Key = key,
             RoomId = room.Id,
             Video = video,
+            MaxVideoHeight = maxVideoHeight,
             Token = token,
             DirectoryPath = dir
         };
@@ -438,7 +444,16 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
                 string.Equals(room.VideoPassthroughCodec, "h264", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(room.VideoSourceCodecName, "h264", StringComparison.OrdinalIgnoreCase);
 
-            if (sourceIsH264)
+            if (stream.MaxVideoHeight is int maxHeight)
+            {
+                // The receiver rejects the source resolution outright (a Nest Hub fails the
+                // load on 1080p), so scale down - never up - and re-encode whatever the codec.
+                Arg("-vf", $"scale=-2:min({maxHeight}\\,ih)");
+                Arg("-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                    "-profile:v", "high", "-pix_fmt", "yuv420p",
+                    "-force_key_frames", $"expr:gte(t,n_forced*{segmentSeconds})");
+            }
+            else if (sourceIsH264)
             {
                 Arg("-c:v", "copy");
             }
