@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using BabyMonitarr.Backend.Auth;
+using BabyMonitarr.Backend.Ha;
 using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
@@ -69,8 +71,15 @@ builder.Services.AddHostedService(sp => (CastSessionService)sp.GetRequiredServic
 // Add authentication
 builder.Services.AddBabyMonitarrAuth(builder.Configuration);
 
-// Add SignalR
-builder.Services.AddSignalR();
+// Home Assistant WebSocket endpoint (/ha/ws) and its always-on monitoring subscriber
+builder.Services.Configure<HaOptions>(builder.Configuration.GetSection("Ha"));
+var haViewerCountFilter = new HaViewerCountFilter();
+builder.Services.AddSingleton<IHaViewerCounter>(haViewerCountFilter);
+builder.Services.AddSingleton<IHaMonitoringService, HaMonitoringService>();
+builder.Services.AddHostedService(sp => (HaMonitoringService)sp.GetRequiredService<IHaMonitoringService>());
+
+// Add SignalR — the filter counts hub connections for the HA connected-viewers sensor
+builder.Services.AddSignalR(options => options.AddFilter(haViewerCountFilter));
 
 var app = builder.Build();
 
@@ -157,6 +166,7 @@ app.UseWhen(
     context => !context.Request.Path.StartsWithSegments("/cast/hls"),
     branch => branch.UseHttpsRedirection());
 app.UseStaticFiles();
+app.UseWebSockets();
 app.UseRouting();
 
 app.UseCors("SignalRWithCredentials");
@@ -167,6 +177,9 @@ app.UseAuthorization();
 // Map SignalR hub
 app.MapHub<BabyMonitarr.Backend.Hubs.AudioStreamHub>("/audioHub")
    .RequireCors("SignalRWithCredentials");
+
+// Plain WebSocket endpoint for the Home Assistant integration
+app.MapHaWebSocket();
 
 app.MapControllerRoute(
         name: "default",
