@@ -61,10 +61,16 @@ function initAudioContext() {
 }
 
 function initializeSignalRConnection() {
+    // SIGNALR_RETRY_POLICY comes from signalr-retry.js — retries forever.
     connection = new signalR.HubConnectionBuilder()
         .withUrl("/audioHub")
-        .withAutomaticReconnect()
+        .withAutomaticReconnect(SIGNALR_RETRY_POLICY)
         .build();
+
+    connection.onclose((error) => {
+        console.warn("SignalR closed, restarting:", error?.message ?? error);
+        setTimeout(initializeSignalRConnection, 2000);
+    });
 
     // Handle server ICE candidates (audio - per room)
     connection.on("ReceiveAudioIceCandidate", async (roomId, candidate, sdpMid, sdpMLineIndex) => {

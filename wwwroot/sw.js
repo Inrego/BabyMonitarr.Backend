@@ -1,7 +1,8 @@
-const CACHE_NAME = 'babymonitarr-v1';
+const CACHE_NAME = 'babymonitarr-v2';
 const STATIC_ASSETS = [
     '/',
     '/css/site.css',
+    '/js/signalr-retry.js',
     '/js/dashboard.js',
     '/js/site.js',
     '/js/system.js',

@@ -1,5 +1,7 @@
 // SignalR connection
 let connection;
+let signalrStartTimer = null;    // pending retry of connection.start()
+let signalrStartAttempts = 0;
 
 // Video state
 let videoConnections = {};        // { roomId: RTCPeerConnection }
@@ -718,9 +720,10 @@ document.addEventListener('DOMContentLoaded', function () {
 function initializeSignalRConnection() {
     diagInfo("signalr.connection.build", { hubUrl: "/audioHub" });
 
+    // SIGNALR_RETRY_POLICY comes from signalr-retry.js — retries forever.
     connection = new signalR.HubConnectionBuilder()
         .withUrl("/audioHub")
-        .withAutomaticReconnect()
+        .withAutomaticReconnect(SIGNALR_RETRY_POLICY)
         .build();
 
     connection.onreconnecting((error) => {
@@ -735,6 +738,7 @@ function initializeSignalRConnection() {
             state: connection.state,
             connectionId: connectionId ?? null
         });
+        afterSignalRConnected(true);
     });
 
     connection.onclose((error) => {
@@ -742,6 +746,10 @@ function initializeSignalRConnection() {
             state: connection.state,
             error: normalizeError(error)
         });
+        // With an infinite retry policy this only fires if start() was never
+        // reached or stop() was called, but it stays as the last backstop so
+        // the dashboard can never end up permanently disconnected.
+        scheduleSignalRStart(2000);
     });
 
     // Handle server ICE candidates (audio - per room)
@@ -862,21 +870,127 @@ function initializeSignalRConnection() {
         await loadRooms();
     });
 
-    connection.start()
-        .then(async () => {
-            console.log("Dashboard SignalR Connected");
-            diagInfo("signalr.connected", {
-                state: connection.state,
-                connectionId: connection.connectionId ?? null
-            });
-            await loadWebRtcConfig();
-            await loadRooms();
-        })
-        .catch(err => {
-            diagError("signalr.start.failed", err);
-            console.error(err);
-            setTimeout(initializeSignalRConnection, 5000);
+    startSignalRWithRetry();
+}
+
+function scheduleSignalRStart(delayMs) {
+    clearTimeout(signalrStartTimer);
+    signalrStartTimer = setTimeout(startSignalRWithRetry, delayMs);
+}
+
+async function startSignalRWithRetry() {
+    signalrStartTimer = null;
+    if (!connection || connection.state !== signalR.HubConnectionState.Disconnected) {
+        return;
+    }
+
+    signalrStartAttempts++;
+    try {
+        await connection.start();
+        signalrStartAttempts = 0;
+        console.log("Dashboard SignalR Connected");
+        diagInfo("signalr.connected", {
+            state: connection.state,
+            connectionId: connection.connectionId ?? null
         });
+        await afterSignalRConnected(false);
+    } catch (err) {
+        // Retry on the same HubConnection rather than rebuilding it — the old
+        // code called initializeSignalRConnection() again, orphaning the
+        // previous connection object and all its handlers on every failure.
+        const delayMs = signalrRetryDelay(signalrStartAttempts) || 2000;
+        diagError("signalr.start.failed", err, {
+            attempt: signalrStartAttempts,
+            nextRetryMs: delayMs
+        });
+        console.error(err);
+        scheduleSignalRStart(delayMs);
+    }
+}
+
+async function afterSignalRConnected(isReconnect) {
+    try {
+        await loadWebRtcConfig();
+        await loadRooms();
+        if (isReconnect) {
+            await rebuildStreamsAfterReconnect();
+        }
+    } catch (err) {
+        diagError("signalr.postConnect.failed", err, { isReconnect });
+    }
+}
+
+// AudioStreamHub.OnDisconnectedAsync closes every peer connection belonging to
+// the dropped hub connection id, so after a reconnect our local
+// RTCPeerConnections are pointing at streams the server has already forgotten.
+// SignalR coming back is therefore not enough — each monitored room has to be
+// renegotiated from scratch, or the cards sit there showing dead video and a
+// flat noise meter.
+async function rebuildStreamsAfterReconnect() {
+    const roomIds = Array.from(monitoringRooms);
+    if (roomIds.length === 0) return;
+
+    diagInfo("signalr.reconnect.rebuildStreams", { roomIds });
+
+    for (const roomId of roomIds) {
+        const room = currentRooms.find(r => r.id === roomId);
+        if (!room) {
+            // loadRooms() already drops rooms that vanished from config.
+            continue;
+        }
+
+        discardLocalStreamState(roomId);
+
+        const hasAudio = room.enableAudioStream && (room.cameraStreamUrl || room.nestDeviceId);
+        const hasVideo = room.enableVideoStream && (room.cameraStreamUrl || room.nestDeviceId);
+
+        if (hasAudio) {
+            await startAudioStream(roomId);
+            updateMuteButton(roomId);
+        }
+        if (hasVideo) {
+            await startVideoStream(roomId);
+        }
+    }
+
+    pwaUpdateMediaSession();
+}
+
+// Local-only teardown. Deliberately does NOT invoke StopAudioStream /
+// StopVideoStream: those are keyed by hub connection id, and after a reconnect
+// the server no longer has the old one, so the calls would be pointless round
+// trips against a fresh connection id.
+function discardLocalStreamState(roomId) {
+    for (const [streamType, store] of [["video", videoConnections], ["audio", audioConnections]]) {
+        const pc = store[roomId];
+        if (pc) {
+            try {
+                pc.close();
+            } catch (err) {
+                diagWarn("webrtc.discard.close.failed", {
+                    roomId,
+                    streamType,
+                    error: normalizeError(err)
+                });
+            }
+            delete store[roomId];
+        }
+        clearAllStreamTimers(roomId, streamType);
+        cleanupStreamDiagnostics(roomId, streamType);
+    }
+
+    delete videoPendingCandidates[roomId];
+    delete videoTracks[roomId];
+    delete audioPendingCandidates[roomId];
+
+    if (audioElements[roomId]) {
+        audioElements[roomId].srcObject = null;
+        audioElements[roomId].remove();
+        delete audioElements[roomId];
+    }
+
+    onVideoDisconnected(roomId);
+    onAudioDisconnected(roomId);
 }
 
 async function loadRooms() {
