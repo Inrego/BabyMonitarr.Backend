@@ -152,7 +152,7 @@ after `set_monitoring`. Incremental changes afterwards arrive as `sound_level`, 
 ```jsonc
 "data": {
   "room_id": 1,
-  "monitoring": true,        // bool, the always-on subscription
+  "monitoring": true,        // bool, the always-on subscription (not "is it running")
   "sound_detected": false,   // bool, the held sound state
   "stream_online": true,     // bool
   "level_db": -41.2          // double|null, last broadcast level; null if none yet
@@ -165,6 +165,10 @@ after `set_monitoring`. Incremental changes afterwards arrive as `sound_level`, 
 ### `sound_level`
 The throttled level broadcast. One frame per tick (`level_interval_ms`, default 1000 ms),
 carrying every room that produced audio during the tick. **Never one frame per audio frame.**
+
+The set of rooms therefore varies from tick to tick and is **not** limited to the monitored ones:
+a room reports whenever its audio pipeline is running, for whatever reason — monitoring is on, or
+the mobile app or the web dashboard is streaming it. See §6.
 
 ```jsonc
 "data": {
@@ -223,10 +227,11 @@ Sent on change. Drives `binary_sensor.<room>_stream_online` (`device_class: conn
 "data": { "room_id": 1, "online": true }
 ```
 
-`online` is true when the room is monitored **and** an audio frame arrived within
-`StreamOnlineTimeoutSeconds` (default 10 s). Turning monitoring off sets it to `false`: with no
-subscriber the backend stops the reader, so there is nothing to observe. A room that has never
-been monitored reports `online: false`.
+`online` is true when an audio frame arrived within `StreamOnlineTimeoutSeconds` (default 10 s),
+regardless of why the room's reader is running. Turning monitoring off does not by itself set it
+to `false`: if the mobile app or the dashboard is still streaming the room, audio keeps arriving
+and the room stays online. It goes `false` once the reader stops — which, with monitoring off, is
+when the last viewer leaves. A room nobody is monitoring or streaming reports `online: false`.
 
 ### `monitoring`
 Sent on change (i.e. in response to some client's `set_monitoring`). Broadcast to **all** HA
@@ -579,13 +584,22 @@ app client registers — and stays subscribed. It never requests a WebRTC peer a
 unsubscribes until monitoring is turned off. There is no second reader lifecycle and no change to
 `StopReader` semantics.
 
+Reporting is a separate concern from that subscription. The backend observes levels through a
+service-wide event raised by every running room processor, so what HA reports is "whatever audio
+pipeline happens to be running", not "the rooms HA subscribed to". The observation is passive: it
+starts no reader, and once a room's reader stops the room is dropped rather than left reporting a
+stale value.
+
 Consequences worth knowing:
 
 - Monitoring keeps the RTSP/Nest reader (and its ffmpeg pipeline) alive for that room. That is the
   cost of always-on detection; it is why the switch defaults off.
-- `sound_event` / `sound_state` also fire for a room that is **not** monitored, whenever somebody
-  else is streaming it — the backend's threshold event is global. Monitoring only guarantees that
-  detection runs when nobody is streaming.
+- `sound_level`, `stream_online`, `sound_event` and `sound_state` all fire for a room that is
+  **not** monitored, whenever somebody else is streaming it. Monitoring only guarantees that
+  detection runs — and therefore that the room reports — when nobody is streaming.
+- When the last viewer of an unmonitored room leaves, the reader stops: within
+  `StreamOnlineTimeoutSeconds` the room emits `stream_online: false`, stops appearing in
+  `sound_level`, and `room_state` reports it with `level_db: null` again.
 
 ---
 
@@ -597,7 +611,7 @@ Consequences worth knowing:
 "Ha": {
   "LevelBroadcastIntervalMs": 1000,   // sound_level tick; floor 100 ms
   "SoundClearHoldSeconds": 30,        // sound_state hold after the last crossing
-  "StreamOnlineTimeoutSeconds": 10,   // silence before a monitored room reports offline
+  "StreamOnlineTimeoutSeconds": 10,   // silence before a room reports offline
   "StatePollIntervalSeconds": 5,      // re-read of rooms/settings/active room/viewers
   "SendQueueCapacity": 256            // per-connection outbound queue before the client is dropped
 }

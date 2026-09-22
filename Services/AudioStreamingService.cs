@@ -18,6 +18,18 @@ namespace BabyMonitarr.Backend.Services
         public uint DurationRtpUnits { get; set; }
     }
 
+    /// <summary>
+    /// A processed audio level for a room, raised for every running processor regardless of who
+    /// (if anyone) subscribed to the room's frames. Observers that must not pin a reader open —
+    /// the Home Assistant bridge, for instance — listen to this instead of subscribing.
+    /// </summary>
+    public class AudioLevelEventArgs : EventArgs
+    {
+        public int RoomId { get; init; }
+        public double AudioLevel { get; init; }
+        public DateTime Timestamp { get; init; }
+    }
+
     public interface IAudioStreamingService
     {
         Task StartAsync(CancellationToken ct);
@@ -27,6 +39,12 @@ namespace BabyMonitarr.Backend.Services
         void RefreshRooms();
         bool IsNestRoom(int roomId);
         event EventHandler<SoundThresholdEventArgs> SoundThresholdExceeded;
+
+        /// <summary>Raised for every processed sample of every running room processor.</summary>
+        event EventHandler<AudioLevelEventArgs> AudioLevelMeasured;
+
+        /// <summary>True while a processor is running for the room, i.e. somebody is streaming it.</summary>
+        bool IsRoomProcessing(int roomId);
     }
 
     public class AudioStreamingService : IAudioStreamingService, IHostedService, IDisposable
@@ -45,6 +63,7 @@ namespace BabyMonitarr.Backend.Services
         private bool _isDisposed;
 
         public event EventHandler<SoundThresholdEventArgs>? SoundThresholdExceeded;
+        public event EventHandler<AudioLevelEventArgs>? AudioLevelMeasured;
 
         public AudioStreamingService(
             ILogger<AudioStreamingService> logger,
@@ -343,6 +362,8 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
+        public bool IsRoomProcessing(int roomId) => _processors.ContainsKey(roomId);
+
         public bool IsNestRoom(int roomId) =>
             _roomCache.TryGetValue(roomId, out var room) && room.StreamSourceType == "google_nest";
 
@@ -351,6 +372,26 @@ namespace BabyMonitarr.Backend.Services
             if (sender is not AudioProcessingService processor) return;
 
             int roomId = processor.RoomId;
+
+            // Raised before the subscriber fan-out and independently of it: a room being streamed
+            // by an app client produces levels that passive observers must still see.
+            if (AudioLevelMeasured != null)
+            {
+                try
+                {
+                    AudioLevelMeasured.Invoke(this, new AudioLevelEventArgs
+                    {
+                        RoomId = roomId,
+                        AudioLevel = e.AudioLevel,
+                        Timestamp = e.Timestamp
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error in audio level observer for room {RoomId}", roomId);
+                }
+            }
+
             if (_subscribers.TryGetValue(roomId, out var handlers))
             {
                 var frameArgs = new AudioFrameEventArgs

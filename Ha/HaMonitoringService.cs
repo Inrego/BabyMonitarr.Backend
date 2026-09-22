@@ -27,6 +27,12 @@ public interface IHaMonitoringService
 /// <see cref="IAudioStreamingService.SubscribeToRoom"/> handler — the same kind an app client
 /// registers — and stays subscribed, which keeps the lazily-started reader alive. There is no
 /// second reader lifecycle here.
+///
+/// Reporting is separate from that subscription. Levels are taken from the service-wide
+/// <see cref="IAudioStreamingService.AudioLevelMeasured"/> event, which fires for every running
+/// processor, so a room that runs only because the phone app or the web client is streaming it
+/// reports too. That observation is passive: it starts no reader and, once the reader stops, the
+/// room's monitor entry is dropped rather than left emitting its last value.
 /// </summary>
 public class HaMonitoringService : IHaMonitoringService, IHostedService, IDisposable
 {
@@ -84,6 +90,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _audioStreamingService.SoundThresholdExceeded += OnSoundThresholdExceeded;
+        _audioStreamingService.AudioLevelMeasured += OnAudioLevelMeasured;
 
         var levelInterval = TimeSpan.FromMilliseconds(Math.Max(100, _options.LevelBroadcastIntervalMs));
         _levelTimer = new Timer(_ => OnLevelTick(), null, levelInterval, levelInterval);
@@ -99,6 +106,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _audioStreamingService.SoundThresholdExceeded -= OnSoundThresholdExceeded;
+        _audioStreamingService.AudioLevelMeasured -= OnAudioLevelMeasured;
         _levelTimer?.Dispose();
         _pollTimer?.Dispose();
         _cts?.Cancel();
@@ -336,20 +344,43 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
     #region Monitoring subscription
 
+    /// <summary>
+    /// Runs <paramref name="action"/> against the room's monitor under its lock, re-creating the
+    /// entry if the level tick retired it in between so no update lands on a dropped monitor.
+    /// </summary>
+    private void WithMonitor(int roomId, Action<RoomMonitor> action)
+    {
+        while (true)
+        {
+            var monitor = _monitors.GetOrAdd(roomId, id => new RoomMonitor(id));
+            lock (monitor.Sync)
+            {
+                if (!monitor.Retired)
+                {
+                    action(monitor);
+                    return;
+                }
+            }
+
+            _monitors.TryRemove(new KeyValuePair<int, RoomMonitor>(roomId, monitor));
+        }
+    }
+
     private void SetMonitoring(int roomId, bool enabled)
     {
-        var monitor = _monitors.GetOrAdd(roomId, id => new RoomMonitor(id));
-        Action<AudioFrameEventArgs> handler;
+        Action<AudioFrameEventArgs>? handler = null;
 
         // Subscribe/unsubscribe happens outside the lock: unsubscribing the last subscriber stops
-        // the reader, and the reader thread may be inside OnAudioFrame waiting for this same lock.
-        lock (monitor.Sync)
+        // the reader, and the reader thread may be inside the level observer waiting for this lock.
+        WithMonitor(roomId, monitor =>
         {
             if (enabled)
             {
                 if (monitor.Handler != null) return;
 
-                handler = frame => OnAudioFrame(monitor, frame);
+                // The handler exists purely to hold the reader open; the levels themselves arrive
+                // on the service-wide AudioLevelMeasured event, for monitored rooms and others alike.
+                handler = _ => { };
                 monitor.Handler = handler;
             }
             else
@@ -358,11 +389,13 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
 
                 handler = monitor.Handler;
                 monitor.Handler = null;
-                monitor.HasLevel = false;
-                monitor.LastFrameUtc = DateTime.MinValue;
-                monitor.StreamOnline = false;
+
+                // No state is cleared here: if somebody else is streaming the room the reader keeps
+                // running, and the level tick decides when it actually went quiet.
             }
-        }
+        });
+
+        if (handler == null) return;
 
         if (!enabled)
         {
@@ -395,35 +428,35 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     }
 
     /// <summary>
-    /// Runs on the reader thread for every audio frame, so it does no work beyond folding the
-    /// frame into the per-room accumulator the level tick drains.
+    /// Runs on the reader thread for every processed sample of every running room — monitored or
+    /// merely being streamed by an app client — so it does no work beyond folding the sample into
+    /// the per-room accumulator the level tick drains.
     /// </summary>
-    private void OnAudioFrame(RoomMonitor monitor, AudioFrameEventArgs frame)
+    private void OnAudioLevelMeasured(object? sender, AudioLevelEventArgs e)
     {
-        if (!double.IsFinite(frame.AudioLevel)) return;
+        if (!double.IsFinite(e.AudioLevel)) return;
 
-        lock (monitor.Sync)
+        WithMonitor(e.RoomId, monitor =>
         {
             monitor.LastFrameUtc = DateTime.UtcNow;
-            if (!monitor.HasLevel || frame.AudioLevel > monitor.PeakLevelDb)
+            if (!monitor.HasLevel || e.AudioLevel > monitor.PeakLevelDb)
             {
-                monitor.PeakLevelDb = frame.AudioLevel;
+                monitor.PeakLevelDb = e.AudioLevel;
             }
             monitor.HasLevel = true;
-        }
+        });
     }
 
     private void OnSoundThresholdExceeded(object? sender, SoundThresholdEventArgs e)
     {
-        var monitor = _monitors.GetOrAdd(e.RoomId, id => new RoomMonitor(id));
-        bool becameDetected;
+        bool becameDetected = false;
 
-        lock (monitor.Sync)
+        WithMonitor(e.RoomId, monitor =>
         {
             monitor.LastSoundEventUtc = e.Timestamp;
             becameDetected = !monitor.SoundDetected;
             monitor.SoundDetected = true;
-        }
+        });
 
         // The event is an edge with a mute window; the state carries its own clear hold, so both
         // are sent — one drives the binary_sensor, the other fires on the HA bus.
@@ -452,8 +485,11 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
             var offlineTimeout = TimeSpan.FromSeconds(Math.Max(1, _options.StreamOnlineTimeoutSeconds));
             var clearHold = TimeSpan.FromSeconds(Math.Max(1, _options.SoundClearHoldSeconds));
 
-            foreach (var monitor in _monitors.Values)
+            foreach (var entry in _monitors)
             {
+                var monitor = entry.Value;
+                bool retire = false;
+
                 lock (monitor.Sync)
                 {
                     if (monitor.HasLevel)
@@ -464,7 +500,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                         monitor.HasLevel = false;
                     }
 
-                    bool online = monitor.Handler != null && now - monitor.LastFrameUtc <= offlineTimeout;
+                    // Online means "audio is arriving", whoever is keeping the reader open.
+                    bool online = now - monitor.LastFrameUtc <= offlineTimeout;
                     if (online != monitor.StreamOnline)
                     {
                         monitor.StreamOnline = online;
@@ -476,6 +513,20 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                         monitor.SoundDetected = false;
                         cleared.Add(new HaSoundStateData(monitor.RoomId, false, monitor.LastSoundEventUtc));
                     }
+
+                    // A room observed only because somebody was streaming it stops being reported
+                    // once its reader is gone, rather than lingering with a stale last value.
+                    if (monitor.Handler == null && !monitor.StreamOnline && !monitor.SoundDetected &&
+                        !_audioStreamingService.IsRoomProcessing(monitor.RoomId))
+                    {
+                        monitor.Retired = true;
+                        retire = true;
+                    }
+                }
+
+                if (retire)
+                {
+                    _monitors.TryRemove(entry);
                 }
             }
 
@@ -638,5 +689,8 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
         public bool StreamOnline { get; set; }
         public bool SoundDetected { get; set; }
         public DateTime LastSoundEventUtc { get; set; } = DateTime.MinValue;
+
+        /// <summary>Set when the level tick drops the entry, so a racing observer re-creates it.</summary>
+        public bool Retired { get; set; }
     }
 }
