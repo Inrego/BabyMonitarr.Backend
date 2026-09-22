@@ -590,11 +590,15 @@ Reconnect contract:
   and should reconcile its switch entities to it (or re-assert its own desired state with
   `set_monitoring`).
 - **Monitoring is persisted and survives a backend restart.** The backend stores one row per
-  monitored room and, on startup, re-establishes the always-on subscriber for each of them before
-  it accepts /ha/ws connections. The first snapshot a reconnecting client receives therefore
-  already reports `monitoring: true` for those rooms, and the client must **not** re-assert
-  `set_monitoring` from its own cached switch state — the backend remains the source of truth, and
-  `room_state` in the snapshot always tells it.
+  monitored room and re-establishes the always-on subscriber for each of them during startup. The
+  socket is already accepting /ha/ws while that runs, so the restore is **not** ordered before the
+  first connection: a client that connects inside that window gets a snapshot reporting
+  `monitoring: false` for rooms that are about to be restored. Every restored room is then
+  announced with `monitoring` plus `room_state`, exactly as a `set_monitoring` would announce it,
+  so such a client is corrected within that startup. A client connecting after the restore sees
+  `monitoring: true` in its snapshot and receives nothing further. Either way the client must
+  **not** re-assert `set_monitoring` from its own cached switch state — the backend remains the
+  source of truth, and `room_state` tells it.
   Restoring a room whose camera is unreachable is not special-cased: the switch comes back on and
   the reader is started exactly as if the switch had been flipped by hand, so it retries and gives
   up the same way. Such a room reports `monitoring: true` with `stream_online: false` and no

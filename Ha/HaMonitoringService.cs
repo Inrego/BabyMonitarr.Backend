@@ -434,6 +434,10 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
     /// prunes them, and a re-used room id would otherwise resurrect a switch nobody turned on.
     /// A room whose camera is unreachable is still restored: the switch is on, the reader is asked
     /// to start and fails the way it would have if the switch had been flipped by hand.
+    ///
+    /// Each restored room is announced exactly as the command path announces a switch, because
+    /// Kestrel is already accepting /ha/ws while this runs: a client that connected in that window
+    /// got a snapshot saying monitoring is off, and nothing else would ever correct it.
     /// </summary>
     private async Task RestorePersistedMonitoringAsync()
     {
@@ -459,14 +463,21 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                     "Dropped persisted HA monitoring for {Count} room(s) that no longer exist", stale.Count);
             }
 
-            foreach (var roomId in persisted.Select(m => m.RoomId).Where(knownRoomIds.Contains))
+            var restored = persisted.Select(m => m.RoomId).Where(knownRoomIds.Contains).ToList();
+            foreach (var roomId in restored)
             {
                 SetMonitoring(roomId, true);
             }
 
+            foreach (var roomId in restored)
+            {
+                Broadcast(HaFrames.Build(HaProtocol.Monitoring, new HaMonitoringData(roomId, true)));
+                Broadcast(HaFrames.Build(HaProtocol.RoomState, BuildRoomState(roomId)));
+            }
+
             _logger.LogInformation(
                 "Restored HA monitoring for {Count} room(s) from the database",
-                persisted.Count - stale.Count);
+                restored.Count);
         }
         catch (Exception ex)
         {
