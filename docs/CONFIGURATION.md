@@ -79,8 +79,8 @@ Video streaming is passthrough-only — BabyMonitarr does **not** transcode vide
 ## Google Cast
 
 Casting a room to Chromecast displays and Google/Nest speakers is handled entirely by the
-backend: it discovers receivers over mDNS, transcodes the room to HLS with FFmpeg, and tells
-each receiver to play it. Several receivers can show the same room at once, and the app only
+backend: it discovers receivers over mDNS, turns the room into HLS with FFmpeg (RTSP is pulled
+directly, Nest is relayed over loopback RTP), and tells each receiver to play it. Several receivers can show the same room at once, and the app only
 selects targets.
 
 | Setting | Default | Notes |
@@ -90,8 +90,8 @@ selects targets.
 | `Cast__HlsPath` | system temp | Where segments are written. |
 | `Cast__DiscoveryIntervalSeconds` | `300` | How often the mDNS sweep runs. |
 | `Cast__DiscoveryTimeoutSeconds` | `5` | Length of each sweep. |
-| `Cast__SegmentSeconds` | `2` | Lower means less cast delay, more segment churn. |
-| `Cast__PlaylistSize` | `6` | Segments kept in the live window. |
+| `Cast__SegmentSeconds` | `1` | Lower means less cast delay, more segment churn. Copied H.264 sources still split only on keyframes. |
+| `Cast__PlaylistSize` | `4` | Segments kept in the live window. Smaller is less delay; below 4 the receiver stalls. |
 | `Cast__StreamLingerSeconds` | `15` | How long FFmpeg keeps running after the last receiver stops. |
 | `Cast__FfmpegPath` | (auto) | Overrides the bundled/Jellyfin FFmpeg binary. |
 
@@ -104,8 +104,19 @@ Things worth knowing:
   in the URL.
 - **mDNS needs a flat network.** In Docker, discovery only works with `--network host`.
   Otherwise add receivers by IP from the app (Cast sheet -> add by IP address).
-- **RTSP rooms only.** Google Nest rooms arrive as WebRTC inside the backend, so there is no
-  source URL for FFmpeg to pull and casting them is rejected with a clear message.
+- **Nest rooms are relayed, not pulled.** A Google Nest room arrives as WebRTC inside the
+  backend, so FFmpeg cannot fetch it by URL. Instead the decrypted RTP packets are re-sent
+  unchanged to loopback UDP ports and FFmpeg reads them through a generated SDP file. Nothing is
+  re-packetized or buffered on the way, and casting an inactive Nest room brings its WebRTC
+  session up (and tears it down again afterwards). Nest video is always H.264 and is copied
+  through, so segment length follows the camera's keyframe cadence rather than
+  `Cast__SegmentSeconds`.
+- **Sessions recover on their own.** A cast runs until it is stopped from the app. If the
+  receiver drops off (Wi-Fi blip, reboot) or its player errors out, the backend reconnects with
+  a capped backoff for as long as it takes; if FFmpeg stops producing segments it is restarted
+  and the playlist continues where it left off; if a Nest session dies or goes silent it is
+  rebuilt and the encoder resynced. Stopping playback on the device itself, or casting another
+  app to it, is treated as deliberate and ends the session.
 - **Non-H.264 cameras are re-encoded** (roughly one CPU core per 1080p stream); H.264 sources
   are copied straight through.
 

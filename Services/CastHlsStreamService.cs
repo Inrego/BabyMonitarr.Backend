@@ -21,6 +21,8 @@ public sealed class CastHlsStream
 
     internal int RefCount;
     internal DateTime? IdleSinceUtc;
+    /// <summary>Set for Nest rooms: the RTP relay that feeds ffmpeg. Null for RTSP rooms.</summary>
+    internal CastNestRtpRelay? Relay;
     internal Process? Process;
     internal CancellationTokenSource? Cts;
     internal Task? Supervisor;
@@ -48,16 +50,21 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
 
     private readonly ILogger<CastHlsStreamService> _logger;
     private readonly IOptionsMonitor<CastOptions> _options;
+    private readonly NestStreamReaderManager _nestReaders;
     private readonly ConcurrentDictionary<string, CastHlsStream> _streams = new();
     private readonly ConcurrentDictionary<string, CastHlsStream> _streamsByToken = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
     private Timer? _reaper;
     private bool _disposed;
 
-    public CastHlsStreamService(ILogger<CastHlsStreamService> logger, IOptionsMonitor<CastOptions> options)
+    public CastHlsStreamService(
+        ILogger<CastHlsStreamService> logger,
+        IOptionsMonitor<CastOptions> options,
+        NestStreamReaderManager nestReaders)
     {
         _logger = logger;
         _options = options;
+        _nestReaders = nestReaders;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -194,8 +201,27 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
             DirectoryPath = dir
         };
 
+        string sourceUrl;
+        if (IsNestRoom(room))
+        {
+            try
+            {
+                stream.Relay = CastNestRtpRelay.Start(_nestReaders, room, video, dir, _logger);
+                stream.Relay.SourceRestarted = () => RestartEncoder(stream, "Nest session rebuilt");
+            }
+            catch
+            {
+                TryDeleteDirectory(dir);
+                throw;
+            }
+            sourceUrl = stream.Relay.SdpPath;
+        }
+        else
+        {
+            sourceUrl = BuildSourceUrl(room);
+        }
+
         stream.Cts = new CancellationTokenSource();
-        string sourceUrl = BuildSourceUrl(room);
         stream.Supervisor = Task.Run(() => SuperviseAsync(stream, room, sourceUrl, stream.Cts.Token));
         return stream;
     }
@@ -221,6 +247,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
 
                 stream.Process = process;
                 _ = DrainAsync(process.StandardError, stream, ct);
+                _ = WatchForStallAsync(stream, process, ct);
                 await process.WaitForExitAsync(ct);
 
                 if (ct.IsCancellationRequested)
@@ -232,6 +259,12 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
                     "Cast ffmpeg for room {RoomId} exited with code {ExitCode}; restarting",
                     stream.RoomId,
                     process.ExitCode);
+
+                // A run that produced segments was healthy; only back off on repeated early deaths.
+                if (File.Exists(Path.Combine(stream.DirectoryPath, "index.m3u8")))
+                {
+                    consecutiveFailures = 0;
+                }
             }
             catch (OperationCanceledException)
             {
@@ -256,6 +289,74 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
             {
                 return;
             }
+        }
+    }
+
+    /// <summary>
+    /// ffmpeg does not exit when its input goes quiet: the RTP relay just stops delivering and an
+    /// RTSP camera can hold the TCP session open while sending nothing. The playlist is the one
+    /// signal that covers both, so it is polled and a stale one gets the encoder restarted. The
+    /// first segment is allowed longer because probing and the first keyframe come before it.
+    /// </summary>
+    private async Task WatchForStallAsync(CastHlsStream stream, Process process, CancellationToken ct)
+    {
+        const int startupGraceSeconds = 60;
+        const int stallSeconds = 15;
+
+        string playlist = Path.Combine(stream.DirectoryPath, "index.m3u8");
+        DateTime lastProgress = DateTime.UtcNow;
+        DateTime lastWrite = DateTime.MinValue;
+        bool produced = false;
+
+        try
+        {
+            while (!ct.IsCancellationRequested && !process.HasExited)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+
+                DateTime write = File.Exists(playlist) ? File.GetLastWriteTimeUtc(playlist) : DateTime.MinValue;
+                if (write > lastWrite)
+                {
+                    lastWrite = write;
+                    lastProgress = DateTime.UtcNow;
+                    produced = true;
+                    continue;
+                }
+
+                int limit = produced ? stallSeconds : startupGraceSeconds;
+                if ((DateTime.UtcNow - lastProgress).TotalSeconds < limit) continue;
+
+                if (!process.HasExited)
+                {
+                    RestartEncoder(stream, produced ? $"no new segments for {limit}s" : $"no first segment within {limit}s");
+                }
+                return;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Stream stopping.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Cast stall watchdog ended for room {RoomId}", stream.RoomId);
+        }
+    }
+
+    /// <summary>Kills the current ffmpeg; the supervisor loop brings up a fresh one.</summary>
+    private void RestartEncoder(CastHlsStream stream, string reason)
+    {
+        var process = stream.Process;
+        if (process is not { HasExited: false }) return;
+
+        _logger.LogWarning("Restarting cast ffmpeg for room {RoomId}: {Reason}", stream.RoomId, reason);
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Could not kill cast ffmpeg for room {RoomId}", stream.RoomId);
         }
     }
 
@@ -305,8 +406,20 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         }
 
         Arg("-hide_banner", "-loglevel", "warning", "-nostdin");
-        Arg("-rtsp_transport", "tcp");
-        Arg("-fflags", "+genpts");
+        if (stream.Relay != null)
+        {
+            // Nest media arrives over the loopback RTP relay described by an SDP file. Packets
+            // come in order (WebRTC leg already reassembled), so the reorder queue only ever
+            // matters on a gap, where it waits at most max_delay before moving on.
+            Arg("-protocol_whitelist", "file,udp,rtp");
+            Arg("-fflags", "nobuffer+genpts", "-flags", "low_delay");
+            Arg("-reorder_queue_size", "16", "-max_delay", "100000");
+        }
+        else
+        {
+            Arg("-rtsp_transport", "tcp");
+            Arg("-fflags", "+genpts");
+        }
         Arg("-i", sourceUrl);
 
         if (stream.Video)
@@ -316,7 +429,12 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
             // Chromecast plays H.264 in MPEG-TS; anything else has to be re-encoded, which costs
             // roughly one CPU core per 1080p stream. Fine for the one or two rooms a household
             // casts at once - a camera farm would want hardware encoding instead.
+            // Nest always delivers H.264, so it is copied too; its segments then follow the
+            // camera's keyframe cadence rather than SegmentSeconds. Re-encoding would restore
+            // short segments at roughly a CPU core per stream - the upgrade path if that latency
+            // ever matters more than CPU.
             bool sourceIsH264 =
+                stream.Relay != null ||
                 string.Equals(room.VideoPassthroughCodec, "h264", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(room.VideoSourceCodecName, "h264", StringComparison.OrdinalIgnoreCase);
 
@@ -339,13 +457,19 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         Arg("-f", "hls");
         Arg("-hls_time", segmentSeconds.ToString());
         Arg("-hls_list_size", playlistSize.ToString());
-        Arg("-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file");
+        // append_list + discont_start let a restarted ffmpeg continue the existing playlist with
+        // a discontinuity marker instead of resetting the sequence to 0, which would make the
+        // receiver bail out of a stream it was happily playing.
+        Arg("-hls_flags", "delete_segments+omit_endlist+independent_segments+temp_file+append_list+discont_start");
         Arg("-hls_segment_type", "mpegts");
         Arg("-hls_segment_filename", Path.Combine(stream.DirectoryPath, "seg%05d.ts"));
         Arg(Path.Combine(stream.DirectoryPath, "index.m3u8"));
 
         return info;
     }
+
+    private static bool IsNestRoom(Room room) =>
+        string.Equals(room.StreamSourceType, "google_nest", StringComparison.OrdinalIgnoreCase);
 
     private static string BuildSourceUrl(Room room)
     {
@@ -373,7 +497,11 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
     private static async Task WaitForPlaylistAsync(CastHlsStream stream, CancellationToken cancellationToken)
     {
         string playlist = Path.Combine(stream.DirectoryPath, "index.m3u8");
-        var deadline = DateTime.UtcNow.AddSeconds(20);
+
+        // A Nest room may have to bring its WebRTC session up first (SDM API round trip, ICE,
+        // then the first keyframe), so it gets longer than a camera that is already streaming.
+        int timeoutSeconds = stream.Relay != null ? 45 : 20;
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
 
         while (DateTime.UtcNow < deadline)
         {
@@ -400,7 +528,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         }
 
         throw new TimeoutException(
-            $"Room {stream.RoomId} produced no HLS segments within 20s - check the camera stream.");
+            $"Room {stream.RoomId} produced no HLS segments within {timeoutSeconds}s - check the camera stream.");
     }
 
     private void ReapIdleStreams()
@@ -442,6 +570,8 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
         }
         finally
         {
+            stream.Relay?.Dispose();
+            stream.Relay = null;
             stream.Cts?.Dispose();
             stream.Cts = null;
             TryDeleteDirectory(stream.DirectoryPath);

@@ -36,15 +36,21 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     /// <summary>Google's Default Media Receiver — no registered app id needed for plain media.</summary>
     private const string DefaultMediaReceiverAppId = "CC1AD845";
 
+    /// <summary>The idle "Backdrop" app a receiver shows when nothing is cast.</summary>
+    private const string BackdropAppId = "E8C28D3C";
+
     private sealed class CastSession
     {
         public required string DeviceId { get; init; }
+        public required string DeviceName { get; init; }
         public required int RoomId { get; init; }
         public required bool Video { get; init; }
-        public required ChromecastClient Client { get; init; }
+        public required Media Media { get; init; }
         public required CastHlsStream Stream { get; init; }
+        public ChromecastClient Client { get; set; } = null!;
         public DateTime StartedAtUtc { get; init; } = DateTime.UtcNow;
         public volatile bool Stopping;
+        public int Recovering;
     }
 
     private readonly ILogger<CastSessionService> _logger;
@@ -125,15 +131,17 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             return result;
         }
 
-        // Nest rooms arrive as WebRTC inside the backend, so there is no URL for ffmpeg to pull.
-        // Casting them needs the in-process H264/Opus frames forwarded to ffmpeg over RTP — that
-        // is the upgrade path, not a tweak to this method.
-        if (!string.Equals(room.StreamSourceType, "rtsp", StringComparison.OrdinalIgnoreCase) ||
-            string.IsNullOrWhiteSpace(room.CameraStreamUrl))
+        // RTSP rooms are pulled by ffmpeg directly; Nest rooms are fed to it over the in-process
+        // RTP relay (CastNestRtpRelay). Either way the room needs a configured source.
+        bool isNest = string.Equals(room.StreamSourceType, "google_nest", StringComparison.OrdinalIgnoreCase);
+        bool hasSource = isNest
+            ? !string.IsNullOrWhiteSpace(room.NestDeviceId)
+            : !string.IsNullOrWhiteSpace(room.CameraStreamUrl);
+        if (!hasSource)
         {
             foreach (string deviceId in deviceIds)
             {
-                result.Failed[deviceId] = "Casting is only supported for RTSP rooms.";
+                result.Failed[deviceId] = $"Room '{room.Name}' has no camera source configured.";
             }
             return result;
         }
@@ -186,42 +194,36 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
 
         var stream = await _streams.AcquireAsync(room, video, cancellationToken);
 
-        ChromecastClient? client = null;
+        string mediaUrl = $"{baseUrl}{stream.PlaylistPath}";
+        var media = new Media
+        {
+            ContentId = mediaUrl,
+            ContentUrl = mediaUrl,
+            ContentType = stream.ContentType,
+            StreamType = StreamType.Live,
+            HlsSegmentFormat = HlsSegmentFormat.TS_AAC,
+            HlsVideoSegmentFormat = video ? HlsVideoSegmentFormat.MPEG2_TS : null,
+            Metadata = new MediaMetadata
+            {
+                MetadataType = MetadataType.Default,
+                Title = room.Name,
+                SubTitle = "BabyMonitarr"
+            }
+        };
+
+        var session = new CastSession
+        {
+            DeviceId = deviceId,
+            DeviceName = device.Name,
+            RoomId = room.Id,
+            Video = video,
+            Media = media,
+            Stream = stream
+        };
+
         try
         {
-            client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
-            await client.ConnectChromecast(_devices.ToReceiver(device));
-            await client.LaunchApplicationAsync(DefaultMediaReceiverAppId, false);
-
-            string mediaUrl = $"{baseUrl}{stream.PlaylistPath}";
-            var media = new Media
-            {
-                ContentId = mediaUrl,
-                ContentUrl = mediaUrl,
-                ContentType = stream.ContentType,
-                StreamType = StreamType.Live,
-                HlsSegmentFormat = HlsSegmentFormat.TS_AAC,
-                HlsVideoSegmentFormat = video ? HlsVideoSegmentFormat.MPEG2_TS : null,
-                Metadata = new MediaMetadata
-                {
-                    MetadataType = MetadataType.Default,
-                    Title = room.Name,
-                    SubTitle = "BabyMonitarr"
-                }
-            };
-
-            await client.GetChannel<Sharpcaster.Channels.MediaChannel>().LoadAsync(media);
-
-            var session = new CastSession
-            {
-                DeviceId = deviceId,
-                RoomId = room.Id,
-                Video = video,
-                Client = client,
-                Stream = stream
-            };
-
-            client.Disconnected += (_, _) => OnClientDisconnected(session);
+            session.Client = await ConnectAndLoadAsync(session, device);
             _sessions[deviceId] = session;
 
             _logger.LogInformation(
@@ -234,13 +236,38 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         }
         catch
         {
-            if (client != null)
-            {
-                try { await client.DisconnectAsync(); } catch { /* best effort */ }
-            }
             _streams.Release(stream);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Connects to the receiver, launches the media app and loads the room. Used for the first
+    /// start and for every recovery, so both paths behave the same.
+    /// </summary>
+    private async Task<ChromecastClient> ConnectAndLoadAsync(CastSession session, CastDevice device)
+    {
+        var client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
+        try
+        {
+            await client.ConnectChromecast(_devices.ToReceiver(device));
+            await client.LaunchApplicationAsync(DefaultMediaReceiverAppId, false);
+            await client.GetChannel<Sharpcaster.Channels.MediaChannel>().LoadAsync(session.Media);
+        }
+        catch
+        {
+            try { await client.DisconnectAsync(); } catch { /* best effort */ }
+            throw;
+        }
+
+        // Subscribed only after a successful load so the transient states of connecting and
+        // launching (Backdrop showing, player idle with no media) are not mistaken for trouble.
+        client.Disconnected += (_, _) => OnClientDisconnected(session, client);
+        client.GetChannel<Sharpcaster.Channels.MediaChannel>().StatusChanged +=
+            (_, status) => OnMediaStatus(session, client, status);
+        client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().ReceiverStatusChanged +=
+            (_, status) => OnReceiverStatus(session, client, status);
+        return client;
     }
 
     public async Task<bool> StopDeviceAsync(string deviceId)
@@ -311,23 +338,164 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         _lastErrors.TryGetValue(deviceId, out var error) ? error : null;
 
     /// <summary>
-    /// A receiver dropping the connection (power off, someone cast something else, Wi-Fi blip)
-    /// ends the session. We release the HLS stream rather than reconnect blindly: re-casting to a
-    /// TV that a parent deliberately switched off would be worse than stopping.
+    /// A cast session lives until someone deliberately ends it. Losing the receiver (Wi-Fi blip,
+    /// reboot, power cycle) or seeing playback die on it triggers recovery, which retries until
+    /// the receiver is back. Someone stopping playback on the device itself, or casting something
+    /// else to it, is a deliberate choice and ends the session instead of fighting them for it.
     /// </summary>
-    private void OnClientDisconnected(CastSession session)
+    private void OnClientDisconnected(CastSession session, ChromecastClient client)
+    {
+        if (!IsCurrent(session, client)) return;
+        BeginRecovery(session, "the cast device disconnected");
+    }
+
+    private void OnMediaStatus(CastSession session, ChromecastClient client, MediaStatus? status)
+    {
+        if (status == null || !IsCurrent(session, client)) return;
+        if (status.PlayerState != PlayerStateType.Idle) return;
+
+        switch (status.IdleReason?.ToUpperInvariant())
+        {
+            case "ERROR":
+            case "FINISHED":
+                BeginRecovery(session, $"playback stopped on the device ({status.IdleReason})");
+                break;
+            case "CANCELLED":
+            case "INTERRUPTED":
+                _ = EndSessionAsync(session, "Playback was stopped on the cast device.");
+                break;
+            // No reason: the player is idle between load and play. Leave it alone.
+        }
+    }
+
+    private void OnReceiverStatus(
+        CastSession session,
+        ChromecastClient client,
+        Sharpcaster.Models.ChromecastStatus.ChromecastStatus? status)
+    {
+        if (status == null || !IsCurrent(session, client)) return;
+
+        string? appId = status.Application?.AppId;
+        if (appId == null || string.Equals(appId, DefaultMediaReceiverAppId, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        string what = string.Equals(appId, BackdropAppId, StringComparison.OrdinalIgnoreCase)
+            ? "Casting was stopped on the device."
+            : $"Another app ({status.Application?.DisplayName ?? appId}) took over the cast device.";
+        _ = EndSessionAsync(session, what);
+    }
+
+    private bool IsCurrent(CastSession session, ChromecastClient client) =>
+        !session.Stopping &&
+        ReferenceEquals(session.Client, client) &&
+        _sessions.TryGetValue(session.DeviceId, out var tracked) &&
+        ReferenceEquals(tracked, session);
+
+    private void BeginRecovery(CastSession session, string reason)
     {
         if (session.Stopping) return;
-        if (!_sessions.TryRemove(session.DeviceId, out _)) return;
+        if (Interlocked.Exchange(ref session.Recovering, 1) == 1) return;
+        _ = RecoverAsync(session, reason);
+    }
 
+    /// <summary>
+    /// Rebuilds the receiver connection with a capped backoff for as long as the session exists.
+    /// There is no attempt limit on purpose: a monitor that silently gives up after a long outage
+    /// is worse than one that keeps knocking once a minute.
+    /// </summary>
+    private async Task RecoverAsync(CastSession session, string reason)
+    {
+        _logger.LogWarning(
+            "Cast to {DeviceName} for room {RoomId} needs recovery: {Reason}",
+            session.DeviceName,
+            session.RoomId,
+            reason);
+        _lastErrors[session.DeviceId] = $"Reconnecting: {reason}.";
+        await BroadcastStateAsync();
+
+        var previous = session.Client;
+        try { await previous.DisconnectAsync(); } catch { /* it is probably already gone */ }
+
+        int attempt = 0;
+        try
+        {
+            while (!session.Stopping)
+            {
+                attempt++;
+                int delaySeconds = (int)Math.Min(60, Math.Pow(2, attempt)); // 2, 4, 8, 16, 32, 60...
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+                if (session.Stopping) return;
+
+                var device = await _devices.FindAsync(session.DeviceId, CancellationToken.None);
+                if (device == null)
+                {
+                    await EndSessionAsync(session, "The cast device was removed.");
+                    return;
+                }
+
+                try
+                {
+                    var client = await ConnectAndLoadAsync(session, device);
+                    if (session.Stopping)
+                    {
+                        // Stopped while we were reconnecting; do not leave the receiver playing.
+                        try { await client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().StopApplication(); } catch { }
+                        try { await client.DisconnectAsync(); } catch { }
+                        return;
+                    }
+
+                    session.Client = client;
+                    _lastErrors.TryRemove(session.DeviceId, out _);
+                    _logger.LogInformation(
+                        "Cast to {DeviceName} for room {RoomId} recovered after {Attempts} attempt(s)",
+                        session.DeviceName,
+                        session.RoomId,
+                        attempt);
+                    await BroadcastStateAsync();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // First few attempts are worth a warning; after that once a minute at debug.
+                    if (attempt <= 3)
+                    {
+                        _logger.LogWarning(ex,
+                            "Cast recovery attempt {Attempt} for {DeviceName} failed; next in {Delay}s",
+                            attempt, session.DeviceName, Math.Min(60, (int)Math.Pow(2, attempt + 1)));
+                    }
+                    else
+                    {
+                        _logger.LogDebug(ex,
+                            "Cast recovery attempt {Attempt} for {DeviceName} failed",
+                            attempt, session.DeviceName);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref session.Recovering, 0);
+        }
+    }
+
+    private async Task EndSessionAsync(CastSession session, string message)
+    {
+        if (session.Stopping) return;
+        if (!_sessions.TryRemove(session.DeviceId, out var tracked) || !ReferenceEquals(tracked, session)) return;
+        session.Stopping = true;
+
+        try { await session.Client.DisconnectAsync(); } catch { /* best effort */ }
         _streams.Release(session.Stream);
-        _lastErrors[session.DeviceId] = "The cast device disconnected.";
+        _lastErrors[session.DeviceId] = message;
         _logger.LogInformation(
-            "Cast device {DeviceId} disconnected; room {RoomId} is no longer casting there",
-            session.DeviceId,
-            session.RoomId);
+            "Cast of room {RoomId} to {DeviceName} ended: {Message}",
+            session.RoomId,
+            session.DeviceName,
+            message);
 
-        _ = BroadcastStateAsync();
+        await BroadcastStateAsync();
     }
 
     private async Task BroadcastStateAsync()

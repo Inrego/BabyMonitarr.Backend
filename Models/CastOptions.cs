@@ -18,11 +18,18 @@ public sealed class CastOptions
     public int DiscoveryIntervalSeconds { get; set; } = 300;
     public int DiscoveryTimeoutSeconds { get; set; } = 5;
 
-    /// <summary>HLS segment length in seconds. Lower means less cast latency and more segment churn.</summary>
-    public int SegmentSeconds { get; set; } = 2;
+    /// <summary>
+    /// HLS segment length in seconds. Lower means less cast latency and more segment churn.
+    /// Copied H.264 sources can only split on keyframes, so their real segment length is the
+    /// camera's keyframe interval when that is longer.
+    /// </summary>
+    public int SegmentSeconds { get; set; } = 1;
 
-    /// <summary>Segments kept in the playlist window.</summary>
-    public int PlaylistSize { get; set; } = 6;
+    /// <summary>
+    /// Segments kept in the playlist window. Receivers start a few segments behind the live
+    /// edge, so a smaller window is a shorter delay; below 4 the default receiver stalls.
+    /// </summary>
+    public int PlaylistSize { get; set; } = 4;
 
     /// <summary>Seconds an HLS stream stays alive after its last cast session ends.</summary>
     public int StreamLingerSeconds { get; set; } = 15;

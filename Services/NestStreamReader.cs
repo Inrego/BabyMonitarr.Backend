@@ -24,17 +24,34 @@ public class NestStreamReader : IDisposable
     private string? _mediaSessionId;
     private Timer? _extensionTimer;
 
-    private const int MaxRetryAttempts = 3;
+    /// <summary>
+    /// Payload types offered to Nest. The answer must echo them (RFC 3264), so anything that
+    /// re-describes this stream - the cast RTP relay's SDP - can rely on the same numbers.
+    /// </summary>
+    public const int OpusPayloadType = 111;
+    public const int H264PayloadType = 96;
+
+    // Reconnect forever with a capped backoff: a baby monitor must not go quiet because Google
+    // had a bad quarter of an hour. The backoff resets once a connection has proven stable.
     private const int InitialRetryDelayMs = 5000;
+    private const int MaxRetryDelayMs = 60_000;
     private const int StreamExtensionIntervalMs = 4 * 60 * 1000; // 4 minutes
-    private const int MinStableConnectionMs = 60_000; // 1 minute - connection must last this long to reset retry count
+    private const int MinStableConnectionMs = 60_000; // 1 minute - connection must last this long to reset backoff
     private const int MaxConsecutiveExtendFailures = 3;
+
+    // Media watchdog: a "connected" peer that has stopped delivering RTP is a dead stream.
+    private const int MediaWatchdogIntervalMs = 5000;
+    private const int NoMediaTimeoutMs = 15_000;
+    private const int FirstMediaTimeoutMs = 30_000;
 
     // Extension failure tracking
     private int _consecutiveExtendFailures;
 
     // Connection timing
     private long _connectionStartTicks;
+    private long _lastRtpTicks;
+    private Timer? _mediaWatchdog;
+    private TaskCompletionSource? _connectionEnded;
 
     // H264 depacketization state
     private readonly List<byte[]> _h264NalBuffer = new();
@@ -53,6 +70,12 @@ public class NestStreamReader : IDisposable
 
     public event EventHandler<AudioFormatEventArgs>? AudioDataReceived;
     public event EventHandler<VideoFrameEventArgs>? VideoFrameReceived;
+
+    /// <summary>
+    /// Every decrypted RTP packet as it arrives, before depacketization. Lets a consumer relay
+    /// the media somewhere else (the cast HLS encoder) without re-packetizing it.
+    /// </summary>
+    public event Action<SDPMediaTypesEnum, RTPPacket>? RtpPacketReceived;
 
     public int RoomId => _roomId;
 
@@ -88,15 +111,15 @@ public class NestStreamReader : IDisposable
     {
         int retryCount = 0;
 
-        while (retryCount < MaxRetryAttempts && !cancellationToken.IsCancellationRequested)
+        while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
                 if (retryCount > 0)
                 {
-                    int delayMs = InitialRetryDelayMs * (int)Math.Pow(3, retryCount - 1); // 5s, 15s, 45s
-                    _logger.LogInformation("Retrying Nest WebRTC connection for room {RoomId} in {DelayMs}ms (attempt {Attempt} of {Max})",
-                        _roomId, delayMs, retryCount + 1, MaxRetryAttempts);
+                    int delayMs = RetryDelayMs(retryCount);
+                    _logger.LogInformation("Retrying Nest WebRTC connection for room {RoomId} in {DelayMs}ms (attempt {Attempt})",
+                        _roomId, delayMs, retryCount + 1);
                     await Task.Delay(delayMs, cancellationToken);
                 }
 
@@ -119,7 +142,10 @@ public class NestStreamReader : IDisposable
                 if (!cancellationToken.IsCancellationRequested)
                 {
                     _logger.LogInformation("Nest WebRTC stream ended for room {RoomId}, will reconnect", _roomId);
-                    await Task.Delay(InitialRetryDelayMs, cancellationToken);
+                    if (retryCount == 0)
+                    {
+                        await Task.Delay(InitialRetryDelayMs, cancellationToken);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -129,30 +155,24 @@ public class NestStreamReader : IDisposable
             catch (RateLimitException ex)
             {
                 retryCount++;
-                var delayMs = ex.RetryAfterSeconds * 1000;
-                _logger.LogWarning("Rate limited connecting Nest stream for room {RoomId}, waiting {Seconds}s (attempt {Attempt} of {Max})",
-                    _roomId, ex.RetryAfterSeconds, retryCount, MaxRetryAttempts);
-
-                if (retryCount >= MaxRetryAttempts)
-                {
-                    _logger.LogError("Max retry attempts reached for Nest stream room {RoomId} (rate limited)", _roomId);
-                    break;
-                }
-
-                await Task.Delay(delayMs, cancellationToken);
+                _logger.LogWarning("Rate limited connecting Nest stream for room {RoomId}, waiting {Seconds}s (attempt {Attempt})",
+                    _roomId, ex.RetryAfterSeconds, retryCount);
+                await Task.Delay(ex.RetryAfterSeconds * 1000, cancellationToken);
             }
             catch (Exception ex)
             {
                 retryCount++;
-                _logger.LogError(ex, "Error in Nest WebRTC stream for room {RoomId} (attempt {Attempt} of {Max})",
-                    _roomId, retryCount, MaxRetryAttempts);
-
-                if (retryCount >= MaxRetryAttempts)
-                {
-                    _logger.LogError("Max retry attempts reached for Nest stream room {RoomId}", _roomId);
-                }
+                _logger.LogError(ex, "Error in Nest WebRTC stream for room {RoomId} (attempt {Attempt}); will keep retrying",
+                    _roomId, retryCount);
             }
         }
+    }
+
+    /// <summary>5s, 15s, 45s, then capped at 60s for as long as it takes.</summary>
+    private static int RetryDelayMs(int retryCount)
+    {
+        double delay = InitialRetryDelayMs * Math.Pow(3, Math.Min(retryCount - 1, 3));
+        return (int)Math.Min(delay, MaxRetryDelayMs);
     }
 
     private async Task ConnectWebRtc(CancellationToken cancellationToken)
@@ -174,7 +194,7 @@ public class NestStreamReader : IDisposable
         // Add receive-only audio transceiver (Opus)
         var audioFormats = new List<AudioFormat>
         {
-            new AudioFormat(AudioCodecsEnum.OPUS, 111, 48000, 2, "minptime=10;useinbandfec=1")
+            new AudioFormat(AudioCodecsEnum.OPUS, OpusPayloadType, 48000, 2, "minptime=10;useinbandfec=1")
         };
         var audioTrack = new MediaStreamTrack(audioFormats, MediaStreamStatusEnum.RecvOnly);
         _peerConnection.addTrack(audioTrack);
@@ -182,7 +202,7 @@ public class NestStreamReader : IDisposable
         // Add receive-only video transceiver (H264)
         var videoFormats = new List<VideoFormat>
         {
-            new VideoFormat(VideoCodecsEnum.H264, 96, 90000, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
+            new VideoFormat(VideoCodecsEnum.H264, H264PayloadType, 90000, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f")
         };
         var videoTrack = new MediaStreamTrack(videoFormats, MediaStreamStatusEnum.RecvOnly);
         _peerConnection.addTrack(videoTrack);
@@ -329,9 +349,10 @@ public class NestStreamReader : IDisposable
             StreamExtensionIntervalMs,
             StreamExtensionIntervalMs);
 
-        // Wait until cancelled or connection drops
-        var tcs = new TaskCompletionSource();
-        cancellationToken.Register(() => tcs.TrySetResult());
+        // Wait until cancelled, the connection drops, or media stops flowing
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _connectionEnded = tcs;
+        using var cancellation = cancellationToken.Register(() => tcs.TrySetResult());
 
         _peerConnection.onconnectionstatechange += (state) =>
         {
@@ -343,10 +364,39 @@ public class NestStreamReader : IDisposable
             }
         };
 
+        Volatile.Write(ref _lastRtpTicks, 0);
+        _mediaWatchdog = new Timer(_ => CheckMediaFlowing(), null, MediaWatchdogIntervalMs, MediaWatchdogIntervalMs);
+
         await tcs.Task;
 
         // Cleanup
+        _connectionEnded = null;
         await StopStream();
+    }
+
+    /// <summary>
+    /// Google can leave the ICE/DTLS session up while the camera stops sending (session expiry,
+    /// camera-side hiccup). Nothing else notices that, so a silence longer than the timeout ends
+    /// the connection and the retry loop rebuilds it.
+    /// </summary>
+    private void CheckMediaFlowing()
+    {
+        var ended = _connectionEnded;
+        if (ended == null || ended.Task.IsCompleted) return;
+
+        long lastRtp = Volatile.Read(ref _lastRtpTicks);
+        long now = Environment.TickCount64;
+        bool stalled = lastRtp == 0
+            ? now - _connectionStartTicks > FirstMediaTimeoutMs
+            : now - lastRtp > NoMediaTimeoutMs;
+
+        if (!stalled) return;
+
+        _logger.LogWarning(
+            "No media from Nest for room {RoomId} for {Seconds}s; reconnecting",
+            _roomId,
+            (now - (lastRtp == 0 ? _connectionStartTicks : lastRtp)) / 1000);
+        ended.TrySetResult();
     }
 
     private async Task ExtendStream()
@@ -397,6 +447,8 @@ public class NestStreamReader : IDisposable
 
     private async Task StopStream()
     {
+        _mediaWatchdog?.Dispose();
+        _mediaWatchdog = null;
         _extensionTimer?.Dispose();
         _extensionTimer = null;
 
@@ -574,6 +626,9 @@ public class NestStreamReader : IDisposable
     {
         try
         {
+            Volatile.Write(ref _lastRtpTicks, Environment.TickCount64);
+            RtpPacketReceived?.Invoke(mediaType, rtpPacket);
+
             if (mediaType == SDPMediaTypesEnum.audio)
             {
                 var count = Interlocked.Increment(ref _rtpAudioPacketCount);
@@ -801,6 +856,7 @@ public class NestStreamReader : IDisposable
             {
                 Stop();
                 _extensionTimer?.Dispose();
+                _mediaWatchdog?.Dispose();
             }
             _isDisposed = true;
         }

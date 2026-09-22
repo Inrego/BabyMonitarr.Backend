@@ -35,7 +35,7 @@ BabyMonitarr turns your existing cameras into a low-latency, privacy-first baby 
 - **Low-Latency Audio & Video** — WebRTC streaming with Opus audio and video codec passthrough (H264, H265, VP8)
 - **Sound Detection & Alerts** — Configurable audio threshold alerts with cooldown
 - **RTSP & Google Nest Support** — Works with any RTSP camera or Google Nest device via the Smart Device Management API
-- **Google Cast** — Cast any RTSP room to one or more Chromecast displays and Google/Nest speakers at once
+- **Google Cast** — Cast any room, RTSP or Google Nest, to one or more Chromecast displays and Google/Nest speakers at once
 - **Docker Ready** — One container, one volume, up and running in under a minute
 - **Privacy First** — Fully self-hosted with a local SQLite database
 
