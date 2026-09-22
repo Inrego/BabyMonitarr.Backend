@@ -590,6 +590,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
             var levels = new List<HaLevelSample>();
             var onlineChanges = new List<HaStreamOnlineData>();
             var cleared = new List<HaSoundStateData>();
+            var retired = new List<int>();
             var offlineTimeout = TimeSpan.FromSeconds(Math.Max(1, _options.StreamOnlineTimeoutSeconds));
             var clearHold = TimeSpan.FromSeconds(Math.Max(1, _options.SoundClearHoldSeconds));
 
@@ -635,6 +636,7 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
                 if (retire)
                 {
                     _monitors.TryRemove(entry);
+                    retired.Add(monitor.RoomId);
                 }
             }
 
@@ -653,6 +655,14 @@ public class HaMonitoringService : IHaMonitoringService, IHostedService, IDispos
             foreach (var clear in cleared)
             {
                 Broadcast(HaFrames.Build(HaProtocol.SoundState, clear));
+            }
+
+            // Retiring a room stops it appearing in sound_level, which on its own would leave the
+            // last level showing forever. The monitor is already gone, so this reports the room's
+            // resting state: not monitored, not online, no level.
+            foreach (var roomId in retired)
+            {
+                Broadcast(HaFrames.Build(HaProtocol.RoomState, BuildRoomState(roomId)));
             }
         }
         catch (Exception ex)

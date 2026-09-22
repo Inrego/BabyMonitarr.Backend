@@ -146,8 +146,9 @@ app. HA WebSocket clients are **not** counted.
 
 ### `room_state`
 The full per-room state, one frame per room. Sent in the snapshot, and again for a single room
-after `set_monitoring`. Incremental changes afterwards arrive as `sound_level`, `sound_state`,
-`stream_online` and `monitoring`.
+after `set_monitoring`, for each room the startup restore re-establishes (§6), and when a room the
+backend was only observing is dropped (§6) — that last one resets `level_db` to null. Incremental
+changes afterwards arrive as `sound_level`, `sound_state`, `stream_online` and `monitoring`.
 
 ```jsonc
 "data": {
@@ -651,8 +652,11 @@ Consequences worth knowing:
   **not** monitored, whenever somebody else is streaming it. Monitoring only guarantees that
   detection runs — and therefore that the room reports — when nobody is streaming.
 - When the last viewer of an unmonitored room leaves, the reader stops: within
-  `StreamOnlineTimeoutSeconds` the room emits `stream_online: false`, stops appearing in
-  `sound_level`, and `room_state` reports it with `level_db: null` again.
+  `StreamOnlineTimeoutSeconds` the room emits `stream_online: false` and stops appearing in
+  `sound_level`. On the tick that drops the room the backend also pushes a `room_state` for it
+  with `monitoring: false`, `sound_detected: false`, `stream_online: false` and `level_db: null`,
+  so the level does not stick at its last value. Nothing is dropped, and no such `room_state` is
+  sent, while the room is monitored, still streaming, or still holding a sound state.
 
 ---
 
