@@ -282,6 +282,12 @@ Sent only to the connection that owns the peer, never broadcast.
 server's registry, so the racing causes below (a client stop that arrives just as ICE fails, say)
 still produce one frame, carrying whichever cause won the race.
 
+The frame is bound to one peer *object*, not to the `(room, kind)` slot. A teardown drives that
+peer to the `closed` state, but the resulting `Peer connection closed` teardown applies only to
+that same peer, so it neither duplicates the frame nor reaches the peer that replaced it: a
+`webrtc.offer` that supersedes an existing peer gets exactly one `Replaced by a new offer for the
+same room` frame for the old peer, and the new peer is left alone.
+
 `reason` is human-readable and **free-form: do not switch on it.** Treat any `webrtc.closed` as
 "this peer is gone; re-offer if you still want the stream." The strings the backend currently
 sends, for logs and diagnostics:

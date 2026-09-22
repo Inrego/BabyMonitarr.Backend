@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using BabyMonitarr.Backend.Ha;
 using BabyMonitarr.Backend.Hubs;
 using Microsoft.AspNetCore.SignalR;
@@ -156,14 +157,16 @@ namespace BabyMonitarr.Backend.Services
 
                 // Both terminal states are handled: a peer that fails ICE and a peer the remote
                 // end closed are equally gone, and a Home Assistant camera must be told either way.
+                // The close is scoped to this exact peer object, never to whatever occupies the key
+                // when the queued task runs: a supersede re-registers a new peer under the same key.
                 if (state == RTCPeerConnectionState.failed)
                 {
                     _logger.LogWarning("Video peer connection failed for {Key}, closing...", key);
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerFailed));
+                    Task.Run(() => CloseConnection(key, roomId, HaWebRtcCloseReasons.PeerFailed, pc));
                 }
                 else if (state == RTCPeerConnectionState.closed)
                 {
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerClosed));
+                    Task.Run(() => CloseConnection(key, roomId, HaWebRtcCloseReasons.PeerClosed, pc));
                 }
             };
 
@@ -316,14 +319,16 @@ namespace BabyMonitarr.Backend.Services
 
                 // Both terminal states are handled: a peer that fails ICE and a peer the remote
                 // end closed are equally gone, and a Home Assistant camera must be told either way.
+                // The close is scoped to this exact peer object, never to whatever occupies the key
+                // when the queued task runs: a supersede re-registers a new peer under the same key.
                 if (state == RTCPeerConnectionState.failed)
                 {
                     _logger.LogWarning("Video peer connection failed for {Key}, closing...", key);
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerFailed));
+                    Task.Run(() => CloseConnection(key, roomId, HaWebRtcCloseReasons.PeerFailed, pc));
                 }
                 else if (state == RTCPeerConnectionState.closed)
                 {
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerClosed));
+                    Task.Run(() => CloseConnection(key, roomId, HaWebRtcCloseReasons.PeerClosed, pc));
                 }
             };
 
@@ -575,8 +580,22 @@ namespace BabyMonitarr.Backend.Services
             }
         }
 
-        private void CloseConnection(string key, int roomId, string? reason = null)
+        /// <param name="expectedPc">
+        /// When given, the close applies only to that exact peer object: if the key no longer holds
+        /// it, nothing is torn down and nothing is reported. Connection-state callbacks pass it,
+        /// because their close is queued and the key may already belong to a superseding peer by
+        /// the time it runs. Callers that mean "whatever is on this key" pass null.
+        /// </param>
+        private void CloseConnection(string key, int roomId, string? reason = null, RTCPeerConnection? expectedPc = null)
         {
+            if (expectedPc != null &&
+                (!_peerConnections.TryGetValue(key, out var registered) || !ReferenceEquals(registered, expectedPc)))
+            {
+                // Already removed by whoever closed it, or replaced by a newer peer. Either way this
+                // peer's teardown is not ours to do, and the newer peer must not be touched.
+                return;
+            }
+
             _logger.LogInformation("Closing video peer connection {Key}", key);
 
             if (_frameHandlers.TryRemove(key, out var handler))
@@ -591,7 +610,9 @@ namespace BabyMonitarr.Backend.Services
             // Removing the peer is the exactly-once gate for the closed notification: pc.Close()
             // below re-enters here through onconnectionstatechange, and so does a client stop that
             // races the failure handler. Only the caller that actually removed it reports.
-            if (_peerConnections.TryRemove(key, out var pc))
+            // With expectedPc the removal is a compare-and-remove, so a supersede that slipped in
+            // after the identity check above still keeps its peer.
+            if (TryRemovePeer(key, expectedPc, out var pc))
             {
                 _haPeerRouter.TrySendClosed(
                     PeerIdFromKey(key, roomId),
@@ -610,6 +631,25 @@ namespace BabyMonitarr.Backend.Services
             }
 
             _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+        }
+
+        /// <summary>
+        /// Removes the peer registered under <paramref name="key"/>. With <paramref name="expectedPc"/>
+        /// the removal is atomic and conditional on that exact instance still being the registered one.
+        /// </summary>
+        private bool TryRemovePeer(
+            string key,
+            RTCPeerConnection? expectedPc,
+            [NotNullWhen(true)] out RTCPeerConnection? pc)
+        {
+            if (expectedPc == null)
+            {
+                return _peerConnections.TryRemove(key, out pc);
+            }
+
+            pc = expectedPc;
+            return ((ICollection<KeyValuePair<string, RTCPeerConnection>>)_peerConnections)
+                .Remove(new KeyValuePair<string, RTCPeerConnection>(key, expectedPc));
         }
 
         /// <summary>
