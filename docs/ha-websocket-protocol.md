@@ -271,11 +271,37 @@ once rewritten to the configured advertised address (the `WebRtc:AdvertisedAddre
 host inferred from the handshake). Both are real candidates; add both and let ICE pick.
 
 ### `webrtc.closed`
-The server tore a peer connection down.
+The server tore a peer connection down — for **any** reason, not only a client's `webrtc.stop`.
+Sent only to the connection that owns the peer, never broadcast.
 
 ```jsonc
 "data": { "room_id": 1, "kind": "video", "reason": "Closed by client" }
 ```
+
+**Exactly one `webrtc.closed` arrives per peer.** The frame rides on the peer's removal from the
+server's registry, so the racing causes below (a client stop that arrives just as ICE fails, say)
+still produce one frame, carrying whichever cause won the race.
+
+`reason` is human-readable and **free-form: do not switch on it.** Treat any `webrtc.closed` as
+"this peer is gone; re-offer if you still want the stream." The strings the backend currently
+sends, for logs and diagnostics:
+
+| `reason` | Cause |
+| --- | --- |
+| `Closed by client` | The client sent `webrtc.stop` for this peer. |
+| `Peer connection failed` | The peer connection reached the `failed` state (ICE failure, for example). |
+| `Peer connection closed` | The peer connection reached the `closed` state — the remote end went away. |
+| `Replaced by a new offer for the same room` | A second `webrtc.offer` arrived for the same room and kind; the old peer was dropped for the new one. |
+| `Codec negotiation failed` | The negotiated codec did not match the room's source codec. |
+| `Source codec changed` | The source started producing a different codec mid-stream, which the answered SDP cannot carry. |
+| `Peer setup failed` | The peer was torn down while being set up (SDP generation or track setup failed). |
+| `Closed by server` | Any other server-side teardown. |
+
+Two cases send **no** `webrtc.closed`:
+
+- A `webrtc.stop` for a peer that does not exist (or has already been closed). The `ack` still
+  arrives and the stop is still a success — there was simply nothing left to close.
+- Peers killed by the socket dropping. See §6.
 
 ### `cast.devices`
 Every Cast receiver the backend knows, from all three discovery origins. Sent in the snapshot,
@@ -460,8 +486,9 @@ no need to wait for `webrtc.answer` before sending them.
 ```jsonc
 { "type": "webrtc.stop", "id": "31", "data": { "room_id": 1, "kind": "video" } }
 ```
-Closes the peer. Answered with `webrtc.closed` and an `ack`. Stopping a peer that does not exist is
-a success.
+Closes the peer. Answered with `webrtc.closed` (emitted by the teardown itself, before the `ack`)
+and an `ack`. Stopping a peer that does not exist is a success, but sends only the `ack` — there is
+no peer to report closed.
 
 ### `cast.discovered`
 The mDNS proxy push. Home Assistant runs the `_googlecast._tcp.local.` browser (it has host
@@ -564,6 +591,10 @@ Reconnect contract:
   owns is closed server-side, mirroring what the SignalR hub does on disconnect. A reconnecting
   client must re-offer; there is no session to resume and no `webrtc.closed` will arrive for peers
   killed this way, because the socket carrying it is already gone.
+- **A peer that dies on its own is reported.** ICE failure, the remote end closing, a codec drift
+  mid-stream — each sends `webrtc.closed` to the owning connection with a reason naming the cause.
+  A camera therefore never silently stops: the client's close handler runs on every path except the
+  one above, where the socket itself is gone.
 - **Cast devices and saved targets are persisted**; live cast sessions are not and do not survive a
   backend restart. Proxy-discovered devices keep their last known host, so HA should re-push
   `cast.discovered` on every reconnect.

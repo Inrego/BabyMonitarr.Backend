@@ -200,6 +200,23 @@ public sealed record HaWebRtcCandidateData(
     [property: JsonPropertyName("sdp_mid")] string SdpMid,
     [property: JsonPropertyName("sdp_m_line_index")] int SdpMLineIndex);
 
+/// <summary>
+/// The reasons a <c>webrtc.closed</c> can carry. Free-form on the wire — a client must not switch
+/// on them — but stable enough to tell a deliberate stop from a peer that died on its own, which
+/// is the whole point of sending the frame for every teardown rather than only for a client stop.
+/// </summary>
+public static class HaWebRtcCloseReasons
+{
+    public const string ClosedByClient = "Closed by client";
+    public const string PeerFailed = "Peer connection failed";
+    public const string PeerClosed = "Peer connection closed";
+    public const string Superseded = "Replaced by a new offer for the same room";
+    public const string CodecMismatch = "Codec negotiation failed";
+    public const string SourceCodecChanged = "Source codec changed";
+    public const string SetupFailed = "Peer setup failed";
+    public const string ClosedByServer = "Closed by server";
+}
+
 public sealed record HaWebRtcClosedData(
     [property: JsonPropertyName("room_id")] int RoomId,
     [property: JsonPropertyName("kind")] string Kind,

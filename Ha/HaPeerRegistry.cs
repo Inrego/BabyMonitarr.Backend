@@ -18,6 +18,14 @@ public interface IHaPeerRouter
     /// </summary>
     bool TrySendIceCandidate(
         string peerId, string kind, int roomId, string candidate, string sdpMid, int sdpMLineIndex);
+
+    /// <summary>
+    /// Tells a Home Assistant connection that one of its peers is gone, whatever tore it down —
+    /// a client stop, an ICE failure, the connection state going closed, or a server-side abort.
+    /// Returns false when <paramref name="peerId"/> is not a live Home Assistant connection, which
+    /// is also the case while its socket is being torn down: a dying client is told nothing.
+    /// </summary>
+    bool TrySendClosed(string peerId, string kind, int roomId, string reason);
 }
 
 public sealed class HaPeerRegistry : IHaPeerRouter
@@ -36,6 +44,16 @@ public sealed class HaPeerRegistry : IHaPeerRouter
         connection.TryEnqueue(HaFrames.Build(
             HaProtocol.WebRtcCandidate,
             new HaWebRtcCandidateData(roomId, kind, candidate, sdpMid, sdpMLineIndex)));
+        return true;
+    }
+
+    public bool TrySendClosed(string peerId, string kind, int roomId, string reason)
+    {
+        if (!_connections.TryGetValue(peerId, out var connection)) return false;
+
+        connection.TryEnqueue(HaFrames.Build(
+            HaProtocol.WebRtcClosed,
+            new HaWebRtcClosedData(roomId, kind, reason)));
         return true;
     }
 }

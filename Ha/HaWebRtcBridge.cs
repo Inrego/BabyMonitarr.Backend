@@ -151,23 +151,23 @@ public class HaWebRtcBridge : IHaWebRtcBridge
         }
 
         string kind = ResolveKind(data);
+
+        // The closed frame is not built here. Every teardown — a failed peer, a peer the remote
+        // closed, a codec drift mid-stream — has to report itself, so the WebRTC services own the
+        // notification and emit exactly one per peer. A stop for a peer that is already gone
+        // therefore acks without a closed frame; there was nothing left to close.
         if (kind == HaProtocol.KindAudio)
         {
-            await _audioWebRtcService.CloseAudioPeerConnection(connection.Id, roomId.Value);
+            await _audioWebRtcService.CloseAudioPeerConnection(
+                connection.Id, roomId.Value, HaWebRtcCloseReasons.ClosedByClient);
         }
         else
         {
-            await _videoWebRtcService.CloseVideoPeerConnection(connection.Id, roomId.Value);
+            await _videoWebRtcService.CloseVideoPeerConnection(
+                connection.Id, roomId.Value, HaWebRtcCloseReasons.ClosedByClient);
         }
 
-        return new HaCommandResult(
-            new[]
-            {
-                HaFrames.Build(HaProtocol.WebRtcClosed,
-                    new HaWebRtcClosedData(roomId.Value, kind, "Closed by client")),
-                HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdWebRtcStop), reference)
-            },
-            Array.Empty<string>());
+        return Reply(HaFrames.Build(HaProtocol.Ack, new HaAckData(HaProtocol.CmdWebRtcStop), reference));
     }
 
     public async Task CloseAllAsync(HaConnection connection)

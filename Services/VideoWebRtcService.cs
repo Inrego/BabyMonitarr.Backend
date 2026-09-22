@@ -21,8 +21,14 @@ namespace BabyMonitarr.Backend.Services
         Task<string> CreateVideoAnswer(string peerId, int roomId, string offerSdp, string? hostHint);
         Task SetVideoRemoteDescription(string peerId, int roomId, RTCSessionDescriptionInit desc);
         Task AddVideoIceCandidate(string peerId, int roomId, RTCIceCandidateInit candidate);
-        Task CloseVideoPeerConnection(string peerId, int roomId);
-        Task CloseAllVideoPeerConnections(string peerId);
+        /// <summary>
+        /// Tears the peer down and, for a Home Assistant peer, reports it with
+        /// <paramref name="reason"/>. Exactly one <c>webrtc.closed</c> is sent per peer: the frame
+        /// rides on the removal of the connection from the registry, so a second close — the
+        /// re-entrant one <c>pc.Close()</c> itself triggers, say — sends nothing.
+        /// </summary>
+        Task CloseVideoPeerConnection(string peerId, int roomId, string? reason = null);
+        Task CloseAllVideoPeerConnections(string peerId, string? reason = null);
     }
 
     public class VideoWebRtcService : IVideoWebRtcService, IDisposable
@@ -71,7 +77,7 @@ namespace BabyMonitarr.Backend.Services
             if (_peerConnections.ContainsKey(key))
             {
                 _logger.LogWarning("Video peer connection already exists for {Key}, closing existing", key);
-                await CloseVideoPeerConnection(peerId, roomId);
+                await CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.Superseded);
             }
 
             _logger.LogInformation(
@@ -148,10 +154,16 @@ namespace BabyMonitarr.Backend.Services
                     peerId,
                     roomId);
 
+                // Both terminal states are handled: a peer that fails ICE and a peer the remote
+                // end closed are equally gone, and a Home Assistant camera must be told either way.
                 if (state == RTCPeerConnectionState.failed)
                 {
                     _logger.LogWarning("Video peer connection failed for {Key}, closing...", key);
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId));
+                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerFailed));
+                }
+                else if (state == RTCPeerConnectionState.closed)
+                {
+                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerClosed));
                 }
             };
 
@@ -191,7 +203,7 @@ namespace BabyMonitarr.Backend.Services
                 if (string.IsNullOrEmpty(sdp))
                 {
                     _logger.LogError("Failed to create video SDP offer for {Key}", key);
-                    await CloseVideoPeerConnection(peerId, roomId);
+                    await CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.SetupFailed);
                     _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
                     return string.Empty;
                 }
@@ -208,7 +220,7 @@ namespace BabyMonitarr.Backend.Services
             }
             catch
             {
-                await CloseVideoPeerConnection(peerId, roomId);
+                await CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.SetupFailed);
                 _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
                 throw;
             }
@@ -226,7 +238,7 @@ namespace BabyMonitarr.Backend.Services
             if (_peerConnections.ContainsKey(key))
             {
                 _logger.LogWarning("Video peer connection already exists for {Key}, closing existing", key);
-                await CloseVideoPeerConnection(peerId, roomId);
+                await CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.Superseded);
             }
 
             _logger.LogInformation(
@@ -302,10 +314,16 @@ namespace BabyMonitarr.Backend.Services
                     "Video connection state changed to {State} for peer {PeerId}, room {RoomId}",
                     state, peerId, roomId);
 
+                // Both terminal states are handled: a peer that fails ICE and a peer the remote
+                // end closed are equally gone, and a Home Assistant camera must be told either way.
                 if (state == RTCPeerConnectionState.failed)
                 {
                     _logger.LogWarning("Video peer connection failed for {Key}, closing...", key);
-                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId));
+                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerFailed));
+                }
+                else if (state == RTCPeerConnectionState.closed)
+                {
+                    Task.Run(() => CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.PeerClosed));
                 }
             };
 
@@ -374,7 +392,7 @@ namespace BabyMonitarr.Backend.Services
             }
             catch
             {
-                await CloseVideoPeerConnection(peerId, roomId);
+                await CloseVideoPeerConnection(peerId, roomId, HaWebRtcCloseReasons.SetupFailed);
                 _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
                 throw;
             }
@@ -501,21 +519,21 @@ namespace BabyMonitarr.Backend.Services
             return Task.CompletedTask;
         }
 
-        public Task CloseVideoPeerConnection(string peerId, int roomId)
+        public Task CloseVideoPeerConnection(string peerId, int roomId, string? reason = null)
         {
             string key = GetConnectionKey(peerId, roomId);
-            CloseConnection(key, roomId);
+            CloseConnection(key, roomId, reason);
             return Task.CompletedTask;
         }
 
-        public Task CloseAllVideoPeerConnections(string peerId)
+        public Task CloseAllVideoPeerConnections(string peerId, string? reason = null)
         {
             string prefix = $"{peerId}_v_";
             foreach (var key in _peerConnections.Keys.Where(k => k.StartsWith(prefix)).ToList())
             {
                 if (int.TryParse(key.Substring(prefix.Length), out int roomId))
                 {
-                    CloseConnection(key, roomId);
+                    CloseConnection(key, roomId, reason);
                 }
             }
             return Task.CompletedTask;
@@ -535,7 +553,7 @@ namespace BabyMonitarr.Backend.Services
                     $"Source codec '{expectedCodec}' is not supported by the WebRTC client.";
 
                 _logger.LogWarning("No negotiated video codec for {Key}. {Message}", key, message);
-                CloseConnection(key, roomId);
+                CloseConnection(key, roomId, HaWebRtcCloseReasons.CodecMismatch);
                 throw new HubException(message);
             }
 
@@ -552,12 +570,12 @@ namespace BabyMonitarr.Backend.Services
                     expectedNegotiatedCodec,
                     negotiatedCodec);
 
-                CloseConnection(key, roomId);
+                CloseConnection(key, roomId, HaWebRtcCloseReasons.CodecMismatch);
                 throw new HubException(message);
             }
         }
 
-        private void CloseConnection(string key, int roomId)
+        private void CloseConnection(string key, int roomId, string? reason = null)
         {
             _logger.LogInformation("Closing video peer connection {Key}", key);
 
@@ -570,8 +588,17 @@ namespace BabyMonitarr.Backend.Services
             _expectedCodecs.TryRemove(key, out _);
             _negotiatedCodecs.TryRemove(key, out _);
 
+            // Removing the peer is the exactly-once gate for the closed notification: pc.Close()
+            // below re-enters here through onconnectionstatechange, and so does a client stop that
+            // races the failure handler. Only the caller that actually removed it reports.
             if (_peerConnections.TryRemove(key, out var pc))
             {
+                _haPeerRouter.TrySendClosed(
+                    PeerIdFromKey(key, roomId),
+                    HaProtocol.KindVideo,
+                    roomId,
+                    reason ?? HaWebRtcCloseReasons.ClosedByServer);
+
                 try
                 {
                     pc.Close("Video peer connection closed");
@@ -583,6 +610,18 @@ namespace BabyMonitarr.Backend.Services
             }
 
             _videoStreamingService.EnsureReaderStoppedIfNoSubscribers(roomId);
+        }
+
+        /// <summary>
+        /// Recovers the peer id from a connection key. Split by length rather than by separator:
+        /// a peer id may itself contain the separator, the room id suffix never does.
+        /// </summary>
+        private static string PeerIdFromKey(string key, int roomId)
+        {
+            string suffix = $"_v_{roomId}";
+            return key.EndsWith(suffix, StringComparison.Ordinal)
+                ? key.Substring(0, key.Length - suffix.Length)
+                : key;
         }
 
         private void SendVideoFrameToPeer(string key, VideoFrameEventArgs args)
@@ -608,7 +647,7 @@ namespace BabyMonitarr.Backend.Services
 
                 if (TryGetRoomIdFromConnectionKey(key, out int roomId))
                 {
-                    CloseConnection(key, roomId);
+                    CloseConnection(key, roomId, HaWebRtcCloseReasons.SourceCodecChanged);
                 }
 
                 return;
