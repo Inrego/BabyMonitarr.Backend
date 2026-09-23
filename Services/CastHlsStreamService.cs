@@ -28,6 +28,29 @@ public sealed class CastHlsStream
     internal Process? Process;
     internal CancellationTokenSource? Cts;
     internal Task? Supervisor;
+    private long _lastDisruptionTicks;
+
+    /// <summary>A playlist not rewritten for this long means the encoder is getting no input.</summary>
+    internal const int StallSeconds = 15;
+
+    internal void MarkDisrupted() => Interlocked.Exchange(ref _lastDisruptionTicks, DateTime.UtcNow.Ticks);
+
+    /// <summary>
+    /// True while the playlist is stale, or when the encoder was restarted within the window.
+    /// A receiver that gives up on the stream around then failed; it was not stopped by a person.
+    /// </summary>
+    public bool DisruptedWithin(TimeSpan window)
+    {
+        long ticks = Interlocked.Read(ref _lastDisruptionTicks);
+        if (ticks != 0 && DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc) < window)
+        {
+            return true;
+        }
+
+        string playlist = Path.Combine(DirectoryPath, "index.m3u8");
+        return File.Exists(playlist) &&
+               (DateTime.UtcNow - File.GetLastWriteTimeUtc(playlist)).TotalSeconds > StallSeconds;
+    }
 
     public string PlaylistPath => $"/cast/hls/{Token}/index.m3u8";
     public string ContentType => "application/vnd.apple.mpegurl";
@@ -261,6 +284,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
                     return;
                 }
 
+                stream.MarkDisrupted();
                 _logger.LogWarning(
                     "Cast ffmpeg for room {RoomId} exited with code {ExitCode}; restarting",
                     stream.RoomId,
@@ -307,7 +331,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
     private async Task WatchForStallAsync(CastHlsStream stream, Process process, CancellationToken ct)
     {
         const int startupGraceSeconds = 60;
-        const int stallSeconds = 15;
+        const int stallSeconds = CastHlsStream.StallSeconds;
 
         string playlist = Path.Combine(stream.DirectoryPath, "index.m3u8");
         DateTime lastProgress = DateTime.UtcNow;
@@ -352,6 +376,7 @@ public sealed class CastHlsStreamService : ICastHlsStreamService, IHostedService
     /// <summary>Kills the current ffmpeg; the supervisor loop brings up a fresh one.</summary>
     private void RestartEncoder(CastHlsStream stream, string reason)
     {
+        stream.MarkDisrupted();
         var process = stream.Process;
         if (process is not { HasExited: false }) return;
 

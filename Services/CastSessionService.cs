@@ -39,6 +39,14 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     /// <summary>The idle "Backdrop" app a receiver shows when nothing is cast.</summary>
     private const string BackdropAppId = "E8C28D3C";
 
+    /// <summary>
+    /// How long after a stream disruption a receiver quitting counts as a failure, not a person.
+    /// A Nest Hub that loses the stream shows "something went wrong" and drops to Backdrop,
+    /// which looks exactly like someone pressing stop. Ceiling: a real stop inside this window
+    /// gets one reconnect; stopping again once the stream is healthy ends it.
+    /// </summary>
+    private static readonly TimeSpan DisruptionWindow = TimeSpan.FromMinutes(3);
+
     private sealed class CastSession
     {
         public required string DeviceId { get; init; }
@@ -371,7 +379,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
                 break;
             case "CANCELLED":
             case "INTERRUPTED":
-                _ = EndSessionAsync(session, "Playback was stopped on the cast device.");
+                EndOrRecover(session, $"Playback was stopped on the cast device ({status.IdleReason}).");
                 break;
             // No reason: the player is idle between load and play. Leave it alone.
         }
@@ -393,6 +401,21 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         string what = string.Equals(appId, BackdropAppId, StringComparison.OrdinalIgnoreCase)
             ? "Casting was stopped on the device."
             : $"Another app ({status.Application?.DisplayName ?? appId}) took over the cast device.";
+        EndOrRecover(session, what);
+    }
+
+    /// <summary>
+    /// The receiver left the stream in a way a person could have caused. If the stream was
+    /// disrupted around then, the receiver gave up on it and the session is recovered instead.
+    /// </summary>
+    private void EndOrRecover(CastSession session, string what)
+    {
+        if (session.Stream.DisruptedWithin(DisruptionWindow))
+        {
+            BeginRecovery(session, $"{what} right after the stream was disrupted");
+            return;
+        }
+
         _ = EndSessionAsync(session, what);
     }
 
@@ -498,7 +521,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         try { await session.Client.DisconnectAsync(); } catch { /* best effort */ }
         _streams.Release(session.Stream);
         _lastErrors[session.DeviceId] = message;
-        _logger.LogInformation(
+        _logger.LogWarning(
             "Cast of room {RoomId} to {DeviceName} ended: {Message}",
             session.RoomId,
             session.DeviceName,
