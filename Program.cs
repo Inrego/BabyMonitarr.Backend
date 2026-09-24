@@ -67,6 +67,8 @@ builder.Services.AddSingleton<ICastDeviceService, CastDeviceService>();
 builder.Services.AddHostedService(sp => (CastDeviceService)sp.GetRequiredService<ICastDeviceService>());
 builder.Services.AddSingleton<ICastSessionService, CastSessionService>();
 builder.Services.AddHostedService(sp => (CastSessionService)sp.GetRequiredService<ICastSessionService>());
+builder.Services.AddSingleton<CastReceiverPeers>();
+builder.Services.AddSingleton<ICastReceiverPeers>(sp => sp.GetRequiredService<CastReceiverPeers>());
 
 // Add authentication
 builder.Services.AddBabyMonitarrAuth(builder.Configuration);
@@ -174,6 +176,18 @@ app.UseStaticFiles();
 app.UseWebSockets();
 app.UseRouting();
 
+// The cast receiver page is hosted on a public origin (GitHub Pages) and calls this server on a LAN
+// address, so Chrome's Private Network Access preflight must be answered for its hub.
+app.Use((context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/cast/receiverHub") &&
+        context.Request.Headers.ContainsKey("Access-Control-Request-Private-Network"))
+    {
+        context.Response.Headers["Access-Control-Allow-Private-Network"] = "true";
+    }
+    return next();
+});
+
 app.UseCors("SignalRWithCredentials");
 
 app.UseAuthentication();
@@ -182,6 +196,10 @@ app.UseAuthorization();
 // Map SignalR hub
 app.MapHub<BabyMonitarr.Backend.Hubs.AudioStreamHub>("/audioHub")
    .RequireCors("SignalRWithCredentials");
+
+// Signalling for the custom cast receiver page; anonymous and token-gated, so any origin may call it
+app.MapHub<BabyMonitarr.Backend.Hubs.CastReceiverHub>("/cast/receiverHub")
+   .RequireCors("SignalRPolicy");
 
 // Plain WebSocket endpoint for the Home Assistant integration
 app.MapHaWebSocket();

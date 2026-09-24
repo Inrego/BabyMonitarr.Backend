@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text.Json;
 using BabyMonitarr.Backend.Hubs;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
@@ -29,6 +31,11 @@ public interface ICastSessionService
     int? RoomForDevice(string deviceId);
 
     string? LastErrorForDevice(string deviceId);
+
+    /// <summary>
+    /// What a receiver page may stream, or null once the cast session behind the token has ended.
+    /// </summary>
+    CastReceiverTicket? ResolveReceiverToken(string token);
 }
 
 public sealed class CastSessionService : ICastSessionService, IHostedService
@@ -47,14 +54,34 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     /// </summary>
     private static readonly TimeSpan DisruptionWindow = TimeSpan.FromMinutes(3);
 
+    /// <summary>Custom message namespace the receiver page listens on; see wwwroot/cast/receiver.js.</summary>
+    private const string ReceiverNamespace = "urn:x-cast:com.babymonitarr.receiver";
+
+    /// <summary>How long a freshly launched receiver page gets to register its message listener.</summary>
+    private static readonly TimeSpan ReceiverReadyTimeout = TimeSpan.FromSeconds(15);
+
     private sealed class CastSession
     {
         public required string DeviceId { get; init; }
         public required string DeviceName { get; init; }
         public required int RoomId { get; init; }
         public required bool Video { get; init; }
-        public required Media Media { get; init; }
-        public required CastHlsStream Stream { get; init; }
+
+        /// <summary>The Default Media Receiver, or the custom receiver for a WebRTC cast.</summary>
+        public required string AppId { get; init; }
+
+        /// <summary>HLS casts only.</summary>
+        public Media? Media { get; init; }
+
+        /// <summary>HLS casts only.</summary>
+        public CastHlsStream? Stream { get; init; }
+
+        /// <summary>WebRTC casts only: the token the receiver page presents to CastReceiverHub.</summary>
+        public string? ReceiverToken { get; init; }
+
+        /// <summary>WebRTC casts only: where the hosted receiver page finds this server.</summary>
+        public string? ReceiverServerUrl { get; init; }
+
         public ChromecastClient Client { get; set; } = null!;
         public DateTime StartedAtUtc { get; init; } = DateTime.UtcNow;
         public volatile bool Stopping;
@@ -73,6 +100,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
 
     private readonly ConcurrentDictionary<string, CastSession> _sessions = new();
     private readonly ConcurrentDictionary<string, string> _lastErrors = new();
+    private readonly ConcurrentDictionary<string, CastReceiverTicket> _receiverTickets = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     public CastSessionService(
@@ -200,6 +228,61 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             throw new InvalidOperationException($"Room '{room.Name}' has no stream enabled to cast.");
         }
 
+        // A Web Receiver needs a screen, so audio-only receivers stay on HLS. The receiver page is
+        // served over HTTPS, so it can only reach a server that is on trusted HTTPS too.
+        string? receiverAppId = _castOptions.CurrentValue.ReceiverAppId?.Trim();
+        bool webRtc = video &&
+                      !string.IsNullOrEmpty(receiverAppId) &&
+                      baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        var session = webRtc
+            ? CreateWebRtcSession(room, device, receiverAppId!, baseUrl)
+            : await CreateHlsSessionAsync(room, device, video, baseUrl, cancellationToken);
+
+        try
+        {
+            session.Client = await ConnectAndLoadAsync(session, device);
+            _sessions[deviceId] = session;
+
+            _logger.LogInformation(
+                "Casting room {RoomId} to {DeviceName} ({Profile}, {Transport})",
+                room.Id,
+                device.Name,
+                video ? "video" : "audio",
+                session.ReceiverToken != null ? "WebRTC" : "HLS");
+
+            return session;
+        }
+        catch
+        {
+            ReleaseResources(session);
+            throw;
+        }
+    }
+
+    private CastSession CreateWebRtcSession(Room room, CastDevice device, string receiverAppId, string baseUrl)
+    {
+        string token = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+        _receiverTickets[token] = new CastReceiverTicket(room.Id, room.Name, Video: true, Audio: room.EnableAudioStream);
+
+        return new CastSession
+        {
+            DeviceId = device.DeviceId,
+            DeviceName = device.Name,
+            RoomId = room.Id,
+            Video = true,
+            AppId = receiverAppId,
+            ReceiverToken = token,
+            ReceiverServerUrl = baseUrl
+        };
+    }
+
+    private async Task<CastSession> CreateHlsSessionAsync(
+        Room room,
+        CastDevice device,
+        bool video,
+        string baseUrl,
+        CancellationToken cancellationToken)
+    {
         var stream = await _streams.AcquireAsync(room, video, MaxVideoHeightFor(device), cancellationToken);
 
         string mediaUrl = $"{baseUrl}{stream.PlaylistPath}";
@@ -219,35 +302,27 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             }
         };
 
-        var session = new CastSession
+        return new CastSession
         {
-            DeviceId = deviceId,
+            DeviceId = device.DeviceId,
             DeviceName = device.Name,
             RoomId = room.Id,
             Video = video,
+            AppId = DefaultMediaReceiverAppId,
             Media = media,
             Stream = stream
         };
-
-        try
-        {
-            session.Client = await ConnectAndLoadAsync(session, device);
-            _sessions[deviceId] = session;
-
-            _logger.LogInformation(
-                "Casting room {RoomId} to {DeviceName} ({Profile})",
-                room.Id,
-                device.Name,
-                video ? "video" : "audio");
-
-            return session;
-        }
-        catch
-        {
-            _streams.Release(stream);
-            throw;
-        }
     }
+
+    /// <summary>Frees what a session holds on the server once it is over, or failed to start.</summary>
+    private void ReleaseResources(CastSession session)
+    {
+        if (session.Stream != null) _streams.Release(session.Stream);
+        if (session.ReceiverToken != null) _receiverTickets.TryRemove(session.ReceiverToken, out _);
+    }
+
+    public CastReceiverTicket? ResolveReceiverToken(string token) =>
+        _receiverTickets.TryGetValue(token, out var ticket) ? ticket : null;
 
     /// <summary>
     /// Nest Hub displays fail the load (LOAD_FAILED, then IdleReason ERROR) on 1080p H.264 of
@@ -268,8 +343,15 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         try
         {
             await client.ConnectChromecast(_devices.ToReceiver(device));
-            await client.LaunchApplicationAsync(DefaultMediaReceiverAppId, false);
-            await client.GetChannel<Sharpcaster.Channels.MediaChannel>().LoadAsync(session.Media);
+            await client.LaunchApplicationAsync(session.AppId, false);
+            if (session.ReceiverToken != null)
+            {
+                await JoinReceiverAsync(client, session.ReceiverToken, session.ReceiverServerUrl!);
+            }
+            else
+            {
+                await client.GetChannel<Sharpcaster.Channels.MediaChannel>().LoadAsync(session.Media!);
+            }
         }
         catch
         {
@@ -280,11 +362,46 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         // Subscribed only after a successful load so the transient states of connecting and
         // launching (Backdrop showing, player idle with no media) are not mistaken for trouble.
         client.Disconnected += (_, _) => OnClientDisconnected(session, client);
-        client.GetChannel<Sharpcaster.Channels.MediaChannel>().StatusChanged +=
-            (_, status) => OnMediaStatus(session, client, status);
+        if (session.ReceiverToken == null)
+        {
+            // The WebRTC receiver plays nothing through the media channel; it recovers its own
+            // stream and only the receiver status says whether it is still up.
+            client.GetChannel<Sharpcaster.Channels.MediaChannel>().StatusChanged +=
+                (_, status) => OnMediaStatus(session, client, status);
+        }
         client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().ReceiverStatusChanged +=
             (_, status) => OnReceiverStatus(session, client, status);
         return client;
+    }
+
+    /// <summary>
+    /// Hands the launched receiver page its token and this server's URL - the page is hosted
+    /// centrally, not by this server. The launch reply can arrive before the page has registered
+    /// its listener, so this waits for the page's namespace to show in the receiver status.
+    /// </summary>
+    private static async Task JoinReceiverAsync(ChromecastClient client, string token, string serverUrl)
+    {
+        var receiver = client.GetChannel<Sharpcaster.Channels.ReceiverChannel>();
+        var deadline = DateTime.UtcNow + ReceiverReadyTimeout;
+        while (true)
+        {
+            var app = (await receiver.GetChromecastStatusAsync())?.Application;
+            if (app?.Namespaces?.Any(ns => ns.Name == ReceiverNamespace) == true)
+            {
+                string payload = JsonSerializer.Serialize(new { type = "join", token, serverUrl });
+                await client.SendAsync(null, ReceiverNamespace, payload, app.TransportId);
+                return;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new InvalidOperationException(
+                    "The BabyMonitarr receiver did not start on the cast device. If Cast:ReceiverAppId " +
+                    "points at your own unpublished app, the device must be registered for testing.");
+            }
+
+            await Task.Delay(500);
+        }
     }
 
     public async Task<bool> StopDeviceAsync(string deviceId)
@@ -322,7 +439,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             _logger.LogDebug(ex, "Error disconnecting cast client {DeviceId}", deviceId);
         }
 
-        _streams.Release(session.Stream);
+        ReleaseResources(session);
         _logger.LogInformation("Stopped casting room {RoomId} to {DeviceId}", session.RoomId, deviceId);
         await BroadcastStateAsync();
         return true;
@@ -393,7 +510,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         if (status == null || !IsCurrent(session, client)) return;
 
         string? appId = status.Application?.AppId;
-        if (appId == null || string.Equals(appId, DefaultMediaReceiverAppId, StringComparison.OrdinalIgnoreCase))
+        if (appId == null || string.Equals(appId, session.AppId, StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
@@ -410,7 +527,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     /// </summary>
     private void EndOrRecover(CastSession session, string what)
     {
-        if (session.Stream.DisruptedWithin(DisruptionWindow))
+        if (session.Stream?.DisruptedWithin(DisruptionWindow) == true)
         {
             BeginRecovery(session, $"{what} right after the stream was disrupted");
             return;
@@ -519,7 +636,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         session.Stopping = true;
 
         try { await session.Client.DisconnectAsync(); } catch { /* best effort */ }
-        _streams.Release(session.Stream);
+        ReleaseResources(session);
         _lastErrors[session.DeviceId] = message;
         _logger.LogWarning(
             "Cast of room {RoomId} to {DeviceName} ended: {Message}",

@@ -32,6 +32,18 @@ public sealed class CastSessionInfo
     public DateTime StartedAtUtc { get; set; }
 }
 
+/// <summary>What one WebRTC cast session lets its receiver page stream.</summary>
+public sealed record CastReceiverTicket(int RoomId, string RoomName, bool Video, bool Audio);
+
+/// <summary>Returned to the receiver page when it joins with its token.</summary>
+public sealed class CastReceiverJoinResult
+{
+    public string RoomName { get; set; } = string.Empty;
+    public bool Video { get; set; }
+    public bool Audio { get; set; }
+    public List<WebRtcClientIceServer> IceServers { get; set; } = new();
+}
+
 public sealed class CastStartResult
 {
     public List<CastSessionInfo> Started { get; set; } = new();

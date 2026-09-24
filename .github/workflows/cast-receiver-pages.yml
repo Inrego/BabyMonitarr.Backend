@@ -1,0 +1,54 @@
+name: Cast Receiver Pages
+
+# Publishes the custom Cast receiver page to GitHub Pages. The project's published Cast app points
+# at https://inrego.github.io/BabyMonitarr.Backend/cast/receiver.html, so every installation casts
+# through the same page and nobody has to register an app of their own. The page keeps the
+# relative layout it has under wwwroot, so the backend can serve the very same files.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - wwwroot/cast/**
+      - wwwroot/js/signalr-retry.js
+      - wwwroot/lib/microsoft-signalr/**
+      - .github/workflows/cast-receiver-pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: cast-receiver-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}cast/receiver.html
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble site
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _site/cast _site/js _site/lib/microsoft-signalr
+          cp wwwroot/cast/receiver.html wwwroot/cast/receiver.js _site/cast/
+          cp wwwroot/js/signalr-retry.js _site/js/
+          cp wwwroot/lib/microsoft-signalr/signalr.min.js _site/lib/microsoft-signalr/
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

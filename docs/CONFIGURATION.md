@@ -94,11 +94,13 @@ selects targets.
 | `Cast__PlaylistSize` | `4` | Segments kept in the live window. Smaller is less delay; below 4 the receiver stalls. |
 | `Cast__StreamLingerSeconds` | `15` | How long FFmpeg keeps running after the last receiver stops. |
 | `Cast__FfmpegPath` | (auto) | Overrides the bundled/Jellyfin FFmpeg binary. |
+| `Cast__ReceiverAppId` | project receiver | The Cast app that plays video casts over WebRTC. Leave it alone to use the project's published receiver; set it empty to always use HLS. See [Low-latency casting](#low-latency-casting). |
 
 Things worth knowing:
 
-- **HLS is not WebRTC.** Cast receivers cannot play WebRTC, so cast output runs a few seconds
-  behind the in-app stream. The app itself is unaffected.
+- **HLS runs a few seconds behind.** Casts that cannot use the WebRTC receiver (below) go to
+  Google's Default Media Receiver as HLS, which lags the in-app stream by several seconds.
+  Audio-only receivers (speakers) always use HLS, because they cannot run a Web Receiver.
 - **Plain HTTP only.** Cast receivers reject self-signed certificates, so `/cast/hls/**` is
   excluded from HTTPS redirection and served anonymously, gated by a random per-session token
   in the URL.
@@ -119,6 +121,32 @@ Things worth knowing:
   app to it, is treated as deliberate and ends the session.
 - **Non-H.264 cameras are re-encoded** (roughly one CPU core per 1080p stream); H.264 sources
   are copied straight through.
+
+### Low-latency casting
+
+Video casts play over WebRTC in BabyMonitarr's own Cast receiver, with well under a second of delay.
+There is nothing to register: the project publishes one receiver app for every installation. Its
+page is hosted on GitHub Pages
+(`https://inrego.github.io/BabyMonitarr.Backend/cast/receiver.html`, built from `wwwroot/cast`).
+When a cast starts, the backend launches the receiver and sends it a one-time token and the
+server's URL over the cast channel. The page then signals over `<server>/cast/receiverHub`, which
+accepts any origin but only unlocks that one room's streams while the cast session lasts.
+
+This needs:
+
+- **`Cast__BaseUrl` on publicly trusted HTTPS**, reachable from the cast device. The receiver page
+  is served over HTTPS, so it cannot connect to plain HTTP. With an HTTP base URL, casts fall
+  back to HLS automatically.
+- **The WebRTC ports (`WebRtc__RtpPortRange__*`) reachable from the cast device**, the same as
+  for any LAN browser.
+- **A decodable video stream.** Video is passed through without transcoding, so the device has
+  to decode the camera's native resolution and codec (H.264 or VP8; not H.265).
+
+To host the receiver yourself instead, register a Custom Receiver at the
+[Google Cast SDK Developer Console](https://cast.google.com/publish) that points at
+`https://<your-host>/cast/receiver.html` (the backend serves the same page), and set
+`Cast__ReceiverAppId` to its app id. An unpublished app only launches on devices registered for
+testing under **Devices**.
 
 ## Logging
 

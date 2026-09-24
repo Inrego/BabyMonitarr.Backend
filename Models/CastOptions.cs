@@ -15,6 +15,19 @@ public sealed class CastOptions
     /// <summary>Directory for generated HLS segments. Defaults to a folder under the system temp path.</summary>
     public string? HlsPath { get; set; }
 
+    /// <summary>
+    /// App id of the custom Web Receiver that plays video casts over WebRTC - sub-second delay
+    /// instead of HLS's several seconds. Defaults to the project's published receiver (the page in
+    /// wwwroot/cast, hosted on GitHub Pages), so nobody has to register anything. Set it empty to
+    /// always use HLS, or to your own app id to host the page yourself. Used only when
+    /// <see cref="BaseUrl"/> resolves to publicly trusted HTTPS, which the page needs to connect
+    /// back; audio-only receivers cannot run a Web Receiver and always use HLS.
+    /// </summary>
+    public string? ReceiverAppId { get; set; } = PublishedReceiverAppId;
+
+    /// <summary>The project's published receiver app.</summary>
+    public const string? PublishedReceiverAppId = null;
+
     public int DiscoveryIntervalSeconds { get; set; } = 300;
     public int DiscoveryTimeoutSeconds { get; set; } = 5;
 

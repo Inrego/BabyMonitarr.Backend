@@ -45,6 +45,7 @@ namespace BabyMonitarr.Backend.Services
         private readonly IHubContext<AudioStreamHub> _hubContext;
         private readonly IWebRtcConfigService _webRtcConfigService;
         private readonly IHaPeerRouter _haPeerRouter;
+        private readonly ICastReceiverPeers _castReceiverPeers;
 
         // Peer connections keyed by "{peerId}_v_{roomId}".
         private readonly ConcurrentDictionary<string, RTCPeerConnection> _peerConnections = new();
@@ -60,13 +61,15 @@ namespace BabyMonitarr.Backend.Services
             IVideoStreamingService videoStreamingService,
             IHubContext<AudioStreamHub> hubContext,
             IWebRtcConfigService webRtcConfigService,
-            IHaPeerRouter haPeerRouter)
+            IHaPeerRouter haPeerRouter,
+            ICastReceiverPeers castReceiverPeers)
         {
             _logger = logger;
             _videoStreamingService = videoStreamingService;
             _hubContext = hubContext;
             _webRtcConfigService = webRtcConfigService;
             _haPeerRouter = haPeerRouter;
+            _castReceiverPeers = castReceiverPeers;
         }
 
         private static string GetConnectionKey(string peerId, int roomId) => $"{peerId}_v_{roomId}";
@@ -619,6 +622,11 @@ namespace BabyMonitarr.Backend.Services
                     HaProtocol.KindVideo,
                     roomId,
                     reason ?? HaWebRtcCloseReasons.ClosedByServer);
+                // A supersede is the receiver's own renegotiation; telling it would restart it again.
+                if (reason != HaWebRtcCloseReasons.Superseded)
+                {
+                    _castReceiverPeers.TrySendClosed(PeerIdFromKey(key, roomId), "video");
+                }
 
                 try
                 {
@@ -753,6 +761,14 @@ namespace BabyMonitarr.Backend.Services
             // A Home Assistant peer signals over /ha/ws and has no SignalR connection to push to.
             if (_haPeerRouter.TrySendIceCandidate(
                     peerId, "video", roomId, candidate.candidate, candidate.sdpMid ?? string.Empty,
+                    candidate.sdpMLineIndex))
+            {
+                return Task.CompletedTask;
+            }
+
+            // A cast receiver page signals over CastReceiverHub.
+            if (_castReceiverPeers.TrySendIceCandidate(
+                    peerId, "video", candidate.candidate, candidate.sdpMid ?? string.Empty,
                     candidate.sdpMLineIndex))
             {
                 return Task.CompletedTask;
