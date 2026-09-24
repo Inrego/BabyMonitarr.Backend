@@ -11,7 +11,7 @@ on:
     paths:
       - wwwroot/cast/**
       - wwwroot/js/signalr-retry.js
-      - wwwroot/lib/microsoft-signalr/**
+      - libman.json
       - .github/workflows/cast-receiver-pages.yml
   workflow_dispatch:
 
@@ -42,7 +42,12 @@ jobs:
           mkdir -p _site/cast _site/js _site/lib/microsoft-signalr
           cp wwwroot/cast/receiver.html wwwroot/cast/receiver.js _site/cast/
           cp wwwroot/js/signalr-retry.js _site/js/
-          cp wwwroot/lib/microsoft-signalr/signalr.min.js _site/lib/microsoft-signalr/
+          # wwwroot/lib is restored by LibMan and not committed; fetch the same pinned file from
+          # the same provider (cdnjs) that libman.json names.
+          library="$(jq -r '.libraries[] | select(.library | startswith("microsoft-signalr@")) | .library' libman.json)"
+          version="${library#microsoft-signalr@}"
+          curl -fsSL "https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/${version}/signalr.min.js" \
+            -o _site/lib/microsoft-signalr/signalr.min.js
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
