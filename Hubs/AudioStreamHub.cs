@@ -347,11 +347,30 @@ public class AudioStreamHub : Hub
         _talkbackService.SetVolumeAsync(roomId, volume);
 
     /// <summary>Admin: cameras in the Google Home account a room's talkback can be mapped to.</summary>
-    public Task<IReadOnlyList<TalkbackCameraOption>> GetTalkbackCameras() => _talkbackService.GetCamerasAsync();
+    public async Task<IReadOnlyList<TalkbackCameraOption>> GetTalkbackCameras()
+    {
+        try
+        {
+            return await _talkbackService.GetCamerasAsync();
+        }
+        catch (TalkbackUnavailableException ex)
+        {
+            throw new HubException(ex.Message);
+        }
+    }
 
     /// <summary>Admin: pins a room's talkback camera; null or empty goes back to automatic matching.</summary>
-    public Task<TalkbackStatus> SetTalkbackCamera(int roomId, string? nestDeviceId) =>
-        _talkbackService.SetCameraAsync(roomId, nestDeviceId);
+    public async Task<TalkbackStatus> SetTalkbackCamera(int roomId, string? nestDeviceId)
+    {
+        try
+        {
+            return await _talkbackService.SetCameraAsync(roomId, nestDeviceId);
+        }
+        catch (Exception ex) when (ex is TalkbackUnavailableException or ArgumentException)
+        {
+            throw new HubException(ex.Message);
+        }
+    }
 
     public Task<GoogleHomeStatus> GetGoogleHomeStatus() => _googleHomeAuthService.GetStatusAsync();
 

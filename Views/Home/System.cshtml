@@ -57,6 +57,46 @@
     </div>
 </div>
 
+<!-- Google Home credential for Nest talkback -->
+<div class="content-card config-section mb-4">
+    <h2 class="config-section-title">Google Home (Talkback)</h2>
+
+    <div class="mb-3">
+        <span class="form-label-dark" style="display: block;">Credential Status</span>
+        <span id="googleHomeStatus" class="status-badge offline" style="font-size: 0.85rem; margin-top: 8px;">
+            <span class="status-dot"></span>
+            <span id="googleHomeStatusText">Not configured</span>
+        </span>
+        <div id="googleHomeStatusDetail" class="form-hint"></div>
+    </div>
+
+    <div class="mb-3">
+        <label for="googleHomeIssueTokenUrl" class="form-label-dark">issueToken Request URL</label>
+        <textarea id="googleHomeIssueTokenUrl" class="form-control-dark" rows="2" autocomplete="off" spellcheck="false"
+                  placeholder="https://accounts.google.com/o/oauth2/iframerpc?action=issueToken&amp;..."></textarea>
+    </div>
+
+    <div class="mb-3">
+        <label for="googleHomeCookie" class="form-label-dark">Cookie Request Header</label>
+        <textarea id="googleHomeCookie" class="form-control-dark" rows="3" autocomplete="off" spellcheck="false"
+                  placeholder="__Secure-3PSID=...; __Secure-3PSIDCC=..."></textarea>
+        <div class="form-hint">
+            Push-to-talk on Nest cameras uses Google Home's private API, which needs a signed-in browser session.
+            See <a href="https://github.com/Inrego/BabyMonitarr.Backend/blob/master/docs/GOOGLE_HOME_TALKBACK_SETUP.md" target="_blank" rel="noopener">how to capture it</a>.
+            Stored on the server only; it is never shown again. Monitoring does not depend on it.
+        </div>
+    </div>
+
+    <div class="d-flex gap-3">
+        <button id="saveGoogleHomeBtn" class="btn-monitor-start" onclick="saveGoogleHomeCredentials()">
+            <i class="fas fa-save"></i> Save &amp; Test
+        </button>
+        <button id="clearGoogleHomeBtn" class="btn-monitor-stop" onclick="clearGoogleHomeCredentials()">
+            <i class="fas fa-trash"></i> Remove
+        </button>
+    </div>
+</div>
+
 <!-- Settings message toast -->
 <div id="settingsMessage" class="settings-toast" style="display: none;"></div>
 

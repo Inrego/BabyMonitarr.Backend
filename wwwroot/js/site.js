@@ -385,6 +385,7 @@ async function saveRoomConfig() {
         ]);
 
         if (updatedRoomResult) {
+            await saveTalkbackCamera(room, updatedRoom);
             await loadRooms();
             // Re-select to refresh UI
             selectMonitorForEditing(selectedRoomId);
@@ -677,6 +678,7 @@ function onStreamSourceTypeChanged(nestDeviceId) {
         if (sourceType === 'google_nest') {
             loadNestDevices(nestDeviceId);
             checkNestLinked();
+            loadTalkbackCameras();
         }
     }
 }
@@ -711,6 +713,62 @@ async function loadNestDevices(deviceIdToSelect) {
     } catch (err) {
         console.error("Error loading Nest devices:", err);
         select.innerHTML = '<option value="">Error loading devices</option>';
+    }
+}
+
+// ===== Talkback camera (Google Home) =====
+async function loadTalkbackCameras() {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) return;
+
+    const select = document.getElementById('talkbackCameraSelect');
+    const hint = document.getElementById('talkbackCameraHint');
+    if (!select || !hint) return;
+
+    const room = currentRooms.find(r => r.id === selectedRoomId);
+    select.innerHTML = '<option value="">Automatic</option>';
+
+    try {
+        const cameras = await connection.invoke("GetTalkbackCameras");
+        cameras.forEach(camera => {
+            const option = document.createElement('option');
+            option.value = camera.nestDeviceId;
+            option.textContent = camera.roomName
+                ? `${camera.roomName} (${camera.nestDeviceId})`
+                : camera.nestDeviceId;
+            select.appendChild(option);
+        });
+        select.disabled = false;
+        select.value = room?.talkbackNestDeviceId || '';
+    } catch (err) {
+        console.error("Error loading talkback cameras:", err);
+        select.disabled = true;
+    }
+
+    if (!room) return;
+    try {
+        const status = await connection.invoke("GetTalkbackStatus", room.id);
+        hint.textContent = status.available && !status.unavailableReason
+            ? 'Talkback is ready for this room.'
+            : (status.message || 'Talkback is not available for this room.');
+    } catch (err) {
+        console.error("Error loading talkback status:", err);
+    }
+}
+
+/** Applies the talkback camera choice after the room itself was saved (a new Nest device clears it). */
+async function saveTalkbackCamera(roomBefore, updatedRoom) {
+    const select = document.getElementById('talkbackCameraSelect');
+    if (!select || select.disabled || updatedRoom.streamSourceType !== 'google_nest') return;
+
+    const chosen = select.value || '';
+    const nestDeviceChanged = (roomBefore.nestDeviceId || '') !== (updatedRoom.nestDeviceId || '');
+    if (chosen === (roomBefore.talkbackNestDeviceId || '') && !(nestDeviceChanged && chosen)) return;
+
+    try {
+        await connection.invoke("SetTalkbackCamera", updatedRoom.id, chosen || null);
+    } catch (err) {
+        console.error("Error saving talkback camera:", err);
+        showMessage("Room saved, but the talkback camera could not be set", true);
     }
 }
 

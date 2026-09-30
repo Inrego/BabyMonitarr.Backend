@@ -22,6 +22,7 @@ function initializeSignalRConnection() {
             console.log("SignalR Connected (System)");
             await loadNestSettings();
             await checkNestStatus();
+            await loadGoogleHomeStatus();
 
             // Check for OAuth callback result
             const params = new URLSearchParams(window.location.search);
@@ -140,6 +141,83 @@ async function checkNestStatus() {
         }
     } catch (err) {
         console.error("Error checking Nest status:", err);
+    }
+}
+
+// ===== Google Home credential (Nest talkback) =====
+async function loadGoogleHomeStatus() {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) return;
+
+    try {
+        renderGoogleHomeStatus(await connection.invoke("GetGoogleHomeStatus"));
+    } catch (err) {
+        console.error("Error loading Google Home status:", err);
+    }
+}
+
+function renderGoogleHomeStatus(status) {
+    const badge = document.getElementById('googleHomeStatus');
+    const text = document.getElementById('googleHomeStatusText');
+    const detail = document.getElementById('googleHomeStatusDetail');
+    if (!badge || !text || !detail) return;
+
+    let label = 'Not configured';
+    let cls = 'status-badge offline';
+    if (status.linked) {
+        label = 'Linked';
+        cls = 'status-badge active';
+    } else if (status.configured) {
+        label = status.lastErrorAtUtc ? 'Failing' : 'Not tested yet';
+    }
+
+    badge.className = cls;
+    badge.style.fontSize = '0.85rem';
+    badge.style.marginTop = '8px';
+    text.textContent = label;
+
+    const parts = [];
+    if (status.configured && status.message && !status.linked) parts.push(status.message);
+    if (status.lastSuccessAtUtc) parts.push(`Last token: ${new Date(status.lastSuccessAtUtc + (status.lastSuccessAtUtc.endsWith('Z') ? '' : 'Z')).toLocaleString()}`);
+    detail.textContent = parts.join(' · ');
+}
+
+async function saveGoogleHomeCredentials() {
+    if (!connection || connection.state !== signalR.HubConnectionState.Connected) {
+        showMessage("Not connected to server.", true);
+        return;
+    }
+
+    const urlInput = document.getElementById('googleHomeIssueTokenUrl');
+    const cookieInput = document.getElementById('googleHomeCookie');
+    const button = document.getElementById('saveGoogleHomeBtn');
+
+    try {
+        if (button) button.disabled = true;
+        const status = await connection.invoke("SetGoogleHomeCredentials", urlInput.value, cookieInput.value);
+        urlInput.value = '';
+        cookieInput.value = '';
+        renderGoogleHomeStatus(status);
+        showMessage(status.linked ? "Google Home credential works" : "Saved, but Google rejected it", !status.linked);
+    } catch (err) {
+        console.error("Error saving Google Home credential:", err);
+        showMessage(err?.message?.replace(/^.*HubException: /, '') || "Error saving credential", true);
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function clearGoogleHomeCredentials() {
+    if (!confirm("Remove the Google Home credential? Push-to-talk stops working until a new one is added.")) {
+        return;
+    }
+
+    try {
+        await connection.invoke("ClearGoogleHomeCredentials");
+        showMessage("Google Home credential removed");
+        await loadGoogleHomeStatus();
+    } catch (err) {
+        console.error("Error removing Google Home credential:", err);
+        showMessage("Error removing credential", true);
     }
 }
 
