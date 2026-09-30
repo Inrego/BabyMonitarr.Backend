@@ -54,6 +54,12 @@ public class GoogleHomeCredentialInputTests
     private const string Url = "https://accounts.google.com/o/oauth2/iframerpc?action=issueToken&response_type=token";
 
     [Fact]
+    public void Accepts_an_iframe_capture_with_only_third_party_cookies()
+    {
+        Assert.True(GoogleHomeCredentialInput.TryNormalize(Url, "__Secure-3PAPISID=a; __Secure-3PSID=b; __Secure-3PSIDCC=c", out _, out _, out _));
+    }
+
+    [Fact]
     public void Accepts_capture_and_strips_cookie_header_name()
     {
         bool ok = GoogleHomeCredentialInput.TryNormalize($"  {Url}\n", "Cookie: SID=abc; HSID=def ", out var url, out var cookie, out _);
@@ -66,7 +72,7 @@ public class GoogleHomeCredentialInputTests
     [Theory]
     [InlineData("https://home.nest.com/", "SID=abc")]
     [InlineData("https://accounts.google.com/o/oauth2/iframerpc?action=checkOrigin", "SID=abc")]
-    [InlineData(Url, "HSID=def")]
+    [InlineData(Url, "HSID=def; __Secure-3PSIDCC=x")]
     [InlineData(null, null)]
     public void Rejects_incomplete_capture(string? url, string? cookie)
     {

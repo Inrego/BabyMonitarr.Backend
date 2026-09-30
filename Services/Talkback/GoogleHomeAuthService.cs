@@ -56,12 +56,15 @@ public static class GoogleHomeCredentialInput
             return false;
         }
 
+        // A capture from the home.nest.com sign-in iframe carries only the third-party session
+        // cookies, so either the first- or the third-party session id will do.
         bool hasSid = normalizedCookie
             .Split(';', StringSplitOptions.TrimEntries)
-            .Any(pair => pair.StartsWith("SID=", StringComparison.Ordinal));
+            .Select(pair => pair.Split('=', 2)[0])
+            .Any(name => name is "SID" or "__Secure-1PSID" or "__Secure-3PSID");
         if (!hasSid)
         {
-            error = "The cookie has no SID= entry; copy the whole Cookie request header of that request.";
+            error = "The cookie has no Google session id (SID or __Secure-3PSID); copy the whole Cookie request header of that request.";
             return false;
         }
 
@@ -111,7 +114,7 @@ public sealed class GoogleHomeAuthService : BackgroundService, IGoogleHomeAuthSe
     {
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
-        var row = await db.GoogleHomeCredentials.AsNoTracking().FirstOrDefaultAsync(ct);
+        var row = await db.GoogleHomeCredentials.AsNoTracking().OrderBy(c => c.Id).FirstOrDefaultAsync(ct);
         return ToStatus(row);
     }
 
@@ -127,7 +130,7 @@ public sealed class GoogleHomeAuthService : BackgroundService, IGoogleHomeAuthSe
         {
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
-            var row = await db.GoogleHomeCredentials.FirstOrDefaultAsync(ct);
+            var row = await db.GoogleHomeCredentials.OrderBy(c => c.Id).FirstOrDefaultAsync(ct);
             if (row == null)
             {
                 row = new GoogleHomeCredential();
@@ -239,7 +242,7 @@ public sealed class GoogleHomeAuthService : BackgroundService, IGoogleHomeAuthSe
 
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<BabyMonitarrDbContext>();
-            var row = await db.GoogleHomeCredentials.FirstOrDefaultAsync(ct)
+            var row = await db.GoogleHomeCredentials.OrderBy(c => c.Id).FirstOrDefaultAsync(ct)
                 ?? throw new TalkbackUnavailableException(TalkbackReasons.NotConfigured,
                     "Talkback needs a Google Home credential; add it on the backend's System page.");
 
