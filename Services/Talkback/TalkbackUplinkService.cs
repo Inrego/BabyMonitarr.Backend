@@ -78,6 +78,9 @@ public sealed class TalkbackUplinkService : ITalkbackUplinkService, IDisposable
             if (advertised != null) _ = SendIceCandidateAsync(connectionId, roomId, advertised);
         };
 
+        pc.oniceconnectionstatechange += state =>
+            _logger.LogInformation("Talkback uplink {Key}: ICE {State}", key, state);
+
         pc.onconnectionstatechange += state =>
         {
             _logger.LogInformation("Talkback uplink {Key}: connection {State}", key, state);
@@ -127,8 +130,10 @@ public sealed class TalkbackUplinkService : ITalkbackUplinkService, IDisposable
         var result = uplink.Pc.setRemoteDescription(description);
         if (result != SetDescriptionResultEnum.OK)
         {
+            _logger.LogWarning("Talkback uplink answer for {Key} rejected: {Result}", Key(connectionId, roomId), result);
             throw new InvalidOperationException($"The talkback uplink answer was rejected: {result}.");
         }
+        _logger.LogInformation("Talkback uplink answer applied for {Key}", Key(connectionId, roomId));
 
         lock (uplink.PendingCandidates)
         {
@@ -140,6 +145,7 @@ public sealed class TalkbackUplinkService : ITalkbackUplinkService, IDisposable
     public void AddIceCandidate(string connectionId, int roomId, RTCIceCandidateInit candidate)
     {
         var uplink = Get(connectionId, roomId);
+        _logger.LogDebug("Talkback uplink {Key}: remote candidate {Candidate}", Key(connectionId, roomId), candidate.candidate);
         lock (uplink.PendingCandidates)
         {
             if (uplink.Pc.signalingState == RTCSignalingState.stable) TryAddCandidate(uplink, candidate);
