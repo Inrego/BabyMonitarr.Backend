@@ -95,6 +95,12 @@ public class RoomService : IRoomService
         existing.CameraUsername = room.CameraUsername;
         existing.CameraPassword = room.CameraPassword;
         existing.StreamSourceType = room.StreamSourceType;
+        if (!string.Equals(existing.NestDeviceId, room.NestDeviceId, StringComparison.Ordinal))
+        {
+            // A different camera: the talkback mapping belonged to the old one.
+            existing.TalkbackNestDeviceId = null;
+            existing.TalkbackGoogleUuid = null;
+        }
         existing.NestDeviceId = room.NestDeviceId;
 
         if (shouldRefreshCodecMetadata)

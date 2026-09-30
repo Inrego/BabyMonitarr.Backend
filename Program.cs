@@ -6,7 +6,9 @@ using BabyMonitarr.Backend.Ha;
 using BabyMonitarr.Backend.Data;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
+using BabyMonitarr.Backend.Talkback;
 using System.Data;
+using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -70,6 +72,24 @@ builder.Services.AddHostedService(sp => (CastSessionService)sp.GetRequiredServic
 builder.Services.AddSingleton<CastReceiverPeers>();
 builder.Services.AddSingleton<ICastReceiverPeers>(sp => sp.GetRequiredService<CastReceiverPeers>());
 
+// Nest talkback over Google Home's Foyer API. The named client logs nothing: the issueToken
+// URL it requests is part of the credential.
+builder.Services.AddHttpClient(GoogleHomeAuthService.HttpClientName)
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        UseCookies = false,
+        AutomaticDecompression = DecompressionMethods.All,
+    })
+    .RemoveAllLoggers();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<GoogleHomeAuthService>();
+builder.Services.AddSingleton<IGoogleHomeAuthService>(sp => sp.GetRequiredService<GoogleHomeAuthService>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<GoogleHomeAuthService>());
+builder.Services.AddSingleton<ITalkbackCameraDirectory, TalkbackCameraDirectory>();
+builder.Services.AddSingleton<IFoyerTalkbackStreamFactory, FoyerTalkbackStreamFactory>();
+builder.Services.AddSingleton<ITalkbackService, TalkbackService>();
+builder.Services.AddSingleton<ITalkbackUplinkService, TalkbackUplinkService>();
+
 // Add authentication
 builder.Services.AddBabyMonitarrAuth(builder.Configuration);
 
@@ -111,6 +131,7 @@ using (var scope = app.Services.CreateScope())
     EnsureAuthTables(db);
     EnsureCastTables(db);
     EnsureHaTables(db);
+    EnsureTalkbackSchema(db);
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())
@@ -319,6 +340,29 @@ static void EnsureHaTables(BabyMonitarrDbContext db)
         """);
     db.Database.ExecuteSqlRaw(
         "CREATE UNIQUE INDEX IF NOT EXISTS IX_HaMonitoredRooms_RoomId ON HaMonitoredRooms (RoomId);");
+}
+
+// Nest talkback: the Google Home credential and each room's camera mapping and volume.
+static void EnsureTalkbackSchema(BabyMonitarrDbContext db)
+{
+    db.Database.ExecuteSqlRaw("""
+        CREATE TABLE IF NOT EXISTS GoogleHomeCredentials (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            IssueTokenUrl TEXT NOT NULL DEFAULT '',
+            Cookie TEXT NOT NULL DEFAULT '',
+            UpdatedAtUtc TEXT NOT NULL DEFAULT '0001-01-01 00:00:00',
+            LastSuccessAtUtc TEXT NULL,
+            LastError TEXT NULL,
+            LastErrorAtUtc TEXT NULL
+        );
+        """);
+
+    AddColumnIfMissing(db, "Rooms", "TalkbackNestDeviceId",
+        "ALTER TABLE Rooms ADD COLUMN TalkbackNestDeviceId TEXT NULL;");
+    AddColumnIfMissing(db, "Rooms", "TalkbackGoogleUuid",
+        "ALTER TABLE Rooms ADD COLUMN TalkbackGoogleUuid TEXT NULL;");
+    AddColumnIfMissing(db, "Rooms", "TalkbackVolume",
+        "ALTER TABLE Rooms ADD COLUMN TalkbackVolume REAL NOT NULL DEFAULT 1.0;");
 }
 
 static void AddColumnIfMissing(BabyMonitarrDbContext db, string table, string column, string alterSql)

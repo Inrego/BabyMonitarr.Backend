@@ -24,3 +24,6 @@ Design/
 
 # Claude
 .claude/
+
+# Tests are not part of the image
+BabyMonitarr.Backend.Tests/

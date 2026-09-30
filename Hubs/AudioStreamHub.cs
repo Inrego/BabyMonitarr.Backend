@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using BabyMonitarr.Backend.Models;
 using BabyMonitarr.Backend.Services;
+using BabyMonitarr.Backend.Talkback;
 using SIPSorcery.Net;
 
 namespace BabyMonitarr.Backend.Hubs;
@@ -21,6 +22,9 @@ public class AudioStreamHub : Hub
     private readonly IWebRtcConfigService _webRtcConfigService;
     private readonly ICastDeviceService _castDeviceService;
     private readonly ICastSessionService _castSessionService;
+    private readonly ITalkbackService _talkbackService;
+    private readonly ITalkbackUplinkService _talkbackUplinkService;
+    private readonly IGoogleHomeAuthService _googleHomeAuthService;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
@@ -33,7 +37,10 @@ public class AudioStreamHub : Hub
         IGoogleNestDeviceService nestDeviceService,
         IWebRtcConfigService webRtcConfigService,
         ICastDeviceService castDeviceService,
-        ICastSessionService castSessionService)
+        ICastSessionService castSessionService,
+        ITalkbackService talkbackService,
+        ITalkbackUplinkService talkbackUplinkService,
+        IGoogleHomeAuthService googleHomeAuthService)
     {
         _logger = logger;
         _audioWebRtcService = audioWebRtcService;
@@ -46,6 +53,9 @@ public class AudioStreamHub : Hub
         _webRtcConfigService = webRtcConfigService;
         _castDeviceService = castDeviceService;
         _castSessionService = castSessionService;
+        _talkbackService = talkbackService;
+        _talkbackUplinkService = talkbackUplinkService;
+        _googleHomeAuthService = googleHomeAuthService;
     }
 
     public override async Task OnConnectedAsync()
@@ -63,6 +73,10 @@ public class AudioStreamHub : Hub
 
         // Close all video peer connections for this client
         await _videoWebRtcService.CloseAllVideoPeerConnections(Context.ConnectionId);
+
+        // Stop talking and drop the microphone uplinks of this client
+        await _talkbackUplinkService.CloseAllForConnectionAsync(Context.ConnectionId);
+        await _talkbackService.StopAllForConnectionAsync(Context.ConnectionId, "app disconnected");
 
         await base.OnDisconnectedAsync(exception);
     }
@@ -276,6 +290,85 @@ public class AudioStreamHub : Hub
     {
         return await _nestAuthService.IsLinked();
     }
+    #endregion
+
+    #region Talkback (docs/TALKBACK.md)
+    public Task<TalkbackStatus> GetTalkbackStatus(int roomId) => _talkbackService.GetStatusAsync(roomId);
+
+    public async Task<string> StartTalkbackUplink(int roomId)
+    {
+        _logger.LogInformation("Client {ConnectionId} opened a talkback uplink for room {RoomId}",
+            Context.ConnectionId, roomId);
+        return await _talkbackUplinkService.CreateUplinkAsync(Context.ConnectionId, roomId, GetRequestHostHint());
+    }
+
+    public void SetTalkbackRemoteDescription(int roomId, string type, string sdp)
+    {
+        _talkbackUplinkService.SetRemoteDescription(Context.ConnectionId, roomId, new RTCSessionDescriptionInit
+        {
+            type = type == "answer" ? RTCSdpType.answer : RTCSdpType.offer,
+            sdp = sdp
+        });
+    }
+
+    public void AddTalkbackIceCandidate(int roomId, string candidate, string sdpMid, int? sdpMLineIndex)
+    {
+        _talkbackUplinkService.AddIceCandidate(Context.ConnectionId, roomId, new RTCIceCandidateInit
+        {
+            candidate = candidate,
+            sdpMid = sdpMid,
+            sdpMLineIndex = (ushort)(sdpMLineIndex ?? 0)
+        });
+    }
+
+    public Task StopTalkbackUplink(int roomId) =>
+        _talkbackUplinkService.CloseUplinkAsync(Context.ConnectionId, roomId, "closed by the app");
+
+    public async Task<TalkbackStartResult> StartTalkback(int roomId)
+    {
+        _logger.LogInformation("Client {ConnectionId} started talking in room {RoomId}", Context.ConnectionId, roomId);
+        try
+        {
+            return await _talkbackService.StartAsync(Context.ConnectionId, roomId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "StartTalkback failed for room {RoomId}", roomId);
+            return new TalkbackStartResult(false, TalkbackReasons.CameraError, "Talkback failed on the server.");
+        }
+    }
+
+    public Task StopTalkback(int roomId) =>
+        _talkbackService.StopAsync(Context.ConnectionId, roomId, "released by the app");
+
+    public Task<TalkbackStartResult> PrepareTalkback(int roomId) => _talkbackService.PrepareAsync(roomId);
+
+    public Task<TalkbackStatus> SetTalkbackVolume(int roomId, double volume) =>
+        _talkbackService.SetVolumeAsync(roomId, volume);
+
+    /// <summary>Admin: cameras in the Google Home account a room's talkback can be mapped to.</summary>
+    public Task<IReadOnlyList<TalkbackCameraOption>> GetTalkbackCameras() => _talkbackService.GetCamerasAsync();
+
+    /// <summary>Admin: pins a room's talkback camera; null or empty goes back to automatic matching.</summary>
+    public Task<TalkbackStatus> SetTalkbackCamera(int roomId, string? nestDeviceId) =>
+        _talkbackService.SetCameraAsync(roomId, nestDeviceId);
+
+    public Task<GoogleHomeStatus> GetGoogleHomeStatus() => _googleHomeAuthService.GetStatusAsync();
+
+    /// <summary>Admin: stores and tests a captured Google Home credential. Never echoed back.</summary>
+    public async Task<GoogleHomeStatus> SetGoogleHomeCredentials(string issueTokenUrl, string cookie)
+    {
+        try
+        {
+            return await _googleHomeAuthService.SetCredentialsAsync(issueTokenUrl, cookie);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new HubException(ex.Message);
+        }
+    }
+
+    public Task ClearGoogleHomeCredentials() => _googleHomeAuthService.ClearCredentialsAsync();
     #endregion
 
     #region Google Cast

@@ -15,6 +15,7 @@ public class BabyMonitarrDbContext : DbContext
     public DbSet<CastDevice> CastDevices => Set<CastDevice>();
     public DbSet<RoomCastTarget> RoomCastTargets => Set<RoomCastTarget>();
     public DbSet<HaMonitoredRoom> HaMonitoredRooms => Set<HaMonitoredRoom>();
+    public DbSet<GoogleHomeCredential> GoogleHomeCredentials => Set<GoogleHomeCredential>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
