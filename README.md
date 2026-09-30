@@ -127,6 +127,7 @@ Pair the app by generating an API key in the web UI (API Keys page) and scanning
 | [Configuration](docs/CONFIGURATION.md) | Environment variables, appsettings, WebRTC tuning, FFmpeg diagnostics |
 | [Reverse Proxy Setup](docs/REVERSE_PROXY.md) | Running behind Caddy, Nginx, or Traefik with WebRTC |
 | [Google Nest Setup](docs/GOOGLE_NEST_SETUP.md) | OAuth setup for the Smart Device Management API |
+| [Nest Talkback Setup](docs/GOOGLE_HOME_TALKBACK_SETUP.md) | Google Home credential for push-to-talk on Nest cameras |
 | [Authentication](docs/AUTHENTICATION.md) | Local auth, proxy header auth (Authelia, Authentik), and OIDC |
 | [Client Integration](docs/CLIENT_INTEGRATION.md) | SignalR hub protocol for building custom clients |
 

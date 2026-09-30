@@ -35,7 +35,12 @@ Pushed to every client whenever any field changes: `TalkbackStatusChanged(Talkba
 ```
 
 `available == false` with `supported == true` means: show the Talk button disabled, with `message`.
-`camera_error` is transient (the last Foyer attempt failed); the next `StartTalkback` retries.
+`camera_error` is transient (the last Foyer attempt failed): `available` stays `true`, `message` says
+what failed, and the next `StartTalkback` retries. Every other non-null reason comes with
+`available == false`.
+
+Measured against a real camera: opening the Foyer stream takes ~0.8 s warm and 1.4–1.7 s cold, plus
+~0.3 s for the speaker to start, so a press goes live in 1–2 s without any warm-up.
 
 ### Microphone uplink (a separate peer connection per room)
 

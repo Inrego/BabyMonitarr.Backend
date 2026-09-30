@@ -224,6 +224,10 @@ await connection.invoke("UpdateAudioSettings", {
 | `StartCast` | `roomId: int`, `deviceIds: string[]?` | `CastStartResult` | Start casting; empty list uses the saved targets |
 | `StopCast` | `roomId: int`, `deviceIds: string[]?` | `int` | Stop casting the room, everywhere or on the given devices |
 | `GetCastSessions` | none | `CastSessionInfo[]` | Active cast sessions |
+| `GetTalkbackStatus` | `roomId: int` | `TalkbackStatus` | Nest push-to-talk capability and state; see [TALKBACK.md](TALKBACK.md) |
+| `StartTalkbackUplink` / `SetTalkbackRemoteDescription` / `AddTalkbackIceCandidate` / `StopTalkbackUplink` | `roomId: int`, … | | Microphone uplink peer connection |
+| `StartTalkback` / `StopTalkback` | `roomId: int` | `TalkbackStartResult` / void | Start or stop talking through the camera |
+| `SetTalkbackVolume` | `roomId: int`, `volume: double` | `TalkbackStatus` | Talkback gain 0.0–2.0 |
 
 ### Server-to-Client (On)
 
@@ -231,6 +235,8 @@ await connection.invoke("UpdateAudioSettings", {
 |-------|------------|-------------|
 | `ReceiveIceCandidate` | `candidate: string`, `sdpMid: string`, `sdpMLineIndex: int` | Server ICE candidate |
 | `CastStateChanged` | none | Cast devices or sessions changed; re-fetch `GetCastDevices` |
+| `TalkbackStatusChanged` | `status: TalkbackStatus` | A room's talkback state, availability or volume changed |
+| `ReceiveTalkbackIceCandidate` | `roomId: int`, `candidate: string`, `sdpMid: string`, `sdpMLineIndex: int` | Server ICE candidate for the microphone uplink |
 
 ## 6. Audio Format
 

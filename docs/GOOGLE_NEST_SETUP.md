@@ -42,6 +42,11 @@ BabyMonitarr supports Google Nest cameras via the Smart Device Management (SDM) 
 3. Click **Link Account** and complete the Google OAuth flow
 4. Your Nest devices will now appear as an option when creating a new monitor
 
+## Optional: Push-to-talk
+
+Talking through the camera's speaker from the app needs a separate Google Home credential; see
+[Google Home Setup for Nest Talkback](GOOGLE_HOME_TALKBACK_SETUP.md).
+
 ## Troubleshooting
 
 - Ensure your redirect URI matches exactly (including protocol and port)
