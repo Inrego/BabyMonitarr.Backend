@@ -26,7 +26,7 @@ public sealed class CastOptions
     public string? ReceiverAppId { get; set; } = PublishedReceiverAppId;
 
     /// <summary>The project's published receiver app.</summary>
-    public const string? PublishedReceiverAppId = null;
+    public const string PublishedReceiverAppId = "0604BA05";
 
     public int DiscoveryIntervalSeconds { get; set; } = 300;
     public int DiscoveryTimeoutSeconds { get; set; } = 5;

@@ -252,10 +252,55 @@ context.addCustomMessageListener(NAMESPACE, (event) => {
     }
 });
 
+// Nest Hubs send an app with no media session back to their dashboard 10 minutes after launch,
+// and re-launching plays the Hub's connection chime. So the page "plays" a still image through
+// the hidden CAF player and reloads it before the limit: a LOAD inside the running app, which
+// keeps the session alive with no reload and no chime (the trick Home Assistant's receiver uses).
+// The server ignores this media session; only the receiver status tells it the app is up.
+const KEEPALIVE_URL = new URL("keepalive.png", location.href).href;
+const KEEPALIVE_INTERVAL_MS = 9 * 60 * 1000;
+const playerManager = context.getPlayerManager();
+let keepAliveTimer = null;
+
+function keepAlive() {
+    clearTimeout(keepAliveTimer);
+    const request = new cast.framework.messages.LoadRequestData();
+    request.autoplay = true;
+    request.media = new cast.framework.messages.MediaInformation();
+    request.media.contentId = KEEPALIVE_URL;
+    request.media.contentType = "image/png";
+    request.media.streamType = cast.framework.messages.StreamType.NONE;
+    request.media.metadata = new cast.framework.messages.GenericMediaMetadata();
+    request.media.metadata.title = joined?.roomName || "BabyMonitarr";
+    playerManager.load(request).catch((err) => console.warn("[receiver] keepalive load failed", err));
+    keepAliveTimer = setTimeout(keepAlive, KEEPALIVE_INTERVAL_MS);
+}
+
+// The hidden player is only for the keepalive; anything else a sender loads would play unseen.
+playerManager.setMessageInterceptor(cast.framework.messages.MessageType.LOAD, (request) => {
+    if (request.media?.contentId === KEEPALIVE_URL) return request;
+    const error = new cast.framework.messages.ErrorData(cast.framework.messages.ErrorType.LOAD_FAILED);
+    error.reason = cast.framework.messages.ErrorReason.NOT_SUPPORTED;
+    return error;
+});
+
+// Stopping the keepalive media from the device's controls means stopping the cast, as it did
+// before the page had a media session: closing the app is what the server watches for.
+playerManager.setMessageInterceptor(cast.framework.messages.MessageType.STOP, () => {
+    context.stop();
+    return null;
+});
+
+context.addEventListener(cast.framework.system.EventType.READY, () => {
+    // Touch displays draw the player's controls over the page; the picture is all there is to see.
+    const controls = document.querySelector("touch-controls");
+    if (controls) controls.style.display = "none";
+    keepAlive();
+});
+
 context.start({
     customNamespaces: { [NAMESPACE]: cast.framework.system.MessageType.JSON },
-    // Nothing plays through the Cast media player, which would otherwise close the app as idle.
+    // The keepalive image has no end, but nothing should ever close the app as idle.
     disableIdleTimeout: true,
-    skipPlayersLoad: true,
     statusText: "BabyMonitarr"
 });

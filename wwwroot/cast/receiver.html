@@ -53,9 +53,15 @@
         #status:empty {
             display: none;
         }
+
+        /* Plays only the keepalive image (see receiver.js); the WebRTC video is what is shown. */
+        cast-media-player {
+            display: none;
+        }
     </style>
 </head>
 <body>
+    <cast-media-player></cast-media-player>
     <video id="video" autoplay playsinline></video>
     <div id="status">Starting…</div>
     <div id="overlay" class="faded"></div>
