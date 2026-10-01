@@ -197,20 +197,11 @@ public sealed class TalkbackUplinkService : ITalkbackUplinkService, IDisposable
         }
     }
 
-    /// <summary>
-    /// Windows reports an ICMP "port unreachable" as ConnectionReset on the socket's next receive,
-    /// and SIPSorcery 10.0.3 then stops receiving on that socket for good. The app trickles its own
-    /// loopback candidates (127.0.0.1, ::1), so one ICE check to such a candidate could leave the
-    /// uplink deaf. Linux does not report ICMP errors on unconnected UDP sockets.
-    /// </summary>
     private void IgnoreIcmpResets(RTCPeerConnection pc, string key)
     {
-        if (!OperatingSystem.IsWindows()) return;
-
-        const int SioUdpConnReset = unchecked((int)0x9800000C);
         try
         {
-            pc.GetRtpChannel().RtpSocket.IOControl(SioUdpConnReset, new byte[4], null);
+            IcmpResets.Ignore(pc);
         }
         catch (Exception ex)
         {

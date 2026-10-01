@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using BabyMonitarr.Backend.Services;
 using BabyMonitarr.Backend.Talkback.Foyer;
@@ -17,7 +18,7 @@ public interface IFoyerTalkbackStream : IAsyncDisposable
     Task StopTalkbackAsync(CancellationToken ct);
     Task ExtendAsync(CancellationToken ct);
 
-    /// <summary>Encodes and sends interleaved stereo 48 kHz PCM.</summary>
+    /// <summary>Queues interleaved stereo 48 kHz PCM for the stream's paced 20 ms sender.</summary>
     void SendPcm(short[] pcm);
 
     /// <summary>The stream ended without being disposed (peer connection failed or closed); carries a reason.</summary>
@@ -70,19 +71,43 @@ public sealed class FoyerTalkbackStreamFactory : IFoyerTalkbackStreamFactory
 /// recvonly (ignored), data channel, in the order Google expects. Separate from, and never
 /// touching, the SDM monitoring stream in <see cref="NestStreamReader"/>.
 /// </summary>
+/// <remarks>
+/// Like the Google Home web client, which sends a silent track from the moment the stream
+/// connects and swaps the microphone in at START, the stream sends Opus every 20 ms for its
+/// whole life: silence, or the talker's queued frames. This also smooths the uplink's arrival
+/// jitter. (As of 2026-10-01 the camera still does not play relayed audio; see the talkback
+/// research handoff notes.)
+/// </remarks>
 public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
 {
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan CloseTimeout = TimeSpan.FromSeconds(5);
+    private const int FrameSamples = 960;
+
+    /// <summary>About 200 ms of talker audio; older frames are dropped so a burst cannot build up delay.</summary>
+    private const int MaxQueuedFrames = 10;
+
+    /// <summary>After a stall longer than this, the sender resumes from now instead of bursting to catch up.</summary>
+    private const int MaxCatchUpSamples = 5 * FrameSamples;
 
     private readonly TalkbackTarget _target;
     private readonly FoyerClient _foyer;
     private readonly ILogger _logger;
     private readonly AudioFormat _opus = new(AudioCodecsEnum.OPUS, NestStreamReader.OpusPayloadType, 48000, 2, "minptime=10;useinbandfec=1");
     private readonly AudioEncoder _encoder = new(includeOpus: true);
+    private readonly ConcurrentQueue<short[]> _talkerFrames = new();
+    private readonly CancellationTokenSource _sendLoopCts = new();
+    private readonly AudioEncoder _cameraDecoder = new(includeOpus: true);
+    private readonly object _cameraLevelLock = new();
+    private double _cameraEnergy;
+    private long _cameraSamples;
+    private double _cameraLevelBeforeTalk = double.NegativeInfinity;
+    private long _cameraAudioPackets;
+    private long _cameraVideoPackets;
     private RTCPeerConnection? _pc;
     private string? _streamId;
     private long _framesSent;
+    private long _sentAllFrames;
     private int _disposed;
 
     public event Action<string>? Closed;
@@ -104,6 +129,15 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
             X_UseRtpFeedbackProfile = true,
         });
         _pc = pc;
+        try
+        {
+            IcmpResets.Ignore(pc);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Could not turn off ICMP resets for the talkback stream of room {RoomId}: {Error}", _target.RoomId, ex.Message);
+        }
+        pc.OnRtpPacketReceived += (_, media, packet) => OnCameraRtp(media, packet);
         pc.addTrack(new MediaStreamTrack(new List<AudioFormat> { _opus }, MediaStreamStatusEnum.SendRecv));
         pc.addTrack(new MediaStreamTrack(
             new List<VideoFormat>
@@ -203,19 +237,70 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
             "Talkback stream for room {RoomId} open in {TotalMs} ms (wake {WakeMs} ms, join {JoinMs} ms, connect {ConnectMs} ms, candidates {Added}/{Count})",
             _target.RoomId, clock.ElapsedMilliseconds, wokeMs, joinedMs - wokeMs, clock.ElapsedMilliseconds - joinedMs,
             added, candidates.Count);
+
+        _ = Task.Run(() => SendLoopAsync(_sendLoopCts.Token));
     }
 
     public async Task StartTalkbackAsync(CancellationToken ct)
     {
+        _talkerFrames.Clear();
         Interlocked.Exchange(ref _framesSent, 0);
+        Interlocked.Exchange(ref _sentAllFrames, 0);
+        _cameraLevelBeforeTalk = TakeCameraLevel();
         await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStart, ct);
     }
 
     public async Task StopTalkbackAsync(CancellationToken ct)
     {
-        _logger.LogDebug("Talkback stream for room {RoomId}: {Frames} audio frames sent to the camera",
-            _target.RoomId, Interlocked.Read(ref _framesSent));
+        _talkerFrames.Clear();
+        _logger.LogDebug(
+            "Talkback stream for room {RoomId}: {Frames} talker frames of {AllFrames} sent; camera RTP received audio {Audio} video {Video}; camera mic {Before:0.0} dBFS before, {During:0.0} dBFS while talking",
+            _target.RoomId, Interlocked.Read(ref _framesSent), Interlocked.Read(ref _sentAllFrames), Interlocked.Read(ref _cameraAudioPackets),
+            Interlocked.Read(ref _cameraVideoPackets), _cameraLevelBeforeTalk, TakeCameraLevel());
         await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStop, ct);
+    }
+
+    /// <summary>
+    /// Diagnostics only: what reaches us from the camera, and how loud its microphone is. The
+    /// camera hears its own speaker, so a louder level while talking means the voice played.
+    /// </summary>
+    private void OnCameraRtp(SDPMediaTypesEnum media, RTPPacket packet)
+    {
+        if (media == SDPMediaTypesEnum.video)
+        {
+            Interlocked.Increment(ref _cameraVideoPackets);
+            return;
+        }
+        if (media != SDPMediaTypesEnum.audio) return;
+
+        Interlocked.Increment(ref _cameraAudioPackets);
+        if (!_logger.IsEnabled(LogLevel.Debug)) return;
+        try
+        {
+            short[] pcm = _cameraDecoder.DecodeAudio(packet.Payload, _opus);
+            double energy = 0;
+            foreach (short s in pcm) energy += (double)s * s;
+            lock (_cameraLevelLock)
+            {
+                _cameraEnergy += energy;
+                _cameraSamples += pcm.Length;
+            }
+        }
+        catch (Exception)
+        {
+            // A frame that doesn't decode only skews a diagnostic.
+        }
+    }
+
+    private double TakeCameraLevel()
+    {
+        lock (_cameraLevelLock)
+        {
+            double rms = _cameraSamples == 0 ? 0 : Math.Sqrt(_cameraEnergy / _cameraSamples) / 32768.0;
+            _cameraEnergy = 0;
+            _cameraSamples = 0;
+            return rms > 0 ? 20 * Math.Log10(rms) : double.NegativeInfinity;
+        }
     }
 
     private async Task SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand command, CancellationToken ct)
@@ -247,20 +332,63 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
 
     public void SendPcm(short[] pcm)
     {
+        _talkerFrames.Enqueue(pcm);
+        while (_talkerFrames.Count > MaxQueuedFrames && _talkerFrames.TryDequeue(out _))
+        {
+        }
+    }
+
+    private async Task SendLoopAsync(CancellationToken ct)
+    {
+        int channels = _opus.ChannelCount;
+        var silence = new short[FrameSamples * channels];
+        var clock = Stopwatch.StartNew();
+        long sentSamples = 0;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                long dueSamples = (long)(clock.Elapsed.TotalSeconds * _opus.ClockRate);
+                if (dueSamples - sentSamples > MaxCatchUpSamples) sentSamples = dueSamples - FrameSamples;
+
+                while (sentSamples < dueSamples)
+                {
+                    bool fromTalker = _talkerFrames.TryDequeue(out var frame);
+                    frame = fromTalker ? frame! : silence;
+                    SendFrame(frame, fromTalker);
+                    sentSamples += frame.Length / channels;
+                }
+
+                double untilNextMs = (sentSamples - dueSamples) * 1000.0 / _opus.ClockRate;
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1, untilNextMs)), ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Talkback audio sender for room {RoomId} stopped: {Error}", _target.RoomId, ex.Message);
+        }
+    }
+
+    private void SendFrame(short[] pcm, bool fromTalker)
+    {
         var pc = _pc;
         if (pc == null || pc.connectionState != RTCPeerConnectionState.connected) return;
 
         byte[] encoded = _encoder.EncodeAudio(pcm, _opus);
-        if (encoded.Length > 0)
-        {
-            pc.SendAudio((uint)(pcm.Length / _opus.ChannelCount), encoded);
-            Interlocked.Increment(ref _framesSent);
-        }
+        if (encoded.Length == 0) return;
+
+        pc.SendAudio((uint)(pcm.Length / _opus.ChannelCount), encoded);
+        Interlocked.Increment(ref _sentAllFrames);
+        if (fromTalker) Interlocked.Increment(ref _framesSent);
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+        _sendLoopCts.Cancel();
 
         if (_streamId != null)
         {
