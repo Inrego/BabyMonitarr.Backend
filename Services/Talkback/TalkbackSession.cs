@@ -44,6 +44,8 @@ public sealed class TalkbackSession : IAsyncDisposable
     private bool _pendingCancelled;
     private long _talkStartedAt;
     private long _lastAudioAt;
+    private long _talkFrames;
+    private int _talkPeak;
     private double _volume;
     private bool _disposed;
 
@@ -171,6 +173,8 @@ public sealed class TalkbackSession : IAsyncDisposable
             LastError = null;
             Volatile.Write(ref _talkStartedAt, now);
             Volatile.Write(ref _lastAudioAt, now);
+            Interlocked.Exchange(ref _talkFrames, 0);
+            Interlocked.Exchange(ref _talkPeak, 0);
             _watchdog = _time.CreateTimer(_ => CheckTalker(), null, WatchdogTick, WatchdogTick);
             SetState(TalkbackState.Talking);
             _logger.LogInformation("Talkback started in room {RoomId}", Target.RoomId);
@@ -202,7 +206,11 @@ public sealed class TalkbackSession : IAsyncDisposable
         {
             if (State != TalkbackState.Talking || Talker != connectionId) return;
 
-            _logger.LogInformation("Talkback stopped in room {RoomId}: {Why}", Target.RoomId, why);
+            int peak = Volatile.Read(ref _talkPeak);
+            _logger.LogInformation(
+                "Talkback stopped in room {RoomId}: {Why} ({Frames} audio frames, input peak {PeakDbfs:0} dBFS)",
+                Target.RoomId, why, Interlocked.Read(ref _talkFrames),
+                peak == 0 ? double.NegativeInfinity : 20 * Math.Log10(peak / 32768.0));
             StopWatchdog();
             Talker = null;
 
@@ -228,6 +236,10 @@ public sealed class TalkbackSession : IAsyncDisposable
         if (State != TalkbackState.Talking || Talker != connectionId) return;
 
         Volatile.Write(ref _lastAudioAt, _time.GetTimestamp());
+        Interlocked.Increment(ref _talkFrames);
+        int peak = 0;
+        foreach (short s in pcm) peak = Math.Max(peak, Math.Abs((int)s));
+        if (peak > Volatile.Read(ref _talkPeak)) Volatile.Write(ref _talkPeak, peak);
         TalkbackGain.Apply(pcm, Volume);
         _stream?.SendPcm(pcm);
     }

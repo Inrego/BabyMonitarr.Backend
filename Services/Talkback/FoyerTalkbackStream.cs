@@ -82,6 +82,7 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
     private readonly AudioEncoder _encoder = new(includeOpus: true);
     private RTCPeerConnection? _pc;
     private string? _streamId;
+    private long _framesSent;
     private int _disposed;
 
     public event Action<string>? Closed;
@@ -168,6 +169,9 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
         }
 
         var (cleanedSdp, candidates) = NestSdp.SplitCandidates(join.Sdp);
+        _logger.LogDebug("Talkback stream for room {RoomId}: camera answer media {Media}", _target.RoomId,
+            string.Join(", ", cleanedSdp.Split('\n').Select(l => l.Trim())
+                .Where(l => l.StartsWith("m=") || l is "a=sendrecv" or "a=recvonly" or "a=sendonly" or "a=inactive")));
         var result = pc.setRemoteDescription(new RTCSessionDescriptionInit { type = RTCSdpType.answer, sdp = cleanedSdp });
         if (result != SetDescriptionResultEnum.OK)
         {
@@ -201,17 +205,30 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
             added, candidates.Count);
     }
 
-    public async Task StartTalkbackAsync(CancellationToken ct) => await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStart, ct);
+    public async Task StartTalkbackAsync(CancellationToken ct)
+    {
+        Interlocked.Exchange(ref _framesSent, 0);
+        await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStart, ct);
+    }
 
-    public async Task StopTalkbackAsync(CancellationToken ct) => await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStop, ct);
+    public async Task StopTalkbackAsync(CancellationToken ct)
+    {
+        _logger.LogDebug("Talkback stream for room {RoomId}: {Frames} audio frames sent to the camera",
+            _target.RoomId, Interlocked.Read(ref _framesSent));
+        await SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand.CommandStop, ct);
+    }
 
-    private Task SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand command, CancellationToken ct) =>
-        _foyer.CallAsync("CameraService", "SendTalkback", new SendTalkbackRequest
+    private async Task SendTalkbackAsync(SendTalkbackRequest.Types.TalkbackCommand command, CancellationToken ct)
+    {
+        var response = await _foyer.CallAsync("CameraService", "SendTalkback", new SendTalkbackRequest
         {
             GoogleDeviceId = _target.GoogleUuid,
             StreamId = _streamId ?? string.Empty,
             Command = command,
         }, SendTalkbackResponse.Parser, ct);
+        _logger.LogDebug("Talkback stream for room {RoomId}: SendTalkback {Command} status {Status}",
+            _target.RoomId, command, response.Status);
+    }
 
     public async Task ExtendAsync(CancellationToken ct)
     {
@@ -237,6 +254,7 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
         if (encoded.Length > 0)
         {
             pc.SendAudio((uint)(pcm.Length / _opus.ChannelCount), encoded);
+            Interlocked.Increment(ref _framesSent);
         }
     }
 
