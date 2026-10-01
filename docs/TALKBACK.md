@@ -89,6 +89,20 @@ continuous talking. Each of these is broadcast as a `TalkbackStatusChanged` with
    "connecting" until both are done, then "talking". Duck/mute the room's incoming audio.
 3. Release: `StopTalkback`, then `StopTalkbackUplink` (releases the mic). Restore room audio.
 
+## Camera stream audio (backend → Foyer)
+
+The backend sends Opus every 20 ms for the Foyer stream's whole life: silence, or the talker's frames
+after the gain/limiter stage. Every audio RTP packet carries the RFC 6464 audio level header extension
+(`urn:ietf:params:rtp-hdrext:ssrc-audio-level`, offered as `a=extmap:1` on the audio m-line, like the
+Google Home web client): the level of the PCM actually encoded, in −dBov, with the V bit set unless
+the frame is digital silence (filler frames go out as level 127, V=0).
+
+**This extension is required.** Google's media relay plays uplink talkback audio only when the
+packets carry it; without it `SendTalkback START` succeeds but the camera stays silent (observed
+2026-10-01, confirmed audibly). Bitrate, abs-send-time and transport-cc made no difference. The
+research spike that played on 2026-09-30 did not send it, so the relay's behaviour changed in
+between.
+
 ## Backend configuration
 
 - Google Home credential: System page → *Google Home (talkback)*. Stored server-side, never returned

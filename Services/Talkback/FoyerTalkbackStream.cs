@@ -75,8 +75,8 @@ public sealed class FoyerTalkbackStreamFactory : IFoyerTalkbackStreamFactory
 /// Like the Google Home web client, which sends a silent track from the moment the stream
 /// connects and swaps the microphone in at START, the stream sends Opus every 20 ms for its
 /// whole life: silence, or the talker's queued frames. This also smooths the uplink's arrival
-/// jitter. (As of 2026-10-01 the camera still does not play relayed audio; see the talkback
-/// research handoff notes.)
+/// jitter. Every audio packet carries the RFC 6464 audio level header extension
+/// (<see cref="TalkbackAudioLevel"/>): Google's relay plays nothing without it (2026-10-01).
 /// </remarks>
 public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
 {
@@ -122,6 +122,8 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
     /// <summary>
     /// The peer connection Google expects, before any signalling: audio sendrecv Opus, video
     /// recvonly H264, data channel, in that order (same construction as the talkback spike).
+    /// The audio m-line offers the ssrc-audio-level extension (extmap <see cref="TalkbackAudioLevel.ExtensionId"/>),
+    /// without which Google's relay drops the talkback audio.
     /// </summary>
     public static async Task<RTCPeerConnection> CreatePeerConnectionAsync(AudioFormat opus)
     {
@@ -130,7 +132,10 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
             iceServers = new List<RTCIceServer> { new() { urls = "stun:stun.l.google.com:19302" } },
             X_UseRtpFeedbackProfile = true,
         });
-        pc.addTrack(new MediaStreamTrack(new List<AudioFormat> { opus }, MediaStreamStatusEnum.SendRecv));
+        var audio = new MediaStreamTrack(new List<AudioFormat> { opus }, MediaStreamStatusEnum.SendRecv);
+        var audioLevel = TalkbackAudioLevel.CreateExtension();
+        audio.HeaderExtensions[audioLevel.Id] = audioLevel;
+        pc.addTrack(audio);
         pc.addTrack(new MediaStreamTrack(
             new List<VideoFormat>
             {
@@ -396,6 +401,8 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
         byte[] encoded = _encoder.EncodeAudio(pcm, _opus);
         if (encoded.Length == 0) return;
 
+        // The level of the PCM actually encoded (talker frames are already past the session's gain).
+        TalkbackAudioLevel.SetForNextPacket(pc.AudioStream, pcm);
         pc.SendAudio((uint)(pcm.Length / _opus.ChannelCount), encoded);
         Interlocked.Increment(ref _sentAllFrames);
         if (fromTalker) Interlocked.Increment(ref _framesSent);
