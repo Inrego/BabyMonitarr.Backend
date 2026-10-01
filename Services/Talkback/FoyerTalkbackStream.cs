@@ -119,15 +119,37 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
         _logger = logger;
     }
 
-    internal async Task ConnectAsync(CancellationToken ct)
+    /// <summary>
+    /// The peer connection Google expects, before any signalling: audio sendrecv Opus, video
+    /// recvonly H264, data channel, in that order (same construction as the talkback spike).
+    /// </summary>
+    public static async Task<RTCPeerConnection> CreatePeerConnectionAsync(AudioFormat opus)
     {
-        var clock = Stopwatch.StartNew();
-
         var pc = new RTCPeerConnection(new RTCConfiguration
         {
             iceServers = new List<RTCIceServer> { new() { urls = "stun:stun.l.google.com:19302" } },
             X_UseRtpFeedbackProfile = true,
         });
+        pc.addTrack(new MediaStreamTrack(new List<AudioFormat> { opus }, MediaStreamStatusEnum.SendRecv));
+        pc.addTrack(new MediaStreamTrack(
+            new List<VideoFormat>
+            {
+                new(VideoCodecsEnum.H264, NestStreamReader.H264PayloadType, 90000,
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"),
+            },
+            MediaStreamStatusEnum.RecvOnly));
+        await pc.createDataChannel("data", new RTCDataChannelInit());
+        return pc;
+    }
+
+    /// <summary>The offer SDP as sent to JoinStream (Google wants the codec name lower-case).</summary>
+    public static string OfferSdpForFoyer(RTCSessionDescriptionInit offer) => offer.sdp.Replace("OPUS", "opus");
+
+    internal async Task ConnectAsync(CancellationToken ct)
+    {
+        var clock = Stopwatch.StartNew();
+
+        var pc = await CreatePeerConnectionAsync(_opus);
         _pc = pc;
         try
         {
@@ -138,15 +160,6 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
             _logger.LogWarning("Could not turn off ICMP resets for the talkback stream of room {RoomId}: {Error}", _target.RoomId, ex.Message);
         }
         pc.OnRtpPacketReceived += (_, media, packet) => OnCameraRtp(media, packet);
-        pc.addTrack(new MediaStreamTrack(new List<AudioFormat> { _opus }, MediaStreamStatusEnum.SendRecv));
-        pc.addTrack(new MediaStreamTrack(
-            new List<VideoFormat>
-            {
-                new(VideoCodecsEnum.H264, NestStreamReader.H264PayloadType, 90000,
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"),
-            },
-            MediaStreamStatusEnum.RecvOnly));
-        await pc.createDataChannel("data", new RTCDataChannelInit());
 
         var connected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         pc.onconnectionstatechange += state =>
@@ -165,6 +178,8 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
 
         var offer = pc.createOffer();
         await pc.setLocalDescription(offer);
+        string offerSdp = OfferSdpForFoyer(offer);
+        _logger.LogDebug("Talkback stream for room {RoomId}: offer SDP\n{Sdp}", _target.RoomId, offerSdp);
 
         try
         {
@@ -188,7 +203,7 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
         {
             Command = "offer",
             DeviceId = _target.NestDeviceId,
-            Sdp = offer.sdp.Replace("OPUS", "opus"),
+            Sdp = offerSdp,
             Local = false,
             StreamContext = JoinStreamRequest.Types.StreamContext.Default,
             RequestedVideoResolution = JoinStreamRequest.Types.VideoResolution.Standard,
@@ -202,6 +217,7 @@ public sealed class FoyerTalkbackStream : IFoyerTalkbackStream
                 $"The camera did not answer the stream request (response '{join.ResponseType}').");
         }
 
+        _logger.LogDebug("Talkback stream for room {RoomId}: answer SDP\n{Sdp}", _target.RoomId, join.Sdp);
         var (cleanedSdp, candidates) = NestSdp.SplitCandidates(join.Sdp);
         _logger.LogDebug("Talkback stream for room {RoomId}: camera answer media {Media}", _target.RoomId,
             string.Join(", ", cleanedSdp.Split('\n').Select(l => l.Trim())
