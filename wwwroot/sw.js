@@ -1,4 +1,6 @@
-const CACHE_NAME = 'babymonitarr-v2';
+// Keyed to the app version the page registers us with, so each release installs a new
+// worker and the activate handler drops the previous release's cache.
+const CACHE_NAME = 'babymonitarr-' + (new URL(self.location).searchParams.get('v') || 'dev');
 const STATIC_ASSETS = [
     '/',
     '/css/site.css',

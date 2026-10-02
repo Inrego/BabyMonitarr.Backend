@@ -78,7 +78,7 @@
     @await RenderSectionAsync("Scripts", required: false)
     <script>
         if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/sw.js').catch(function(err) {
+            navigator.serviceWorker.register('/sw.js?v=@(Uri.EscapeDataString(AppVersionProvider.DisplayVersion))').catch(function(err) {
                 console.warn('Service worker registration failed:', err);
             });
         }
