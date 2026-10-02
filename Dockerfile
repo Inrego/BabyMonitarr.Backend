@@ -1,10 +1,12 @@
-# Build stage
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+# Build stage. Runs natively on the build host and cross-compiles for the target
+# arch: Grpc.Tools' protoc segfaults under QEMU, so the SDK must not be emulated.
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+ARG TARGETARCH
 WORKDIR /src
 
 # Copy csproj and restore (layer caching)
 COPY BabyMonitarr.Backend.csproj .
-RUN dotnet restore
+RUN dotnet restore -a $TARGETARCH
 
 # Install libman and restore client-side libraries (Bootstrap, jQuery, SignalR JS are gitignored)
 COPY libman.json .
@@ -15,7 +17,7 @@ RUN dotnet tool install -g Microsoft.Web.LibraryManager.Cli && \
 # Copy everything else and publish
 COPY . .
 ARG APP_VERSION=1.0.0
-RUN dotnet publish BabyMonitarr.Backend.csproj -c Release -o /app/publish \
+RUN dotnet publish BabyMonitarr.Backend.csproj -c Release -a $TARGETARCH --no-self-contained -o /app/publish \
     -p:Version=${APP_VERSION} \
     -p:AssemblyVersion=${APP_VERSION}.0 \
     -p:FileVersion=${APP_VERSION}.0 \
