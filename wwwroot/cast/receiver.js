@@ -15,8 +15,9 @@ const RESTART_DELAY_MS = 2000;
 const videoEl = document.getElementById("video");
 const statusEl = document.getElementById("status");
 const overlayEl = document.getElementById("overlay");
+// Attached to the video only once a track arrives: a Nest Hub never acknowledges CAF's "ready"
+// from a page whose video already holds a MediaStream, so the launch hangs on "Starting…".
 const mediaStream = new MediaStream();
-videoEl.srcObject = mediaStream;
 
 let token = null;
 let serverUrl = null;       // null: the page is served by the backend itself
@@ -109,6 +110,7 @@ async function startStream(kind) {
                 mediaStream.removeTrack(track);
             }
             mediaStream.addTrack(event.track);
+            if (videoEl.srcObject !== mediaStream) videoEl.srcObject = mediaStream;
             void play();
             if (event.track.kind === "video") setStatus("");
         };
@@ -164,7 +166,9 @@ async function play() {
 }
 
 async function addServerCandidate(kind, candidate, sdpMid, sdpMLineIndex) {
-    const init = { candidate, sdpMid, sdpMLineIndex };
+    // The server sends SIPSorcery's candidate without the "candidate:" prefix, which Chrome rejects.
+    const line = candidate.startsWith("candidate:") ? candidate : `candidate:${candidate}`;
+    const init = { candidate: line, sdpMid, sdpMLineIndex };
     const pc = peers[kind];
     if (!pc || !pc.remoteDescription) {
         (pendingCandidates[kind] ||= []).push(init);
