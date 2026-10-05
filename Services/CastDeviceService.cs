@@ -184,7 +184,7 @@ public sealed class CastDeviceService : ICastDeviceService, IHostedService, IDis
         // Connect once so a typo surfaces immediately instead of at cast time.
         try
         {
-            var client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
+            var client = CastClientFactory.Create(_loggerFactory);
             await client.ConnectChromecast(new ChromecastReceiver
             {
                 DeviceUri = new Uri($"https://{host}"),

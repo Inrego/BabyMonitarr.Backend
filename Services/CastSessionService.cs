@@ -354,7 +354,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     /// </summary>
     private async Task<ChromecastClient> ConnectAndLoadAsync(CastSession session, CastDevice device)
     {
-        var client = new ChromecastClient(_loggerFactory.CreateLogger<ChromecastClient>());
+        var client = CastClientFactory.Create(_loggerFactory);
         try
         {
             await client.ConnectChromecast(_devices.ToReceiver(device));
