@@ -94,6 +94,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     private readonly ICastHlsStreamService _streams;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IHubContext<AudioStreamHub> _hub;
+    private readonly IHubContext<CastReceiverHub> _receiverHub;
     private readonly IOptionsMonitor<CastOptions> _castOptions;
     private readonly IOptionsMonitor<WebRtcOptions> _webRtcOptions;
     private readonly IServer? _server;
@@ -110,6 +111,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         ICastHlsStreamService streams,
         IServiceScopeFactory scopeFactory,
         IHubContext<AudioStreamHub> hub,
+        IHubContext<CastReceiverHub> receiverHub,
         IOptionsMonitor<CastOptions> castOptions,
         IOptionsMonitor<WebRtcOptions> webRtcOptions,
         IServer? server = null)
@@ -120,6 +122,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         _streams = streams;
         _scopeFactory = scopeFactory;
         _hub = hub;
+        _receiverHub = receiverHub;
         _castOptions = castOptions;
         _webRtcOptions = webRtcOptions;
         _server = server;
@@ -319,6 +322,18 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     {
         if (session.Stream != null) _streams.Release(session.Stream);
         if (session.ReceiverToken != null) _receiverTickets.TryRemove(session.ReceiverToken, out _);
+        CloseReceiver(session);
+    }
+
+    /// <summary>
+    /// Tells a WebRTC receiver page its session is over so it closes the app itself. The cast
+    /// channel's STOP alone is not enough: once Sharpcaster's receive loop has died on a message
+    /// it cannot parse, the STOP never lands and the page keeps streaming.
+    /// </summary>
+    private void CloseReceiver(CastSession session)
+    {
+        if (session.ReceiverToken == null) return;
+        _ = _receiverHub.Clients.Group(CastReceiverHub.GroupFor(session.ReceiverToken)).SendAsync("SessionEnded");
     }
 
     public CastReceiverTicket? ResolveReceiverToken(string token) =>
@@ -421,6 +436,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             _gate.Release();
         }
 
+        CloseReceiver(session);
         try
         {
             await session.Client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().StopApplication();

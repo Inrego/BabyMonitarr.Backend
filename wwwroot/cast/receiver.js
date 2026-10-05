@@ -55,10 +55,16 @@ function isEndedError(err) {
     return /cast session has ended/i.test(err?.message || "");
 }
 
+// Stopping a cast closes the app, back to the device's own screen. The server tells the page
+// directly because its cast-channel STOP does not always reach the device.
 function onSessionEnded() {
+    if (ended) return;
     ended = true;
     Object.keys(peers).forEach(closePeer);
     setStatus("Casting ended");
+    clearTimeout(keepAliveTimer);
+    void connection?.stop();
+    context.stop();
 }
 
 function closePeer(kind) {
@@ -212,6 +218,7 @@ async function connect() {
     connection.on("IceCandidate", (kind, candidate, sdpMid, sdpMLineIndex) =>
         void addServerCandidate(kind, candidate, sdpMid, sdpMLineIndex));
     connection.on("PeerClosed", (kind) => scheduleRestart(kind, RESTART_DELAY_MS));
+    connection.on("SessionEnded", onSessionEnded);
 
     connection.onreconnecting(() => setStatus("Reconnecting…"));
     connection.onreconnected(() => {

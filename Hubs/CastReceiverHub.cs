@@ -51,13 +51,17 @@ public class CastReceiverHub : Hub
         await base.OnDisconnectedAsync(exception);
     }
 
-    public CastReceiverJoinResult Join(string token)
+    /// <summary>The receivers playing one cast session, so ending it can tell them to close.</summary>
+    public static string GroupFor(string token) => $"cast-receiver:{token}";
+
+    public async Task<CastReceiverJoinResult> Join(string token)
     {
         var ticket = _castSessionService.ResolveReceiverToken(token)
             ?? throw new HubException("This cast session has ended.");
 
         Context.Items[TokenKey] = token;
         _peers.Register(Context.ConnectionId);
+        await Groups.AddToGroupAsync(Context.ConnectionId, GroupFor(token));
         _logger.LogInformation(
             "Cast receiver {ConnectionId} joined room {RoomId}", Context.ConnectionId, ticket.RoomId);
 
