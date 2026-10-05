@@ -59,6 +59,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
 
     /// <summary>How long a freshly launched receiver page gets to register its message listener.</summary>
     private static readonly TimeSpan ReceiverReadyTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan StopReplyTimeout = TimeSpan.FromSeconds(3);
 
     private sealed class CastSession
     {
@@ -439,7 +440,11 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         CloseReceiver(session);
         try
         {
-            await session.Client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().StopApplication();
+            // Bounded: once Sharpcaster's receive loop has died the reply never arrives, and the
+            // caller's hub connection is blocked for the library's 30 s timeout. The receiver
+            // page closes itself on SessionEnded anyway.
+            await session.Client.GetChannel<Sharpcaster.Channels.ReceiverChannel>().StopApplication()
+                .WaitAsync(StopReplyTimeout);
         }
         catch (Exception ex)
         {
