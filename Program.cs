@@ -132,6 +132,8 @@ using (var scope = app.Services.CreateScope())
     EnsureCastTables(db);
     EnsureHaTables(db);
     EnsureTalkbackSchema(db);
+    AddColumnIfMissing(db, "GlobalSettings", "CastSoundGraph",
+        "ALTER TABLE GlobalSettings ADD COLUMN CastSoundGraph INTEGER NOT NULL DEFAULT 0;");
 
     // Seed from appsettings.json if DB has no rooms yet
     if (!db.Rooms.Any())

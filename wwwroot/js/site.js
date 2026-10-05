@@ -377,12 +377,19 @@ async function saveRoomConfig() {
         volumeAdjustmentDb: -15.0
     };
 
+    // Saved on its own: UpdateAudioSettings leaves it untouched.
+    const castSoundGraph = document.getElementById('castSoundGraph')?.checked || false;
+
     try {
         // Save room and global settings in parallel
         const [updatedRoomResult] = await Promise.all([
             connection.invoke("UpdateRoom", updatedRoom),
-            connection.invoke("UpdateAudioSettings", audioSettings)
+            connection.invoke("UpdateAudioSettings", audioSettings),
+            castSoundGraph !== !!globalSettings?.castSoundGraph
+                ? connection.invoke("SetCastSoundGraph", castSoundGraph)
+                : Promise.resolve()
         ]);
+        if (globalSettings) globalSettings.castSoundGraph = castSoundGraph;
 
         if (updatedRoomResult) {
             await saveTalkbackCamera(room, updatedRoom);
@@ -446,6 +453,9 @@ function updateGlobalSettingsUI(settings) {
 
     const lowPassInput = document.getElementById('lowPassFrequency');
     if (lowPassInput) lowPassInput.value = settings.lowPassFrequency;
+
+    const castSoundGraphInput = document.getElementById('castSoundGraph');
+    if (castSoundGraphInput) castSoundGraphInput.checked = !!settings.castSoundGraph;
 }
 
 // ===== WebRTC Implementation =====

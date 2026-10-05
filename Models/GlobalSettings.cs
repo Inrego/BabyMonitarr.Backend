@@ -10,4 +10,10 @@ public class GlobalSettings
     public int HighPassFrequency { get; set; } = 300;
     public int ThresholdPauseDuration { get; set; } = 30;
     public double VolumeAdjustmentDb { get; set; } = -15.0;
+
+    /// <summary>
+    /// Draws the sound level graph over the video on cast displays. Set only through
+    /// <c>SetCastSoundGraph</c>: the settings pages save the other fields as one object.
+    /// </summary>
+    public bool CastSoundGraph { get; set; }
 }

@@ -25,6 +25,7 @@ public class CastReceiverHub : Hub
     private readonly IVideoWebRtcService _videoWebRtcService;
     private readonly IAudioWebRtcService _audioWebRtcService;
     private readonly IWebRtcConfigService _webRtcConfigService;
+    private readonly IRoomService _roomService;
     private readonly CastReceiverPeers _peers;
 
     public CastReceiverHub(
@@ -33,6 +34,7 @@ public class CastReceiverHub : Hub
         IVideoWebRtcService videoWebRtcService,
         IAudioWebRtcService audioWebRtcService,
         IWebRtcConfigService webRtcConfigService,
+        IRoomService roomService,
         CastReceiverPeers peers)
     {
         _logger = logger;
@@ -40,6 +42,7 @@ public class CastReceiverHub : Hub
         _videoWebRtcService = videoWebRtcService;
         _audioWebRtcService = audioWebRtcService;
         _webRtcConfigService = webRtcConfigService;
+        _roomService = roomService;
         _peers = peers;
     }
 
@@ -70,6 +73,7 @@ public class CastReceiverHub : Hub
             RoomName = ticket.RoomName,
             Video = ticket.Video,
             Audio = ticket.Audio,
+            SoundGraph = (await _roomService.GetGlobalSettingsAsync()).CastSoundGraph,
             IceServers = _webRtcConfigService.GetClientConfig().IceServers
         };
     }
