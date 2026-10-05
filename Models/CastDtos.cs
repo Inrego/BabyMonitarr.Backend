@@ -41,6 +41,10 @@ public sealed class CastReceiverJoinResult
     public string RoomName { get; set; } = string.Empty;
     public bool Video { get; set; }
     public bool Audio { get; set; }
+
+    /// <summary>Draw the sound level graph over the video; later changes arrive as "SoundGraph".</summary>
+    public bool SoundGraph { get; set; }
+
     public List<WebRtcClientIceServer> IceServers { get; set; } = new();
 }
 

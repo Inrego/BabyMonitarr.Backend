@@ -25,6 +25,7 @@ public class AudioStreamHub : Hub
     private readonly ITalkbackService _talkbackService;
     private readonly ITalkbackUplinkService _talkbackUplinkService;
     private readonly IGoogleHomeAuthService _googleHomeAuthService;
+    private readonly IHubContext<CastReceiverHub> _castReceiverHub;
 
     public AudioStreamHub(
         ILogger<AudioStreamHub> logger,
@@ -40,7 +41,8 @@ public class AudioStreamHub : Hub
         ICastSessionService castSessionService,
         ITalkbackService talkbackService,
         ITalkbackUplinkService talkbackUplinkService,
-        IGoogleHomeAuthService googleHomeAuthService)
+        IGoogleHomeAuthService googleHomeAuthService,
+        IHubContext<CastReceiverHub> castReceiverHub)
     {
         _logger = logger;
         _audioWebRtcService = audioWebRtcService;
@@ -56,6 +58,7 @@ public class AudioStreamHub : Hub
         _talkbackService = talkbackService;
         _talkbackUplinkService = talkbackUplinkService;
         _googleHomeAuthService = googleHomeAuthService;
+        _castReceiverHub = castReceiverHub;
     }
 
     public override async Task OnConnectedAsync()
@@ -258,6 +261,15 @@ public class AudioStreamHub : Hub
         // Refresh audio streaming service so processors pick up new settings
         _audioStreamingService.RefreshRooms();
 
+        await Clients.Others.SendAsync("SettingsUpdated");
+    }
+
+    /// <summary>Shows or hides the sound level graph on every cast display, including running casts.</summary>
+    public async Task SetCastSoundGraph(bool enabled)
+    {
+        _logger.LogInformation("Client {ConnectionId} set the cast sound graph to {Enabled}", Context.ConnectionId, enabled);
+        await _roomService.SetCastSoundGraphAsync(enabled);
+        await _castReceiverHub.Clients.All.SendAsync("SoundGraph", enabled);
         await Clients.Others.SendAsync("SettingsUpdated");
     }
     #endregion

@@ -29,6 +29,20 @@ const pendingCandidates = {}; // kind -> server candidates that arrived before t
 const restartTimers = {};   // kind -> timeout id
 let overlayTimer = null;
 
+// The app's five-minute sound level graph, drawn over the video when the server's global
+// "sound graph on cast" setting is on. Levels come from the audio peer's data channel, on the
+// app's scale and zones: -90..0 dB shown as 0..100, colour changing at 40 and 55.
+const GRAPH_WINDOW_MS = 5 * 60 * 1000;
+const GRAPH_SAMPLE_MS = 500;
+// Samples further apart than this mean the audio dropped; the line breaks rather than bridging it.
+const GRAPH_GAP_MS = 3000;
+const GRAPH_MIN_DB = -90;
+const GRAPH_ZONES = [40, 55];
+const GRAPH_COLORS = ["#88D5C3", "#FFB088", "#FF8B94"];
+const graphEl = document.getElementById("soundGraph");
+const graphHistory = [];    // { t, v } with v on the 0..100 display scale, oldest first
+let graphShown = false;
+
 function setStatus(text) {
     statusEl.textContent = text || "";
 }
@@ -39,6 +53,107 @@ function showRoomName(name) {
     clearTimeout(overlayTimer);
     overlayTimer = setTimeout(() => overlayEl.classList.add("faded"), 5000);
 }
+
+function displayLevel(db) {
+    const clamped = Math.min(0, Math.max(GRAPH_MIN_DB, db));
+    return ((clamped - GRAPH_MIN_DB) / -GRAPH_MIN_DB) * 100;
+}
+
+function onAudioLevel(db) {
+    const now = Date.now();
+    const last = graphHistory[graphHistory.length - 1];
+    if (last && now - last.t < GRAPH_SAMPLE_MS) return;
+    graphHistory.push({ t: now, v: displayLevel(db) });
+    while (graphHistory[0].t < now - GRAPH_WINDOW_MS) graphHistory.shift();
+    drawSoundGraph();
+}
+
+function applySoundGraph() {
+    graphShown = !!(joined?.soundGraph && joined.audio);
+    graphEl.hidden = !graphShown;
+    document.body.classList.toggle("sound-graph", graphShown);
+    drawSoundGraph();
+}
+
+function zoneColor(v) {
+    const zone = GRAPH_ZONES.findIndex((limit) => v < limit);
+    return GRAPH_COLORS[zone === -1 ? GRAPH_ZONES.length : zone];
+}
+
+function drawSoundGraph() {
+    if (!graphShown) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(graphEl.clientWidth * dpr);
+    const h = Math.round(graphEl.clientHeight * dpr);
+    if (graphEl.width !== w || graphEl.height !== h) {
+        graphEl.width = w;
+        graphEl.height = h;
+    }
+    const ctx = graphEl.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    const now = Date.now();
+    const pad = 10 * dpr;
+    const x = (t) => (w - pad) * (1 - (now - t) / GRAPH_WINDOW_MS);
+    const y = (v) => pad + (h - 2 * pad) * (1 - v / 100);
+
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.setLineDash([6 * dpr, 6 * dpr]);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+    for (const limit of GRAPH_ZONES) {
+        ctx.beginPath();
+        ctx.moveTo(0, y(limit));
+        ctx.lineTo(w, y(limit));
+        ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    if (graphHistory.length === 0) return;
+
+    // Smoothed through the midpoints between samples, the way the app's curved line reads.
+    ctx.beginPath();
+    graphHistory.forEach((p, i) => {
+        const prev = graphHistory[i - 1];
+        if (!prev || p.t - prev.t > GRAPH_GAP_MS) {
+            ctx.moveTo(x(p.t), y(p.v));
+        } else {
+            const mx = (x(prev.t) + x(p.t)) / 2;
+            const my = (y(prev.v) + y(p.v)) / 2;
+            ctx.quadraticCurveTo(x(prev.t), y(prev.v), mx, my);
+            if (i === graphHistory.length - 1) ctx.lineTo(x(p.t), y(p.v));
+        }
+    });
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    // A dark halo first, so the pastel line stays visible on a white picture.
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.lineWidth = 8 * dpr;
+    ctx.stroke();
+
+    // Coloured by height with hard stops at the zone limits: the app's per-zone segments.
+    const gradient = ctx.createLinearGradient(0, y(0), 0, y(100));
+    let from = 0;
+    GRAPH_COLORS.forEach((color, i) => {
+        const to = i < GRAPH_ZONES.length ? GRAPH_ZONES[i] / 100 : 1;
+        gradient.addColorStop(from, color);
+        gradient.addColorStop(to, color);
+        from = to;
+    });
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = 4 * dpr;
+    ctx.stroke();
+
+    const head = graphHistory[graphHistory.length - 1];
+    ctx.beginPath();
+    ctx.arc(x(head.t), y(head.v), 6 * dpr, 0, 2 * Math.PI);
+    ctx.fillStyle = zoneColor(head.v);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.lineWidth = 2.5 * dpr;
+    ctx.stroke();
+}
+
+window.addEventListener("resize", drawSoundGraph);
 
 function normalizeIceServers(servers) {
     return (servers || [])
@@ -121,6 +236,19 @@ async function startStream(kind) {
             if (event.track.kind === "video") setStatus("");
         };
 
+        // The server's audio peer carries the room's levels, as it does for the dashboard.
+        pc.ondatachannel = (event) => {
+            event.channel.onmessage = (msg) => {
+                if (peers[kind] !== pc) return;
+                try {
+                    const message = JSON.parse(msg.data);
+                    if (message.type === "audioLevel") onAudioLevel(message.level);
+                } catch {
+                    /* not a level message */
+                }
+            };
+        };
+
         pc.onconnectionstatechange = () => {
             if (peers[kind] !== pc) return;
             const state = pc.connectionState;
@@ -197,6 +325,7 @@ async function joinAndStream() {
     }
 
     showRoomName(joined.roomName);
+    applySoundGraph();
     Object.keys(peers).forEach(closePeer);
     if (joined.video) void startStream("video");
     if (joined.audio) void startStream("audio");
@@ -219,6 +348,11 @@ async function connect() {
         void addServerCandidate(kind, candidate, sdpMid, sdpMLineIndex));
     connection.on("PeerClosed", (kind) => scheduleRestart(kind, RESTART_DELAY_MS));
     connection.on("SessionEnded", onSessionEnded);
+    connection.on("SoundGraph", (enabled) => {
+        if (!joined) return;
+        joined.soundGraph = enabled;
+        applySoundGraph();
+    });
 
     connection.onreconnecting(() => setStatus("Reconnecting…"));
     connection.onreconnected(() => {
@@ -250,6 +384,7 @@ context.addCustomMessageListener(NAMESPACE, (event) => {
     const newServer = (message.serverUrl || null) !== serverUrl;
     token = message.token;
     serverUrl = message.serverUrl || null;
+    graphHistory.length = 0;
     ended = false;
     setStatus("Connecting…");
     if (!connection || newServer) {

@@ -21,6 +21,7 @@ public interface IRoomService
         DateTime checkedAtUtc);
     Task<GlobalSettings> GetGlobalSettingsAsync();
     Task<GlobalSettings> UpdateGlobalSettingsAsync(GlobalSettings settings);
+    Task SetCastSoundGraphAsync(bool enabled);
     Task<AudioSettings> GetComposedAudioSettingsAsync();
     Task<AudioSettings> GetAudioSettingsForRoomAsync(int roomId);
 }
@@ -193,6 +194,21 @@ public class RoomService : IRoomService
 
         await _db.SaveChangesAsync();
         return await GetGlobalSettingsAsync();
+    }
+
+    public async Task SetCastSoundGraphAsync(bool enabled)
+    {
+        var existing = await _db.GlobalSettings.FindAsync(1);
+        if (existing == null)
+        {
+            _db.GlobalSettings.Add(new GlobalSettings { Id = 1, CastSoundGraph = enabled });
+        }
+        else
+        {
+            existing.CastSoundGraph = enabled;
+        }
+
+        await _db.SaveChangesAsync();
     }
 
     public async Task<AudioSettings> GetComposedAudioSettingsAsync()

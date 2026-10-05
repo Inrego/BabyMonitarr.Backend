@@ -35,8 +35,25 @@
             transition: opacity 1s;
         }
 
+        /* The room name sits above the sound graph rather than on its line. */
+        body.sound-graph #overlay {
+            bottom: calc(24% + 12px);
+        }
+
         #overlay.faded {
             opacity: 0;
+        }
+
+        /* A scrim under the line: on a white night-vision picture it darkens just enough for the
+           line to stand out, on a black one it is invisible. */
+        #soundGraph {
+            position: absolute;
+            left: 0;
+            bottom: 0;
+            width: 100%;
+            height: 24%;
+            pointer-events: none;
+            background: linear-gradient(to top, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.2) 80%, rgba(0, 0, 0, 0));
         }
 
         #status {
@@ -63,6 +80,7 @@
 <body>
     <cast-media-player></cast-media-player>
     <video id="video" autoplay playsinline></video>
+    <canvas id="soundGraph" hidden></canvas>
     <div id="status">Starting…</div>
     <div id="overlay" class="faded"></div>
 
