@@ -407,10 +407,16 @@ const KEEPALIVE_URL = new URL("keepalive.png", location.href).href;
 const KEEPALIVE_INTERVAL_MS = 9 * 60 * 1000;
 const playerManager = context.getPlayerManager();
 let keepAliveTimer = null;
+// CAF numbers a local request it has no id for from Date.now(), and echoes that id in the
+// MEDIA_STATUS it sends every connected sender. That is far past 32 bits, and Sharpcaster's
+// receive loop dies on it for good, so the server stops hearing replies and status from the
+// device. Small ids of our own stay clear of that.
+let keepAliveRequestId = 0;
 
 function keepAlive() {
     clearTimeout(keepAliveTimer);
     const request = new cast.framework.messages.LoadRequestData();
+    request.requestId = ++keepAliveRequestId;
     request.autoplay = true;
     request.media = new cast.framework.messages.MediaInformation();
     request.media.contentId = KEEPALIVE_URL;
