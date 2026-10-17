@@ -79,6 +79,8 @@ public class NestStreamReader : IDisposable
 
     public int RoomId => _roomId;
 
+    public bool IsDisposed => Volatile.Read(ref _isDisposed);
+
     public NestStreamReader(
         int roomId,
         string nestDeviceId,

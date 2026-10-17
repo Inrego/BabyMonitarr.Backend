@@ -247,6 +247,14 @@ namespace BabyMonitarr.Backend.Services
 
         private void EnsureReaderStarted(int roomId)
         {
+            // A shared Nest reader can be disposed under us; drop it so the room reconnects
+            // instead of staying silent for as long as subscribers keep it from going idle.
+            if (_readers.TryGetValue(roomId, out var existing) && existing is NestStreamReader { IsDisposed: true })
+            {
+                _logger.LogWarning("Nest audio reader for room {RoomId} was disposed while subscribed, restarting", roomId);
+                StopReader(roomId);
+            }
+
             if (_readers.ContainsKey(roomId)) return;
 
             if (_roomCache.TryGetValue(roomId, out var room))
@@ -291,7 +299,7 @@ namespace BabyMonitarr.Backend.Services
                         nestReader.AudioDataReceived -= processor.OnAudioDataReceived;
                         processor.AudioSampleProcessed -= OnAudioSampleProcessed;
                         processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;
-                        _nestReaderManager.ReleaseReader(room.Id);
+                        _nestReaderManager.ReleaseReader(room.Id, nestReader);
                         processor.Dispose();
                     }
                 }
@@ -342,7 +350,7 @@ namespace BabyMonitarr.Backend.Services
                     else if (reader is NestStreamReader nestReader)
                     {
                         nestReader.AudioDataReceived -= processor.OnAudioDataReceived;
-                        _nestReaderManager.ReleaseReader(roomId);
+                        _nestReaderManager.ReleaseReader(roomId, nestReader);
                     }
                     processor.AudioSampleProcessed -= OnAudioSampleProcessed;
                     processor.SoundThresholdExceeded -= OnSoundThresholdExceeded;

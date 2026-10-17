@@ -1,12 +1,18 @@
-using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace BabyMonitarr.Backend.Services;
 
+/// <summary>
+/// Shares one <see cref="NestStreamReader"/> per room between the audio and video services.
+/// Acquire and release run under one lock: a release that drops the count to zero must not
+/// race an acquire that would pick the dying entry back up, and a holder may only release the
+/// reader it actually holds (never a newer one registered for the same room).
+/// </summary>
 public class NestStreamReaderManager : IDisposable
 {
-    private readonly ConcurrentDictionary<int, NestStreamReaderEntry> _readers = new();
+    private readonly Dictionary<int, NestStreamReaderEntry> _readers = new();
+    private readonly object _gate = new();
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<NestStreamReaderManager> _logger;
     private bool _isDisposed;
@@ -27,66 +33,95 @@ public class NestStreamReaderManager : IDisposable
 
     public NestStreamReader GetOrCreateReader(int roomId, string nestDeviceId, CancellationToken ct)
     {
-        var entry = _readers.GetOrAdd(roomId, _ =>
+        lock (_gate)
         {
-            _logger.LogInformation("Creating NestStreamReader for room {RoomId}, device {DeviceId}", roomId, nestDeviceId);
-
-            var reader = new NestStreamReader(roomId, nestDeviceId, _scopeFactory, _logger);
-            reader.StartAsync(ct);
-
-            return new NestStreamReaderEntry
+            if (!_readers.TryGetValue(roomId, out var entry))
             {
-                Reader = reader,
-                ReferenceCount = 0
-            };
-        });
+                _logger.LogInformation("Creating NestStreamReader for room {RoomId}, device {DeviceId}", roomId, nestDeviceId);
 
-        Interlocked.Increment(ref entry.ReferenceCount);
-        return entry.Reader;
+                var reader = new NestStreamReader(roomId, nestDeviceId, _scopeFactory, _logger);
+                reader.StartAsync(ct);
+
+                entry = new NestStreamReaderEntry { Reader = reader };
+                _readers[roomId] = entry;
+            }
+
+            entry.ReferenceCount++;
+            return entry.Reader;
+        }
     }
 
-    public void ReleaseReader(int roomId)
+    public void ReleaseReader(int roomId, NestStreamReader reader)
     {
-        if (_readers.TryGetValue(roomId, out var entry))
+        lock (_gate)
         {
-            var newCount = Interlocked.Decrement(ref entry.ReferenceCount);
-            if (newCount <= 0)
+            // A stale holder (its reader already replaced) has nothing left to release.
+            if (!_readers.TryGetValue(roomId, out var entry) || !ReferenceEquals(entry.Reader, reader))
             {
-                if (_readers.TryRemove(roomId, out var removed))
-                {
-                    _logger.LogInformation("Disposing NestStreamReader for room {RoomId} (no more references)", roomId);
-                    removed.Reader.Dispose();
-                }
+                return;
             }
+
+            if (--entry.ReferenceCount > 0)
+            {
+                return;
+            }
+
+            _readers.Remove(roomId);
         }
+
+        _logger.LogInformation("Disposing NestStreamReader for room {RoomId} (no more references)", roomId);
+        // Outside the lock: Dispose waits up to 10s for the connection loop to wind down.
+        reader.Dispose();
     }
 
     public void StopReader(int roomId)
     {
-        if (_readers.TryRemove(roomId, out var entry))
+        NestStreamReaderEntry? entry;
+        lock (_gate)
         {
-            _logger.LogInformation("Force-stopping NestStreamReader for room {RoomId}", roomId);
-            entry.Reader.Dispose();
+            if (!_readers.Remove(roomId, out entry))
+            {
+                return;
+            }
+        }
+
+        _logger.LogInformation("Force-stopping NestStreamReader for room {RoomId}", roomId);
+        entry.Reader.Dispose();
+    }
+
+    public bool HasReader(int roomId)
+    {
+        lock (_gate)
+        {
+            return _readers.ContainsKey(roomId);
         }
     }
 
-    public bool HasReader(int roomId) => _readers.ContainsKey(roomId);
-
     public NestStreamReader? GetReader(int roomId)
     {
-        return _readers.TryGetValue(roomId, out var entry) ? entry.Reader : null;
+        lock (_gate)
+        {
+            return _readers.TryGetValue(roomId, out var entry) ? entry.Reader : null;
+        }
     }
 
     public void Dispose()
     {
-        if (!_isDisposed)
+        List<NestStreamReaderEntry> entries;
+        lock (_gate)
         {
-            foreach (var kvp in _readers)
+            if (_isDisposed)
             {
-                kvp.Value.Reader.Dispose();
+                return;
             }
+            entries = _readers.Values.ToList();
             _readers.Clear();
             _isDisposed = true;
+        }
+
+        foreach (var entry in entries)
+        {
+            entry.Reader.Dispose();
         }
     }
 }
