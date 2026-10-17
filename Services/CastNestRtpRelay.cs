@@ -241,7 +241,7 @@ internal sealed class CastNestRtpRelay : IDisposable
         _disposed = true;
 
         _reader.RtpPacketReceived -= OnRtpPacket;
-        _readers.ReleaseReader(_roomId);
+        _readers.ReleaseReader(_roomId, _reader);
         _socket.Dispose();
     }
 }
