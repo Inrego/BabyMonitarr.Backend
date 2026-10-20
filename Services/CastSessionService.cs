@@ -61,6 +61,12 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
     private static readonly TimeSpan ReceiverReadyTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan StopReplyTimeout = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// Upper bound on one connect-and-load. Sharpcaster's TLS handshake has no timeout, so a
+    /// receiver that accepts the socket but never answers would otherwise hang recovery for good.
+    /// </summary>
+    private static readonly TimeSpan ConnectAndLoadTimeout = TimeSpan.FromSeconds(60);
+
     private sealed class CastSession
     {
         public required string DeviceId { get; init; }
@@ -358,6 +364,17 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         var client = CastClientFactory.Create(_loggerFactory);
         try
         {
+            await LoadAsync().WaitAsync(ConnectAndLoadTimeout);
+        }
+        catch
+        {
+            // Disposing the socket is also what unblocks a load that is still hanging.
+            try { await client.DisconnectAsync().WaitAsync(StopReplyTimeout); } catch { /* best effort */ }
+            throw;
+        }
+
+        async Task LoadAsync()
+        {
             await client.ConnectChromecast(_devices.ToReceiver(device));
             await client.LaunchApplicationAsync(session.AppId, false);
             if (session.ReceiverToken != null)
@@ -368,11 +385,6 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
             {
                 await client.GetChannel<Sharpcaster.Channels.MediaChannel>().LoadAsync(session.Media!);
             }
-        }
-        catch
-        {
-            try { await client.DisconnectAsync(); } catch { /* best effort */ }
-            throw;
         }
 
         // Subscribed only after a successful load so the transient states of connecting and
@@ -586,7 +598,7 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
         await BroadcastStateAsync();
 
         var previous = session.Client;
-        try { await previous.DisconnectAsync(); } catch { /* it is probably already gone */ }
+        try { await previous.DisconnectAsync().WaitAsync(StopReplyTimeout); } catch { /* it is probably already gone */ }
 
         int attempt = 0;
         try
@@ -598,15 +610,16 @@ public sealed class CastSessionService : ICastSessionService, IHostedService
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
                 if (session.Stopping) return;
 
-                var device = await _devices.FindAsync(session.DeviceId, CancellationToken.None);
-                if (device == null)
-                {
-                    await EndSessionAsync(session, "The cast device was removed.");
-                    return;
-                }
-
                 try
                 {
+                    // Inside the try: anything escaping this loop ends recovery without a word.
+                    var device = await _devices.FindAsync(session.DeviceId, CancellationToken.None);
+                    if (device == null)
+                    {
+                        await EndSessionAsync(session, "The cast device was removed.");
+                        return;
+                    }
+
                     var client = await ConnectAndLoadAsync(session, device);
                     if (session.Stopping)
                     {
