@@ -39,7 +39,9 @@ public class NestStreamReader : IDisposable
     private const int MinStableConnectionMs = 60_000; // 1 minute - connection must last this long to reset backoff
     private const int MaxConsecutiveExtendFailures = 3;
 
-    // Media watchdog: a "connected" peer that has stopped delivering RTP is a dead stream.
+    // Media watchdog: a "connected" peer that has stopped delivering video RTP is a dead stream.
+    // Watch video, not all RTP: Google can freeze the video track while Opus audio keeps
+    // flowing, which would otherwise keep a frozen picture "alive" indefinitely.
     private const int MediaWatchdogIntervalMs = 5000;
     private const int NoMediaTimeoutMs = 15_000;
     private const int FirstMediaTimeoutMs = 30_000;
@@ -49,7 +51,7 @@ public class NestStreamReader : IDisposable
 
     // Connection timing
     private long _connectionStartTicks;
-    private long _lastRtpTicks;
+    private long _lastVideoRtpTicks;
     private Timer? _mediaWatchdog;
     private TaskCompletionSource? _connectionEnded;
 
@@ -366,7 +368,7 @@ public class NestStreamReader : IDisposable
             }
         };
 
-        Volatile.Write(ref _lastRtpTicks, 0);
+        Volatile.Write(ref _lastVideoRtpTicks, 0);
         _mediaWatchdog = new Timer(_ => CheckMediaFlowing(), null, MediaWatchdogIntervalMs, MediaWatchdogIntervalMs);
 
         await tcs.Task;
@@ -378,15 +380,16 @@ public class NestStreamReader : IDisposable
 
     /// <summary>
     /// Google can leave the ICE/DTLS session up while the camera stops sending (session expiry,
-    /// camera-side hiccup). Nothing else notices that, so a silence longer than the timeout ends
-    /// the connection and the retry loop rebuilds it.
+    /// camera-side hiccup), or freeze only the video track while audio keeps flowing. Nothing else
+    /// notices that, so a video silence longer than the timeout ends the connection and the retry
+    /// loop rebuilds it.
     /// </summary>
     private void CheckMediaFlowing()
     {
         var ended = _connectionEnded;
         if (ended == null || ended.Task.IsCompleted) return;
 
-        long lastRtp = Volatile.Read(ref _lastRtpTicks);
+        long lastRtp = Volatile.Read(ref _lastVideoRtpTicks);
         long now = Environment.TickCount64;
         bool stalled = lastRtp == 0
             ? now - _connectionStartTicks > FirstMediaTimeoutMs
@@ -395,7 +398,7 @@ public class NestStreamReader : IDisposable
         if (!stalled) return;
 
         _logger.LogWarning(
-            "No media from Nest for room {RoomId} for {Seconds}s; reconnecting",
+            "No video from Nest for room {RoomId} for {Seconds}s; reconnecting",
             _roomId,
             (now - (lastRtp == 0 ? _connectionStartTicks : lastRtp)) / 1000);
         ended.TrySetResult();
@@ -490,7 +493,8 @@ public class NestStreamReader : IDisposable
     {
         try
         {
-            Volatile.Write(ref _lastRtpTicks, Environment.TickCount64);
+            if (mediaType == SDPMediaTypesEnum.video)
+                Volatile.Write(ref _lastVideoRtpTicks, Environment.TickCount64);
             RtpPacketReceived?.Invoke(mediaType, rtpPacket);
 
             if (mediaType == SDPMediaTypesEnum.audio)
